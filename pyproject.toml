@@ -1,0 +1,10 @@
+[project]
+name = "kb-pente-ai"
+version = "0.1.0"
+description = "Machine learning for the board game Pente"
+readme = "README.md"
+dependencies = [
+    "numpy>=2.3.2",
+    "scipy>=1.16.1",
+    "torch",
+]
