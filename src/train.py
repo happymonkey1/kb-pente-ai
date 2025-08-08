@@ -17,7 +17,7 @@ def train(num_iterations: int, batch_games: int, eval_interval: int, net, optimi
         logger.info(f"=== Iteration {iteration + 1}/{num_iterations} ===")
 
         sp_start_time = time.time()
-        games = [play_game_with_mcts(net, num_simulations=400) for _ in range(batch_games)]
+        games = [play_game_with_mcts(net, num_simulations=400, max_moves=5) for _ in range(batch_games)]
         sp_time = time.time() - sp_start_time
         logger.info(f"Generated {batch_games} games in {sp_time:.2f}s "
                     f"({batch_games / sp_time:.2f} games/sec)")
