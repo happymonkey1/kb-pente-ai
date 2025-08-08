@@ -31,7 +31,7 @@ class PenteNet(nn.Module):
         # Policy
         p = F.relu(self.conv_policy(x))
         p = p.view(p.size(0), -1)
-        p = F.log_softmax(self.fc_policy(p), dim=1)  # log‑probabilities
+        p = F.log_softmax(self.fc_policy(p), dim=1)
 
         # Value
         v = F.relu(self.conv_value(x))

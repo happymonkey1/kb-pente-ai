@@ -2,10 +2,8 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
-def board_to_tensor(board: np.ndarray) -> np.ndarray:
-    current_mask = (board == 1).astype(np.float32)
-    opponent_mask = (board == 2).astype(np.float32)
-    return np.stack([current_mask, opponent_mask], axis=0)
+from src.game.board_utils import board_to_tensor
+
 
 class PenteDataset(Dataset):
     def __init__(self, games):
@@ -24,4 +22,4 @@ class PenteDataset(Dataset):
         else:
             policy_flat = policy.astype(np.float32)
 
-        return torch.from_numpy(tensor), torch.from_numpy(policy_flat), torch.tensor(outcome, dtype=torch.float32)
+        return tensor, torch.from_numpy(policy_flat), torch.tensor(outcome, dtype=torch.float32)

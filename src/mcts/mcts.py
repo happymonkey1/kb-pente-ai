@@ -1,9 +1,7 @@
 import numpy as np
-import torch
 
-from src.game.board_utils import legal_moves, apply_move, opponent, is_terminal, evaluate_terminal
+from src.game.board_utils import legal_moves, apply_move, opponent, is_terminal, evaluate_terminal, board_to_tensor
 from src.mcts.mcts_node import MCTSNode
-from src.pente_dataloader import board_to_tensor
 import torch.nn.functional as F
 
 class MCTS:
@@ -12,14 +10,18 @@ class MCTS:
         self.num_simulations = num_simulations
         self.c_puct = c_puct
 
-    def run(self, board, player):
-        root = MCTSNode(prior = 0.0)
+    def run(self, board: np.ndarray, player: int, captures: dict[int, int]):
+        root = MCTSNode(prior=1.0,
+                        board=board,
+                        player=player,
+                        captures=captures.copy(),
+                        parent=None)
 
-        policy_logits, _ = self.net(torch.from_numpy(board_to_tensor(board))).detach()
-        policy_probs = F.softmax(policy_logits, dim=0).numpy()
+        policy_logits, _ = self.net(board_to_tensor(board))
+        policy_probs = F.softmax(policy_logits, dim=0).detach().numpy()
 
         for move, prob in zip(legal_moves(board, player), policy_probs):
-            root.children[move] = MCTSNode(prob)
+            root.children[move] = MCTSNode(prob, board, player, captures.copy(), root)
 
         for _ in range(self.num_simulations):
             node, path = root, []
@@ -31,16 +33,14 @@ class MCTS:
                     key=lambda item: self._puct(item[1], node)
                 )
                 path.append((cur_board, cur_player, move))
-                cur_board = apply_move(cur_board, move, cur_player)
+                cur_board = apply_move(node.board, move, node.player, node.captures)
                 cur_player = opponent(cur_player)
 
-            terminated, winner = is_terminal(cur_board, cur_player)
+            terminated, winner = is_terminal(cur_board, node.captures)
             if terminated:
                 value = evaluate_terminal(winner)
             else:
-                policy_logits, value_tensor = self.net(
-                    torch.from_numpy(board_to_tensor(cur_board))
-                )
+                policy_logits, value_tensor = self.net(board_to_tensor(cur_board))
                 value = value_tensor.item()
                 # Add children for all legal moves
                 for m, prob in zip(legal_moves(cur_board, cur_player),
@@ -69,9 +69,10 @@ def play_game_with_mcts(net, num_simulations=400, max_moves=200, epsilon=0.1):
     player = 1
     examples = []
     captures = { 1: 0, 2: 0 }
+    winner = 0
 
     for _ in range(max_moves):
-        policy = MCTS(net, num_simulations).run(board, player)
+        policy = MCTS(net, num_simulations).run(board, player, captures)
 
         if np.random.rand() < epsilon:
             move = tuple(np.random.choice((a for a in legal_moves(board, player)), 1)[0])
@@ -89,7 +90,7 @@ def play_game_with_mcts(net, num_simulations=400, max_moves=200, epsilon=0.1):
         if terminated:
             break
 
-    outcome = evaluate_terminal(board)
+    outcome = evaluate_terminal(winner)
     for i in range(len(examples)):
         player_of_move = 1 if i % 2 == 0 else 2
         examples[i] = (examples[i][0], examples[i][1], outcome * (1 if player_of_move == 1 else -1))

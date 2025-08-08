@@ -1,10 +1,16 @@
 import numpy as np
+import torch
 from scipy.signal import convolve2d
 
-def legal_moves(board, player):
+def legal_moves(board, player) -> list[tuple[int, int]]:
     return list(zip(*np.where(board == 0)))
 
-def apply_move(board, move, player, captures: dict[int, int]):
+def apply_move(
+        board: np.ndarray,
+        move: tuple[int, int],
+        player: int,
+        captures: dict[int, int]
+) -> tuple[np.ndarray, dict[int, int]]:
     r, c = move
     if board[r, c] != 0:
         raise ValueError(f"Cell ({r},{c}) is already occupied")
@@ -18,10 +24,10 @@ def apply_move(board, move, player, captures: dict[int, int]):
 
     return new_board, new_captures
 
-def opponent(player):
+def opponent(player) -> int:
     return 1 if player == 2 else 2
 
-def is_terminal(board: np.ndarray, captures: dict[int, int]):
+def is_terminal(board: np.ndarray, captures: dict[int, int]) -> tuple[bool, int]:
     for p in (1, 2):
         if captures.get(p, 0) >= 10:
             return True, p
@@ -35,13 +41,19 @@ def is_terminal(board: np.ndarray, captures: dict[int, int]):
 
     return False, 0
 
-def evaluate_terminal(winner):
+def evaluate_terminal(winner: int) -> float:
     if winner == 0:
         return 0.0
     else:
         return 1.0 if winner == 1 else -1.0
 
-def _apply_captures(board: np.ndarray, r: int, c: int, player: int):
+def board_to_tensor(board: np.ndarray) -> torch.Tensor:
+    current_mask = (board == 1).astype(np.float32)
+    opponent_mask = (board == 2).astype(np.float32)
+    board = np.stack([current_mask, opponent_mask], axis=0)
+    return torch.from_numpy(board).unsqueeze(0)
+
+def _apply_captures(board: np.ndarray, r: int, c: int, player: int) -> tuple[np.ndarray, int]:
     opp = opponent(player)
     H, W = board.shape
     dirs = [(0, 1), (1, 0), (1, 1), (1, -1)]
