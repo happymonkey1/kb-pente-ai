@@ -1,8 +1,21 @@
 from src.model.model_v1 import PenteNet
 from src.train import train
 from torch import optim
+import logging
+
+logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('kb-penta-ai.log'),
+            logging.StreamHandler()
+        ]
+    )
+    logger.info("Starting training")
+
     pente_network = PenteNet()
     optimizer = optim.Adam(pente_network.parameters(), lr=1e4)
 

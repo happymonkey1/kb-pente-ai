@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Union
 
 class MCTSNode:
     def __init__(self,
@@ -6,7 +7,7 @@ class MCTSNode:
                  board: np.ndarray | None = None,
                  player: int | None = None,
                  captures: dict[int, int] | None = None,
-                 parent: 'MCTSNode' | None = None):
+                 parent: Union['MCTSNode', None] = None):
 
         if captures is None:
             captures = {1: 0, 2: 0}
@@ -18,7 +19,7 @@ class MCTSNode:
 
         self.value_sum = 0.0
         self.visit_count = 0
-        self.children: dict[int, 'MCTSNode'] = {}
+        self.children: dict[tuple[int, int], 'MCTSNode'] = {}
 
     @property
     def value(self) -> float:

@@ -3,11 +3,15 @@ from torch.utils.data import DataLoader
 from src.loss import policy_loss, value_loss
 from src.mcts.mcts import play_game_with_mcts
 from src.pente_dataloader import PenteDataset
+import logging
+
+logger = logging.getLogger(__name__)
 
 def train(num_iterations: int, batch_games: int, eval_interval: int, net, optimizer):
+    logger.info("Entered training loop")
     for iteration in range(num_iterations):
         if iteration % 100 == 0:
-            print(f"Iteration {iteration}")
+            logger.info(f"Iteration {iteration}")
 
         games = []
         for _ in range(batch_games):

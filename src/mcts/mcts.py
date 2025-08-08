@@ -1,39 +1,58 @@
 import numpy as np
-
-from src.game.board_utils import legal_moves, apply_move, opponent, is_terminal, evaluate_terminal, board_to_tensor
-from src.mcts.mcts_node import MCTSNode
 import torch.nn.functional as F
+import torch.nn as nn
+
+from src.game.board_utils import (
+    legal_moves, apply_move, opponent, is_terminal, evaluate_terminal, board_to_tensor
+)
+from src.mcts.mcts_node import MCTSNode
+
 
 class MCTS:
-    def __init__(self, net, num_simulations, c_puct=1.0):
+    def __init__(self, net: nn.Module, num_simulations: int, c_puct=1.0):
         self.net = net
         self.num_simulations = num_simulations
         self.c_puct = c_puct
 
     def run(self, board: np.ndarray, player: int, captures: dict[int, int]):
-        root = MCTSNode(prior=1.0,
-                        board=board,
-                        player=player,
-                        captures=captures.copy(),
-                        parent=None)
-
+        root = MCTSNode(
+            prior=1.0,
+            board=board,
+            player=player,
+            captures=captures.copy(),
+            parent=None,
+        )
         policy_logits, _ = self.net(board_to_tensor(board))
-        policy_probs = F.softmax(policy_logits, dim=0).detach().numpy()
+        policy_probs = F.softmax(policy_logits, dim=0).detach().cpu().numpy()
+        cur_captures = captures.copy()
 
         for move, prob in zip(legal_moves(board, player), policy_probs):
-            root.children[move] = MCTSNode(prob, board, player, captures.copy(), root)
+            root.children[move] = MCTSNode(
+                prior=prob,
+                board=board,
+                player=player,
+                captures=captures.copy(),
+                parent=root,
+            )
 
         for _ in range(self.num_simulations):
-            node, path = root, []
+            node: 'MCTSNode' = root
+            path: list[tuple['MCTSNode', tuple[int, int]]] = []
             cur_board, cur_player = board.copy(), player
 
             while node.children:
                 move, node = max(
                     node.children.items(),
-                    key=lambda item: self._puct(item[1], node)
+                    key=lambda item: self._puct(item[1], node),
                 )
-                path.append((cur_board, cur_player, move))
-                cur_board = apply_move(node.board, move, node.player, node.captures)
+
+                path.append((node, move))
+                cur_board, cur_captures = apply_move(
+                    node.board,
+                    move,
+                    node.player,
+                    node.captures,
+                )
                 cur_player = opponent(cur_player)
 
             terminated, winner = is_terminal(cur_board, node.captures)
@@ -42,27 +61,44 @@ class MCTS:
             else:
                 policy_logits, value_tensor = self.net(board_to_tensor(cur_board))
                 value = value_tensor.item()
-                # Add children for all legal moves
-                for m, prob in zip(legal_moves(cur_board, cur_player),
-                                   F.softmax(policy_logits, dim=0).detach().numpy()):
-                    node.children[m] = MCTSNode(prior=prob)
 
-            for b, p, m in reversed(path):
-                node = b.children[m]
-                node.value_sum += value * (1 if p == cur_player else -1)
+                for m, prob in zip(
+                        legal_moves(cur_board, cur_player),
+                        F.softmax(policy_logits, dim=0).detach().cpu().numpy(),
+                ):
+                    node.children[m] = MCTSNode(
+                        prior=prob,
+                        board=cur_board,
+                        player=cur_player,
+                        captures=cur_captures.copy(),
+                        parent=node,
+                    )
+
+            for b, move in reversed(path):
+                node = b.children[move]
+                node.value_sum += value
                 node.visit_count += 1
                 value = -value
 
-        visits = np.array([root.children[move].visit_count for move in legal_moves(board, player)], dtype=np.float32)
+        visits = np.array(
+            [root.children[move].visit_count for move in legal_moves(board, player)],
+            dtype=np.float32,
+        )
         policy = visits / visits.sum()
 
         return policy
 
-    def _puct(self, child, parent):
-        # Q + U
+    def _puct(self, child: MCTSNode, parent: MCTSNode):
         q = child.value
-        u = self.c_puct * child.prior * np.sqrt(parent.visit_count) / (1 + child.visit_count)
+        u = (
+                self.c_puct
+                * child.prior
+                * np.sqrt(parent.visit_count)
+                / (1 + child.visit_count)
+        )
+
         return q + u
+
 
 def play_game_with_mcts(net, num_simulations=400, max_moves=200, epsilon=0.1):
     board = np.zeros((19, 19), dtype=np.int32)
