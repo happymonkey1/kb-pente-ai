@@ -24,3 +24,6 @@ class MCTSNode:
     @property
     def value(self) -> float:
         return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
+
+    def __str__(self):
+        return f"MCTSNode(prior={self.prior}, board={self.board}, player={self.player}, captures={self.captures}, parent={self.parent}, value={self.value}, visit_count={self.visit_count}, children={self.children})"

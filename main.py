@@ -6,8 +6,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
+    level = logging.DEBUG
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler('kb-penta-ai.log'),
@@ -21,7 +22,7 @@ if __name__ == "__main__":
 
     train(
         num_iterations=10_000,
-        batch_games=128,
+        batch_games=1,
         eval_interval=100,
         net=pente_network,
         optimizer=optimizer

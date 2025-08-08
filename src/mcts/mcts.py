@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import torch.nn.functional as F
 import torch.nn as nn
@@ -7,6 +9,7 @@ from src.game.board_utils import (
 )
 from src.mcts.mcts_node import MCTSNode
 
+logger = logging.getLogger(__name__)
 
 class MCTS:
     def __init__(self, net: nn.Module, num_simulations: int, c_puct=1.0):
@@ -15,6 +18,8 @@ class MCTS:
         self.c_puct = c_puct
 
     def run(self, board: np.ndarray, player: int, captures: dict[int, int]):
+        logger.debug("Entered MCTS.run()")
+
         root = MCTSNode(
             prior=1.0,
             board=board,
@@ -35,25 +40,29 @@ class MCTS:
                 parent=root,
             )
 
-        for _ in range(self.num_simulations):
+        for i in range(self.num_simulations):
+            logger.debug(f"MCTS simulation step: {i + 1}/{self.num_simulations}")
             node: 'MCTSNode' = root
             path: list[tuple['MCTSNode', tuple[int, int]]] = []
             cur_board, cur_player = board.copy(), player
 
+            logger.debug(f"len(node.children) = {len(node.children)}")
             while node.children:
-                move, node = max(
+                move, new_node = max(
                     node.children.items(),
                     key=lambda item: self._puct(item[1], node),
                 )
 
                 path.append((node, move))
                 cur_board, cur_captures = apply_move(
-                    node.board,
+                    new_node.board,
                     move,
-                    node.player,
-                    node.captures,
+                    new_node.player,
+                    new_node.captures,
                 )
                 cur_player = opponent(cur_player)
+
+                node = new_node
 
             terminated, winner = is_terminal(cur_board, node.captures)
             if terminated:
@@ -74,7 +83,9 @@ class MCTS:
                         parent=node,
                     )
 
+            logger.debug(f"Generated len(path) = {len(path)}")
             for b, move in reversed(path):
+                logger.debug(f"Updating node {b} at move {move}")
                 node = b.children[move]
                 node.value_sum += value
                 node.visit_count += 1
