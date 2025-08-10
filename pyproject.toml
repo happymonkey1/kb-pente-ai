@@ -4,9 +4,10 @@ version = "0.1.0"
 description = "Machine learning for the board game Pente"
 readme = "README.md"
 dependencies = [
-    "mypy>=1.17.1",
-    "numpy>=2.3.2",
-    "scipy>=1.16.1",
-    "scipy-stubs>=1.16.1.0",
+    "mypy",
+    "numba>=0.61.2",
+    "numpy",
+    "scipy",
+    "scipy-stubs",
     "torch",
 ]
