@@ -60,7 +60,8 @@ class MCTS:
             for i in range(debug_iters):
                 best_as = np.array(np.argwhere(counts == np.max(counts))).flatten()
                 valid_moves = self.game.get_valid_moves(canonical_board, Game.PLAYER_ONE)
-                best_a = np.random.choice(best_as * valid_moves)
+                masked = valid_moves[best_as].astype(bool)
+                best_a = np.random.choice(best_as[masked])
                 if i == 1:
                     logger.warning("Random exploration produced an invalid move.")
 

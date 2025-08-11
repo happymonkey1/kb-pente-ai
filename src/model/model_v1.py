@@ -25,7 +25,9 @@ class PenteNet(nn.Module):
         #action_size=19*19+1,
         action_size=19*19,
         num_res_blocks=5,
-        num_channels=128
+        num_channels=128,
+        num_hidden_fc_value_layers: int = 0,
+        hidden_fc_size: int = 256,
     ):
         super().__init__()
         self.device = device
@@ -33,6 +35,8 @@ class PenteNet(nn.Module):
         self.action_size = action_size
         self.num_res_blocks = num_res_blocks
         self.num_channels = num_channels
+        self.num_hidden_fc_value_layers = num_hidden_fc_value_layers
+        self.hidden_fc_size = hidden_fc_size
 
         self.conv_in = nn.Conv2d(2, num_channels, kernel_size=3, padding=1)
         self.bn_in = nn.BatchNorm2d(num_channels)
@@ -45,8 +49,11 @@ class PenteNet(nn.Module):
 
         self.conv_value = nn.Conv2d(num_channels, 1, kernel_size=1)
         self.bn_value = nn.BatchNorm2d(1)
-        self.fc_value1 = nn.Linear(board_size * board_size, 256)
-        self.fc_value2 = nn.Linear(256, 1)
+        self.fc_value_in = nn.Linear(board_size * board_size, self.hidden_fc_size)
+        self.fc_value_hiddens = nn.ModuleList(
+            [nn.Linear(self.hidden_fc_size, self.hidden_fc_size) for _ in range(self.num_hidden_fc_value_layers)]
+        )
+        self.fc_value_out = nn.Linear(self.hidden_fc_size, 1)
 
         self.to(device)
 
@@ -68,12 +75,14 @@ class PenteNet(nn.Module):
 
         p = F.relu(self.bn_policy(self.conv_policy(x)))
         p = p.view(p.size(0), -1)
-        p = self.fc_policy(p) # Output raw logits
+        p = self.fc_policy(p)
 
         v = F.relu(self.bn_value(self.conv_value(x)))
         v = v.view(v.size(0), -1)
-        v = F.relu(self.fc_value1(v))
-        v = torch.tanh(self.fc_value2(v))
+        v = F.relu(self.fc_value_in(v))
+        for fc in self.fc_value_hiddens:
+            v = F.relu(fc(v))
+        v = torch.tanh(self.fc_value_out(v))
 
         return p, v
 
@@ -106,10 +115,8 @@ class PenteNet(nn.Module):
         filepath = os.path.join(checkpoint_dir, filename)
         if not os.path.exists(filepath):
             logger.warning(f"No checkpoint found at '{filepath}'. Starting from scratch.")
-            return 0 # Return starting iteration 0
+            return 0
 
-        # When loading a checkpoint, map storage to the same device the model is on
-        # This prevents errors if you save on a GPU and load on a CPU, or vice-versa.
         map_location = next(net.parameters()).device
         checkpoint = torch.load(filepath, map_location=map_location)
 
@@ -120,6 +127,9 @@ class PenteNet(nn.Module):
 
         logger.info(f"Checkpoint loaded from '{filepath}'. Resuming from iteration {start_iteration}.")
         return start_iteration
+
+    def get_checkpoint_file_name(self) -> str:
+        return f"checkpoint_{self.board_size}_{self.action_size}_{self.num_res_blocks}_{self.num_channels}_{self.num_hidden_fc_value_layers}_{self.hidden_fc_size}.pth.tar"
 
 class ResBlock(nn.Module):
     def __init__(self, num_channels):

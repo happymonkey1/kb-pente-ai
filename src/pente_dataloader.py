@@ -2,10 +2,12 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
+from src.game.pente.pente_game import PenteGame
+
 def board_to_cpu_tensor(board: np.ndarray) -> torch.Tensor:
     # TODO: this only supports two players
-    p1_mask = (board == 1).astype(np.float32)
-    p2_mask = (board == 2).astype(np.float32)
+    p1_mask = (board == PenteGame.PLAYER_ONE).astype(np.float32)
+    p2_mask = (board == PenteGame.PLAYER_TWO).astype(np.float32)
     return torch.from_numpy(np.stack([p1_mask, p2_mask], axis=0))
 
 class PenteDataset(Dataset):
