@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SelfPlayTrainerArgs:
+    start_iteration: int
     professional_games_training_iterations: int
     self_play_training_iterations: int
     temp_threshold: float
@@ -125,7 +126,7 @@ class SelfPlayTrainer:
     def train(self):
         logger.info("Entered training loop")
         total_iterations = self.args.professional_games_training_iterations + self.args.self_play_training_iterations
-        for iteration in range(total_iterations):
+        for iteration in range(self.args.start_iteration, total_iterations):
             iter_start_time = time.time()
             logger.info(f"=== Iteration {iteration + 1}/{total_iterations} ===")
 
@@ -173,7 +174,7 @@ class SelfPlayTrainer:
                     PenteNet.load_checkpoint(
                         checkpoint_dir=self.args.checkpoint_dir,
                         net=self.previous_net,
-                        filename=f'model-{iteration}.pth.tar'
+                        filename=self.previous_net.get_checkpoint_file_name(iteration - 1)
                     )
 
                 logger.info("Initializing Arena")
@@ -206,7 +207,7 @@ class SelfPlayTrainer:
                     PenteNet.load_checkpoint(
                         checkpoint_dir=self.args.checkpoint_dir,
                         net=self.net,
-                        filename=f'model-{iteration}.pth.tar'
+                        filename=self.net.get_checkpoint_file_name(iteration)
                     )
                 else:
                     logger.info(f"Accepting new model due to high performance")
@@ -219,7 +220,7 @@ class SelfPlayTrainer:
                         PenteNet.save_checkpoint(
                             state=training_state,
                             checkpoint_dir=self.args.checkpoint_dir,
-                            filename=f'model-{iteration}.pth.tar'
+                            filename=self.net.get_checkpoint_file_name(iteration + 1)
                         )
                         PenteNet.save_checkpoint(
                             state={
@@ -238,7 +239,7 @@ class SelfPlayTrainer:
                 PenteNet.save_checkpoint(
                     state=training_state,
                     checkpoint_dir=self.args.checkpoint_dir,
-                    filename=f'model-{iteration}.pth.tar'
+                    filename=self.net.get_checkpoint_file_name(iteration + 1)
                 )
 
     def __train_model(self, training_examples: list[tuple[np.ndarray, np.ndarray, float]]) -> ModelTrainingStats:
@@ -255,7 +256,7 @@ class SelfPlayTrainer:
 
             self.optimizer.zero_grad()
 
-            pred_policies_logits, pred_values = self.net(states)
+            pred_policies_logits, pred_values = self.net.forward(states)
 
             if self.args.debug:
                 if torch.isnan(states).any():

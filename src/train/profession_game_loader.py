@@ -41,17 +41,21 @@ class ProfessionGameLoader:
                 move_sequence = parts[:-1]
                 result_str = parts[-1]
 
+                # 1. Determine the final outcome of the game
                 if result_str == "1-0":
-                    final_winner = 1.0
+                    final_winner = 1.0  # Player 1 won
                 elif result_str == "0-1":
-                    final_winner = -1.0
+                    final_winner = -1.0 # Player 2 won (represented as -1 from P1's view)
                 else:
+                    # Handle draws or other outcomes if necessary
+                    # For this dataset, we assume only wins/losses
                     print(f"Warning: Skipping line {line_num} due to unrecognized result '{result_str}'")
                     continue
 
+                # 2. Simulate the game move by move
                 game = PenteGame(self.board_size, self.player_count)
                 board = game.init_board()
-                current_player = 1
+                current_player = 1 # Player 1 always starts
 
                 for move_str in move_sequence:
                     try:
@@ -69,9 +73,14 @@ class ProfessionGameLoader:
 
                     pi = np.zeros((self.board_size * self.board_size), dtype=float)
                     pi[action] = 1
-                    all_training_examples.append((board.board.copy(), pi, value_for_current_player))
 
-                    board, current_player = game.apply_action(board, current_player, action)
+                    board, next_player = game.apply_action(board, current_player, action)
+
+                    canonical_board = game.get_canonical_form(board, current_player)
+                    all_training_examples.append((canonical_board.board.copy(), pi, value_for_current_player))
+
+                    current_player = next_player
+
 
         logger.info(f"Successfully loaded and processed {len(all_training_examples)} positions.")
         return all_training_examples
@@ -102,6 +111,7 @@ class ProfessionGameLoader:
             raise ValueError(f"Invalid column character '{col_char}' in move '{move_str}'")
 
         col = COLS.index(col_char)
+        # Convert 1-based row number to 0-based index
         row = int(row_str) - 1
 
         if not (0 <= row < self.board_size and 0 <= col < self.board_size):

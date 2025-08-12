@@ -22,17 +22,21 @@ class GameOverStats:
     winner: int
 
 class Arena:
-    def __init__(self, player1: 'Player', player2: 'Player', game: 'Game', debug: bool = False):
+    def __init__(self, player1: 'Player', player2: 'Player', game: 'Game', debug: bool = False, display = None):
         self.player1 = player1
         self.player2 = player2
         self.game = game
         self.debug = debug
+        self.display = display
 
         assert self.game.get_player_count() == 2, "Arena only supports 2-player games"
 
     def play_game(self):
         if self.debug:
             logger.info("Starting new arena game")
+
+        self.player1.reset()
+        self.player2.reset()
 
         current_player = Game.PLAYER_ONE
         board = self.game.init_board()
@@ -44,6 +48,9 @@ class Arena:
 
             action = self.__get_player_move(board, current_player)
             board, next_player = self.game.apply_action(board, current_player, action)
+
+            if self.display:
+                self.display(board.board)
 
             terminal, winner = self.game.check_game_end(board, current_player)
             if terminal:
@@ -60,9 +67,9 @@ class Arena:
 
     def __get_player_move(self, board, player):
         if player == Game.PLAYER_ONE:
-            return self.player1.play(self.game, board, player)
+            return self.player1.play(self.game, board, player, self.debug)
         elif player == Game.PLAYER_TWO:
-            return self.player2.play(self.game, board, player)
+            return self.player2.play(self.game, board, player, self.debug)
         else:
             raise ValueError(f"Invalid player: {player}")
 

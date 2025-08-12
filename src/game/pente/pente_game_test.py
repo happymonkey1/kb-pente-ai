@@ -7,22 +7,25 @@ import numpy as np
 
 class PenteGameTest(unittest.TestCase):
     BOARD_SIZE = 6
+    TWO_PLAYERS = [PenteGame.PLAYER_ONE, PenteGame.PLAYER_TWO]
+
     def test_is_terminal_five_in_a_row(self):
         game = PenteGame(board_size=PenteGameTest.BOARD_SIZE)
         board = PenteBoard.new_board(PenteGameTest.BOARD_SIZE)
-        board.board[0,0] = 1
-        board.board[0,1] = 1
-        board.board[0,2] = 1
-        board.board[0,3] = 1
-        board.board[0,4] = 1
+        for player in PenteGameTest.TWO_PLAYERS:
+            board.board[0,0] = player
+            board.board[0,1] = player
+            board.board[0,2] = player
+            board.board[0,3] = player
+            board.board[0,4] = player
 
-        is_terminal, score = game.check_game_end(board, PenteGame.PLAYER_ONE)
-        self.assertTrue(is_terminal)
-        self.assertEqual(1, score)
+            is_terminal, score = game.check_game_end(board, PenteGame.PLAYER_ONE)
+            self.assertTrue(is_terminal)
+            self.assertEqual(player, score)
 
-        is_terminal, score = game.check_game_end(board, PenteGame.PLAYER_TWO)
-        self.assertTrue(is_terminal)
-        self.assertEqual(1, score)
+            is_terminal, score = game.check_game_end(board, PenteGame.PLAYER_TWO)
+            self.assertTrue(is_terminal)
+            self.assertEqual(player, score)
 
     def test_is_terminal_five_in_a_row_horizontal(self):
         game = PenteGame(board_size=PenteGameTest.BOARD_SIZE)

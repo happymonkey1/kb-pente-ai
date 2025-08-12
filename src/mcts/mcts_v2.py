@@ -12,6 +12,8 @@ from src.game.pente.pente_board import PenteBoard
 from src.game.pente.pente_game import PenteGame
 from src.model.model_v1 import PenteNet
 
+from numba import njit
+
 EPS = 1e-8
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,15 @@ class MCTS:
         self.es = {}
         self.vs = {}
 
+    def reset(self):
+        self.qsa = {}
+        self.nsa = {}
+        self.ns = {}
+        self.ps = {}
+
+        self.es = {}
+        self.vs = {}
+
     def get_action_prob(self, canonical_board: 'PenteBoard', temp=1):
         """
         This function performs numMCTSSims simulations of MCTS starting from
@@ -54,37 +65,30 @@ class MCTS:
         s = self.game.to_string(canonical_board)
         counts = [self.nsa[(s, a)] if (s, a) in self.nsa else 0 for a in range(self.game.get_action_size())]
 
-        def random_exploration():
-            debug_iters = 200
-
-            for i in range(debug_iters):
-                best_as = np.array(np.argwhere(counts == np.max(counts))).flatten()
-                valid_moves = self.game.get_valid_moves(canonical_board, Game.PLAYER_ONE)
-                masked = valid_moves[best_as].astype(bool)
-                best_a = np.random.choice(best_as[masked])
-                if i == 1:
-                    logger.warning("Random exploration produced an invalid move.")
-
-                if not self.game.is_valid_move(canonical_board, PenteGame.PLAYER_ONE, best_a):
-                    continue
-
-                ps = [0] * len(counts)
-                ps[best_a] = 1
-                return ps
-            else:
-                raise ValueError(f"Failed to compute random exploration best move in {debug_iters} iterations.")
-
         if temp == 0:
-            return random_exploration()
+            return self.__random_exploration(canonical_board, counts)
 
         counts = [x ** (1. / temp) for x in counts]
         counts_sum = float(sum(counts))
         if counts_sum == 0:
             logger.error("Counts sum is zero")
-            return random_exploration()
+            return self.__random_exploration(canonical_board, counts)
 
         probs = [x / counts_sum for x in counts]
         return probs
+
+    def __random_exploration(self, canonical_board, counts):
+        best_as = np.array(np.argwhere(counts == np.max(counts))).flatten()
+        valid_moves = self.game.get_valid_moves(canonical_board, Game.PLAYER_ONE)
+        masked = valid_moves[best_as].astype(bool)
+        best_a = np.random.choice(best_as[masked])
+
+        if not self.game.is_valid_move(canonical_board, PenteGame.PLAYER_ONE, best_a):
+            raise ValueError(f"Failed to compute random exploration best move ")
+
+        ps = [0] * len(counts)
+        ps[best_a] = 1
+        return ps
 
     def search(self, canonical_board: 'PenteBoard'):
         """
@@ -110,16 +114,14 @@ class MCTS:
 
         if s not in self.es:
             self.es[s] = self.game.check_game_end(canonical_board, Game.PLAYER_ONE)[1]
+
         if self.es[s] != 0:
             # terminal node
             return -self.es[s]
 
         if s not in self.ps:
             # leaf node
-            with torch.no_grad():
-                #p, v = self.net.predict(canonical_board)
-                #self.ps[s] = F.softmax(p, dim=1)
-                self.ps[s], v = self.net.predict(canonical_board)
+            self.ps[s], v = self.net.predict(canonical_board)
             valid_moves = self.game.get_valid_moves(canonical_board, Game.PLAYER_ONE)
             self.ps[s] = self.ps[s].cpu().numpy().reshape(-1) * valid_moves  # masking invalid moves
             sum_ps_s = np.sum(self.ps[s])

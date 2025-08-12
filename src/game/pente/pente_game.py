@@ -71,14 +71,15 @@ class PenteGame(Game):
         """
         assert self.player_count == 2, "check_game_end logic only supports 2 players"
         assert pente_board.board.size == self.board_size * self.board_size, "Board size not correct"
-        for p in range(1, self.player_count + 1):
+        players = [PenteGame.PLAYER_ONE, PenteGame.PLAYER_TWO]
+        for p in players:
             if pente_board.get_capture_count(p) >= PenteGame.CAPTURES_TO_WIN:
                 return True, 1 if p == PenteGame.PLAYER_ONE else -1
 
         if not np.any(pente_board.board == 0):
             return True, 1 if player != Game.PLAYER_ONE else -1
 
-        for p in range(1, self.player_count + 1):
+        for p in players:
             if _has_five_in_a_row_fast(pente_board.board, p):
                 return True, 1 if p == PenteGame.PLAYER_ONE else -1
 

@@ -6,17 +6,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+from numba import njit
+
+from src.game.pente.pente_game import PenteGame
 
 logger = logging.getLogger(__name__)
 
+@torch.compile(fullgraph=True)
 def boards_to_tensor(boards: np.ndarray, device: torch.device) -> torch.Tensor:
     """Converts a batch of boards (N, H, W) to a PyTorch tensor (N, 2, H, W)."""
     p1_masks = (boards == 1)
-    p2_masks = (boards == 2)
+    p2_masks = (boards == -1)
     # Stack along the channel dimension (axis=1) to get (N, 2, H, W)
     batch = np.stack([p1_masks, p2_masks], axis=1)
     return torch.from_numpy(batch.astype(np.float32)).to(device)
 
+@torch.compile(fullgraph=True)
 class PenteNet(nn.Module):
     def __init__(
         self,
@@ -26,7 +31,6 @@ class PenteNet(nn.Module):
         action_size=19*19,
         num_res_blocks=5,
         num_channels=128,
-        num_hidden_fc_value_layers: int = 0,
         hidden_fc_size: int = 256,
     ):
         super().__init__()
@@ -35,7 +39,6 @@ class PenteNet(nn.Module):
         self.action_size = action_size
         self.num_res_blocks = num_res_blocks
         self.num_channels = num_channels
-        self.num_hidden_fc_value_layers = num_hidden_fc_value_layers
         self.hidden_fc_size = hidden_fc_size
 
         self.conv_in = nn.Conv2d(2, num_channels, kernel_size=3, padding=1)
@@ -50,9 +53,6 @@ class PenteNet(nn.Module):
         self.conv_value = nn.Conv2d(num_channels, 1, kernel_size=1)
         self.bn_value = nn.BatchNorm2d(1)
         self.fc_value_in = nn.Linear(board_size * board_size, self.hidden_fc_size)
-        self.fc_value_hiddens = nn.ModuleList(
-            [nn.Linear(self.hidden_fc_size, self.hidden_fc_size) for _ in range(self.num_hidden_fc_value_layers)]
-        )
         self.fc_value_out = nn.Linear(self.hidden_fc_size, 1)
 
         self.to(device)
@@ -65,8 +65,10 @@ class PenteNet(nn.Module):
             net.action_size,
             net.num_res_blocks,
             net.num_channels,
+            net.hidden_fc_size,
         )
 
+    @torch.compile(fullgraph=True)
     def forward(self, x):
         x = F.relu(self.bn_in(self.conv_in(x)))
 
@@ -80,12 +82,11 @@ class PenteNet(nn.Module):
         v = F.relu(self.bn_value(self.conv_value(x)))
         v = v.view(v.size(0), -1)
         v = F.relu(self.fc_value_in(v))
-        for fc in self.fc_value_hiddens:
-            v = F.relu(fc(v))
         v = torch.tanh(self.fc_value_out(v))
 
         return p, v
 
+    @torch.compile(fullgraph=True)
     def predict(self, pente_board: 'PenteBoard'):
         self.eval()
 
@@ -111,8 +112,11 @@ class PenteNet(nn.Module):
 
     @staticmethod
     def load_checkpoint(checkpoint_dir, net, filename="checkpoint.pth.tar", optimizer=None):
+        return PenteNet.load_checkpoint(os.path.join(checkpoint_dir, filename), net, optimizer)
+
+    @staticmethod
+    def load_checkpoint(filepath: str, net, optimizer=None):
         """Loads model and training parameters."""
-        filepath = os.path.join(checkpoint_dir, filename)
         if not os.path.exists(filepath):
             logger.warning(f"No checkpoint found at '{filepath}'. Starting from scratch.")
             return 0
@@ -128,9 +132,10 @@ class PenteNet(nn.Module):
         logger.info(f"Checkpoint loaded from '{filepath}'. Resuming from iteration {start_iteration}.")
         return start_iteration
 
-    def get_checkpoint_file_name(self) -> str:
-        return f"checkpoint_{self.board_size}_{self.action_size}_{self.num_res_blocks}_{self.num_channels}_{self.num_hidden_fc_value_layers}_{self.hidden_fc_size}.pth.tar"
+    def get_checkpoint_file_name(self, iteration: int) -> str:
+        return f"checkpoint-{iteration}_{self.board_size}_{self.action_size}_{self.num_res_blocks}_{self.num_channels}_{self.hidden_fc_size}.pth.tar"
 
+@torch.compile(fullgraph=True)
 class ResBlock(nn.Module):
     def __init__(self, num_channels):
         super().__init__()

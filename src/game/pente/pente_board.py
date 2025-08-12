@@ -41,7 +41,7 @@ class PenteBoard:
         return self.captures[player-1]
 
     def get_legal_moves(self) -> list[tuple[int, int]]:
-        return list(zip(*np.where(self.board == 0)))
+        return _get_legal_moves(self.board)
 
     def get_canonical_form(self, player: int, player_count) -> 'PenteBoard':
         assert Game.PLAYER_ONE == 1, f"Optimization assumption failed, expected Player 1 == 1, found {Game.PLAYER_ONE}"
@@ -55,7 +55,10 @@ class PenteBoard:
 
     def to_string(self) -> str:
         return base64.b64encode(self.board.tobytes()).decode('ascii')
-        #self.board.tostring()
+
+@njit(cache=True)
+def _get_legal_moves(board: np.ndarray) -> list[tuple[int, int]]:
+    return list(zip(*np.where(board == 0)))
 
 @njit(cache=True)
 def _in_bounds(r: int, c: int, w: int, h: int) -> bool:

@@ -11,7 +11,7 @@ class RandomPlayer(Player):
     def __init__(self):
         pass
 
-    def play(self, game: 'Game', board, player: int):
+    def play(self, game: 'Game', board, player: int, debug: bool = False):
         valid_moves = game.get_valid_moves(board, player)
         if valid_moves.sum() == 0:
             logger.error("No valid moves for random player")
