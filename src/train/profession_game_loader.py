@@ -98,7 +98,7 @@ class ProfessionGameLoader:
         logger.info(f"Successfully loaded and processed {len(all_training_examples)} positions.")
 
         deduplicated = {
-            PenteBoard(board=example[0], captures=np.zeros(self.player_count)).to_string(): example
+            PenteBoard(board=example[0], captures=np.zeros(self.player_count, dtype=np.int8)).to_string(): example
             for example in reversed(all_training_examples)
         }
 

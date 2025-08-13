@@ -186,7 +186,13 @@ class MCTS:
         next_s, next_player = self.game.apply_action(canonical_board, Game.PLAYER_ONE, a)
         next_s = self.game.get_canonical_form(next_s, next_player)
 
-        v = self.search(next_s)
+        # TODO: remove
+        try:
+            v = self.search(next_s)
+        except RecursionError as e:
+            logger.error(f"Caught recursion while searching: {e}")
+            logger.info(f"Board dump:\n{next_s}")
+            exit(1)
 
         if (s, a) in self.qsa:
             self.qsa[(s, a)] = (self.nsa[(s, a)] * self.qsa[(s, a)] + v) / (self.nsa[(s, a)] + 1)

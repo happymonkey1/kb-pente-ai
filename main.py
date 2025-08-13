@@ -132,7 +132,7 @@ if __name__ == "__main__":
         device,
         board_size=board_size,
         action_size=game.get_action_size(),
-        hidden_fc_size=1,
+        hidden_fc_size=1024,
     )
     optimizer = optim.Adam(pente_network.parameters(), lr=1e-3, weight_decay=1e-4)
 
