@@ -34,6 +34,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--infer", action="store_true", help="Enable inference mode")
+    parser.add_argument("--gpu", action="store_true", help="Attempt to run model on the first available GPU")
     parser.add_argument("--infer-games", type=int, help="Number of games to play in inference mode", default=1)
     parser.add_argument("--no-interactive", action="store_true", help="Disable any and all user interactions")
     parser.add_argument("--model-dir", type=str, help="Directory for model checkpoints")
@@ -70,8 +71,7 @@ if __name__ == "__main__":
     )
     logger.info("Starting training")
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+    device = torch.device('cuda' if torch.cuda.is_available() and program_args.gpu else 'cpu')
 
     professional_games_training_iterations = 30
     board_size = 9 # Pente is usually played on 19x19
@@ -111,6 +111,7 @@ if __name__ == "__main__":
     logger.info(f"  num_simulations: {args.mcts_args.num_simulations}")
     logger.info(f"  batch_games: {args.batch_games}")
     logger.info(f"  batch_size: {args.batch_size}")
+    logger.info(f"  device: {device}")
     logger.info(f"  ----------------------")
     logger.info(f"  arena: {args.should_use_arena}")
     logger.info(f"  num_arena_games: {args.num_arena_games}")
