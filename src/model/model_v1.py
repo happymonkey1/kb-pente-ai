@@ -112,10 +112,10 @@ class PenteNet(nn.Module):
 
     @staticmethod
     def load_checkpoint(checkpoint_dir, net, filename="checkpoint.pth.tar", optimizer=None):
-        return PenteNet.load_checkpoint(os.path.join(checkpoint_dir, filename), net, optimizer)
+        return PenteNet.load_checkpoint_from_path(os.path.join(checkpoint_dir, filename), net, optimizer)
 
     @staticmethod
-    def load_checkpoint(filepath: str, net, optimizer=None):
+    def load_checkpoint_from_path(filepath: str, net, optimizer=None):
         """Loads model and training parameters."""
         if not os.path.exists(filepath):
             logger.warning(f"No checkpoint found at '{filepath}'. Starting from scratch.")

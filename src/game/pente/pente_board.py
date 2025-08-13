@@ -79,14 +79,14 @@ def _apply_captures_inplace(board: np.ndarray, r: int, c: int, player: int, opp:
                     board[r1, c1] == opp and
                     board[r2, c2] == opp and
                     board[r3, c3] == player):
-                board[r1, c1], board[r2, c2] = 0, 0
+                board[r1, c1], board[r2, c2] = np.int8(0), np.int8(0)
                 captured_count += 1
 
     return captured_count
 
 @njit
 def _get_canonical_form_two_players_v2(board: np.ndarray, player: int) -> np.ndarray:
-    return player*board
+    return np.int8(player)*board
 
 # @njit(cache=True)
 def _get_canonical_form_two_players(board: np.ndarray, player: int) -> np.ndarray:

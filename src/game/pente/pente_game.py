@@ -44,19 +44,16 @@ class PenteGame(Game):
         return Game.PLAYER_ONE if player == Game.PLAYER_TWO else Game.PLAYER_TWO
 
     def get_valid_moves(self, pente_board: 'PenteBoard', player: int) -> np.ndarray:
-        valids = [0] * self.get_action_size()
-        new_pente_board = PenteBoard.new_board(self.board_size, self.player_count)
-        new_pente_board.board = np.copy(pente_board.board)
-        legal_moves = new_pente_board.get_legal_moves()
+        legal_moves = pente_board.get_legal_moves()
+        valids = np.zeros(self.get_action_size(), dtype=np.int8)
 
-        if len(legal_moves)==0:
-            #valids[-1] = 1
-            return np.array(valids)
+        if not legal_moves:
+            return valids
 
-        for x, y in legal_moves:
-            valids[self.board_size*x+y]=1
+        indices = [self.board_size * x + y for x, y in legal_moves]
+        valids[indices] = 1
 
-        return np.array(valids)
+        return valids
 
     def is_valid_move(self, pente_board: 'PenteBoard', player: int, action: int) -> bool:
         r, c = action // self.board_size, action % self.board_size

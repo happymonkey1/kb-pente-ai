@@ -1,20 +1,35 @@
+import os.path
+import pickle
+
 import numpy as np
 import logging
 
+from src.game.pente.pente_board import PenteBoard
 from src.game.pente.pente_game import PenteGame
 
 logger = logging.getLogger(__name__)
 
 class ProfessionGameLoader:
-    def __init__(self, filepath: str, board_size: int = 19, player_count: int = 2):
-        self.filepath = filepath
+    def __init__(self, raw_filepath: str, processed_filepath: str, board_size: int = 19, player_count: int = 2, force: bool = False):
+        self.raw_filepath = raw_filepath
+        self.processed_filepath = processed_filepath
         self.board_size = board_size
         self.player_count = player_count
+        self.force = force
 
         assert player_count == 2, "Only 2-player games are supported"
         assert board_size == 19, "Only 19x19 boards are supported"
 
     def load_games(self):
+        processed_exists = os.path.exists(self.processed_filepath)
+        if self.force or not processed_exists:
+            return self.__process_games()
+        elif processed_exists:
+            return self.__load_processed_list(self.processed_filepath)
+        else:
+            raise ValueError(f"Failed to load processed dataset file: {self.processed_filepath}")
+
+    def __process_games(self):
         """
         Loads a Pente dataset from a file, parses the games, and generates
         training examples. Each example is a tuple containing the board state
@@ -24,14 +39,13 @@ class ProfessionGameLoader:
             A list of training examples, where each example is a tuple of
             (board_state_array, final_outcome_for_current_player).
         """
-
-        # TODO: generate symmetries
-
         all_training_examples = []
 
-        logger.info(f"Loading dataset from: {self.filepath}")
+        logger.info(f"Loading dataset from: {self.raw_filepath}")
+        if not os.path.exists(self.raw_filepath):
+            raise ValueError(f"Raw dataset file '{self.raw_filepath}' does not exist")
 
-        with open(self.filepath, 'r') as f:
+        with open(self.raw_filepath, 'r') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
@@ -41,21 +55,17 @@ class ProfessionGameLoader:
                 move_sequence = parts[:-1]
                 result_str = parts[-1]
 
-                # 1. Determine the final outcome of the game
                 if result_str == "1-0":
-                    final_winner = 1.0  # Player 1 won
+                    final_winner = 1.0
                 elif result_str == "0-1":
-                    final_winner = -1.0 # Player 2 won (represented as -1 from P1's view)
+                    final_winner = -1.0
                 else:
-                    # Handle draws or other outcomes if necessary
-                    # For this dataset, we assume only wins/losses
                     print(f"Warning: Skipping line {line_num} due to unrecognized result '{result_str}'")
                     continue
 
-                # 2. Simulate the game move by move
                 game = PenteGame(self.board_size, self.player_count)
                 board = game.init_board()
-                current_player = 1 # Player 1 always starts
+                current_player = 1
 
                 for move_str in move_sequence:
                     try:
@@ -77,13 +87,50 @@ class ProfessionGameLoader:
                     board, next_player = game.apply_action(board, current_player, action)
 
                     canonical_board = game.get_canonical_form(board, current_player)
-                    all_training_examples.append((canonical_board.board.copy(), pi, value_for_current_player))
+
+                    symmetries = game.get_symmetries(canonical_board, pi)
+                    for sym_board, sym_pi in symmetries:
+                        all_training_examples.append((sym_board.copy(), sym_pi, value_for_current_player))
 
                     current_player = next_player
 
 
         logger.info(f"Successfully loaded and processed {len(all_training_examples)} positions.")
-        return all_training_examples
+
+        deduplicated = {
+            PenteBoard(board=example[0], captures=np.zeros(self.player_count)).to_string(): example
+            for example in reversed(all_training_examples)
+        }
+
+        deduplicated_examples = list(deduplicated.values())
+
+        logger.info(f"Deduplication leaves {len(deduplicated_examples)}")
+
+        if self.force or not os.path.exists(self.processed_filepath):
+            ProfessionGameLoader.__save_processed_list(deduplicated_examples, self.processed_filepath)
+
+        logger.info("Finished saving processed dataset")
+
+        return deduplicated_examples
+
+    @staticmethod
+    def __save_processed_list(data, filepath: str):
+        logger.info(f"Saving processed dataset to: {filepath}")
+        try:
+            with open(filepath, 'wb') as f:
+                pickle.dump(data, f)
+        except IOError as e:
+            logger.error(f"Failed to save pente processed dataset file '{filepath}': {e}")
+
+    @staticmethod
+    def __load_processed_list(filepath: str):
+        logger.info(f"Loading processed dataset from: {filepath}")
+        try:
+            with open(filepath, 'rb') as f:
+                return pickle.load(f)
+        except IOError as e:
+            logger.error(f"Failed to load pente processed dataset from file '{filepath}': {e}")
+
 
     def parse_move(self, move_str: str):
         """
@@ -111,7 +158,6 @@ class ProfessionGameLoader:
             raise ValueError(f"Invalid column character '{col_char}' in move '{move_str}'")
 
         col = COLS.index(col_char)
-        # Convert 1-based row number to 0-based index
         row = int(row_str) - 1
 
         if not (0 <= row < self.board_size and 0 <= col < self.board_size):

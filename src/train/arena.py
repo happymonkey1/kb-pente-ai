@@ -1,5 +1,6 @@
 import time
 
+from src.train.nnet_player import NNetPlayer
 from src.train.player import Player
 from src.game.game import Game
 
@@ -46,7 +47,16 @@ class Arena:
         while True:
             moves += 1
 
+            get_move_start_time = time.time()
             action = self.__get_player_move(board, current_player)
+            get_move_time = time.time() - get_move_start_time
+
+            if self.debug:
+                logger.info(f"Retrieving move took: {get_move_time}")
+                player = self.player1 if current_player == Game.PLAYER_ONE else self.player2
+                if isinstance(player, NNetPlayer) and player.mcts is not None:
+                    logger.info(f"  Network predictions took: {player.mcts.net_time} ({(player.mcts.net_time / get_move_time):.2%})")
+
             board, next_player = self.game.apply_action(board, current_player, action)
 
             if self.display:

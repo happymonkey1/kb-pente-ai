@@ -30,7 +30,7 @@ class NNetPlayer(Player):
             return np.argmax(masked)
         else:
             canonical_board = game.get_canonical_form(board, player)
-            action_probs = self.mcts.get_action_prob(canonical_board, temp=0)
+            action_probs = self.mcts.get_action_prob(canonical_board, temp=1)
             if debug:
                 _, v = self.net.predict(canonical_board)
                 logger.info(f"{self.name} prediction (mcts): {v * player}")

@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 
 import numpy as np
 import torch
@@ -41,6 +42,9 @@ class MCTS:
         self.es = {}
         self.vs = {}
 
+        # Debugging
+        self.net_time = 0
+
     def reset(self):
         self.qsa = {}
         self.nsa = {}
@@ -49,6 +53,8 @@ class MCTS:
 
         self.es = {}
         self.vs = {}
+
+        self.net_time = 0
 
     def get_action_prob(self, canonical_board: 'PenteBoard', temp=1):
         """
@@ -59,6 +65,8 @@ class MCTS:
             probs: a policy vector where the probability of the ith action is
                    proportional to Nsa[(s,a)]**(1./temp)
         """
+        self.net_time = 0
+
         for i in range(self.args.num_simulations):
             self.search(canonical_board)
 
@@ -121,7 +129,9 @@ class MCTS:
 
         if s not in self.ps:
             # leaf node
+            start_time = time.time()
             self.ps[s], v = self.net.predict(canonical_board)
+            self.net_time += time.time() - start_time
             valid_moves = self.game.get_valid_moves(canonical_board, Game.PLAYER_ONE)
             self.ps[s] = self.ps[s].cpu().numpy().reshape(-1) * valid_moves  # masking invalid moves
             sum_ps_s = np.sum(self.ps[s])
@@ -137,20 +147,40 @@ class MCTS:
             return -v
 
         valid_moves = self.vs[s]
-        cur_best = -float('inf')
-        best_act = -1
+        q_values = np.full(self.game.get_action_size(), -np.inf, dtype=np.float32)
+        nsa_values = np.zeros(self.game.get_action_size(), dtype=np.int32)
 
+        # Gather existing stats into arrays
+        actions_with_stats = []
         for a in range(self.game.get_action_size()):
-            if valid_moves[a]:
-                if (s, a) in self.qsa:
-                    u = self.qsa[(s, a)] + self.args.c_puct * self.ps[s][a] * math.sqrt(self.ns[s]) / (
-                            1 + self.nsa[(s, a)])
-                else:
-                    u = self.args.c_puct * self.ps[s][a] * math.sqrt(self.ns[s] + EPS)
+            if (s, a) in self.qsa:
+                actions_with_stats.append(a)
+                q_values[a] = self.qsa[(s, a)]
+                nsa_values[a] = self.nsa[(s, a)]
 
-                if u > cur_best:
-                    cur_best = u
-                    best_act = a
+        # Calculate UCB score for all valid moves at once
+        # Only calculate for moves with existing stats
+        if len(actions_with_stats) > 0:
+            #ucb_values = np.zeros(self.game.get_action_size(), dtype=np.float32)
+
+            # Calculate PUCT part
+            puct_part = self.args.c_puct * self.ps[s] * (np.sqrt(self.ns[s]) / (1 + nsa_values))
+            ucb_values = q_values + puct_part
+
+            # Mask out invalid moves to ensure they are not chosen
+            ucb_values[~valid_moves.astype(bool)] = -np.inf
+
+            # Select best action
+            best_act = np.argmax(ucb_values)
+
+        else: # If no moves have been explored yet, pick based on policy
+            # Handle the case where no actions have stats yet (all are new)
+            # The original code's logic handles this with the 'else' part of the UCB
+            # We can simplify by just choosing the move with the highest policy * c_puct
+            # since Q and nsa are 0.
+            ucb_values = self.args.c_puct * self.ps[s] * math.sqrt(self.ns[s] + EPS)
+            ucb_values[~valid_moves.astype(bool)] = -np.inf
+            best_act = np.argmax(ucb_values)
 
         a = best_act
         next_s, next_player = self.game.apply_action(canonical_board, Game.PLAYER_ONE, a)

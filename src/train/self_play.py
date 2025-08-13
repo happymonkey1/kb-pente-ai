@@ -1,3 +1,4 @@
+import copy
 import time
 
 from src.game.pente.pente_game import PenteGame
@@ -24,11 +25,14 @@ class SelfPlayTrainerArgs:
     start_iteration: int
     professional_games_training_iterations: int
     self_play_training_iterations: int
+    # Threshold for random exploration
     temp_threshold: float
     mcts_args: MCTSArgs
-    professional_games_training_examples_filepath: str
+    watch_training_raw_dataset_filepath: str
+    watch_training_processed_dataset_filepath: str
+    force_watch_training_raw_dataset_processing: bool
     eval_iteration_interval: int = 1
-    arena_num_games: int = 100
+    num_arena_games: int = 100
     batch_size: int = 8192
     batch_games: int = 1
     update_threshold: float = 0.6
@@ -67,7 +71,7 @@ class SelfPlayTrainer:
         self.policy_loss = torch.nn.CrossEntropyLoss()
         self.value_loss = torch.nn.MSELoss()
 
-        self.previous_net = PenteNet.from_existing_model(self.net)
+        self.previous_net = copy.deepcopy(self.net)
 
     def __play_game(self):
         examples = []
@@ -105,9 +109,13 @@ class SelfPlayTrainer:
         return training_examples
 
     def __load_training_examples(self):
-        loader = ProfessionGameLoader(self.args.professional_games_training_examples_filepath, board_size=self.game.get_board_size())
-        games = loader.load_games()
-        return games
+        loader = ProfessionGameLoader(
+            raw_filepath=self.args.watch_training_raw_dataset_filepath,
+            processed_filepath=self.args.watch_training_processed_dataset_filepath,
+            board_size=self.game.get_board_size(),
+            force=self.args.force_watch_training_raw_dataset_processing
+        )
+        return loader.load_games()
 
     def __get_training_examples_for_current_iteration(self, iteration: int):
         if self.args.professional_games_training_iterations > 0 and iteration < self.args.professional_games_training_iterations:
@@ -166,16 +174,21 @@ class SelfPlayTrainer:
             total_iter_time = time.time() - iter_start_time
             logger.info(f"Iteration {iteration + 1} took {total_iter_time:.2f}s")
 
-            if self.args.should_use_arena and self.args.arena_num_games > 0 and iteration >= self.args.professional_games_training_iterations:
+            if self.args.should_use_arena and self.args.num_arena_games > 0 and iteration >= self.args.professional_games_training_iterations:
                 logger.info(f"Beginning Arena evaluation")
 
                 # Load previous network from cached weights
                 if self.args.should_checkpoint:
-                    PenteNet.load_checkpoint(
-                        checkpoint_dir=self.args.checkpoint_dir,
-                        net=self.previous_net,
-                        filename=self.previous_net.get_checkpoint_file_name(iteration - 1)
-                    )
+                    path = os.path.join(self.args.checkpoint_dir, 'best.pth.tar')
+                    if os.path.exists(path):
+                        PenteNet.load_checkpoint(
+                            checkpoint_dir=self.args.checkpoint_dir,
+                            net=self.previous_net,
+                            filename='best.pth.tar'
+                        )
+                    else:
+                        logger.warn(f"Failed to retrieve best model from '{path}'")
+
 
                 logger.info("Initializing Arena")
                 arena_start = time.time()
@@ -191,9 +204,9 @@ class SelfPlayTrainer:
                 logger.info(f"Arena initialized in {arena_time:.2f}s")
 
                 arena_play_start = time.time()
-                arena_stats = arena.play_games(self.args.arena_num_games)
+                arena_stats = arena.play_games(self.args.num_arena_games)
                 arena_play_time = time.time() - arena_play_start
-                logger.info(f"Arena played {self.args.arena_num_games} games in {arena_play_time:.2f}s")
+                logger.info(f"Arena played {self.args.num_arena_games} games in {arena_play_time:.2f}s")
                 previous_wins, current_wins, draws = arena_stats.p1_wins, arena_stats.p2_wins, arena_stats.draws
 
                 logger.info(f"Arena stats:\n  previous model wins: {previous_wins}\n  current model wins: {current_wins}\n  draws: {draws}")
@@ -207,7 +220,7 @@ class SelfPlayTrainer:
                     PenteNet.load_checkpoint(
                         checkpoint_dir=self.args.checkpoint_dir,
                         net=self.net,
-                        filename=self.net.get_checkpoint_file_name(iteration)
+                        filename='best.pth.tar',
                     )
                 else:
                     logger.info(f"Accepting new model due to high performance")
@@ -223,9 +236,7 @@ class SelfPlayTrainer:
                             filename=self.net.get_checkpoint_file_name(iteration + 1)
                         )
                         PenteNet.save_checkpoint(
-                            state={
-                                'state_dict': self.net.state_dict(),
-                            },
+                            state=training_state,
                             checkpoint_dir=self.args.checkpoint_dir,
                             filename='best.pth.tar'
                         )

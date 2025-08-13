@@ -109,6 +109,9 @@ class PenteGameTest(unittest.TestCase):
         legal_moves = game.get_valid_moves(board, PenteGame.PLAYER_TWO)
         self.assertEqual(1, np.sum(legal_moves == 1))
         self.assertEqual(1, legal_moves[0])
+        self.assertEqual(0, legal_moves[1])
+        self.assertEqual(0, legal_moves[2])
+        self.assertEqual(0, legal_moves[3])
 
 
 if __name__ == '__main__':
