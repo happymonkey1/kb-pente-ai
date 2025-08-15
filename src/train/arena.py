@@ -1,5 +1,7 @@
 import time
 
+import tqdm
+
 from src.train.nnet_player import NNetPlayer
 from src.train.player import Player
 from src.game.game import Game
@@ -89,7 +91,7 @@ class Arena:
         p1_starts = num_games // 2
         total_moves = 0
 
-        for i in range(p1_starts):
+        for i in tqdm.tqdm(range(p1_starts)):
             game_over_stats = self.play_game()
             moves, winner = game_over_stats.moves, game_over_stats.winner
             total_moves += moves
@@ -106,7 +108,7 @@ class Arena:
         if num_games % 2 != 0:
             p1_starts += 1
 
-        for _ in range(p1_starts):
+        for _ in tqdm.tqdm(range(p1_starts)):
             game_over_stats = self.play_game()
             moves, winner = game_over_stats.moves, game_over_stats.winner
             total_moves += moves

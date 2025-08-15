@@ -21,7 +21,7 @@ class PenteDataset(Dataset):
         state, policy, outcome = self.games[idx]
 
         state_tensor = board_to_cpu_tensor(state)
-        policy_tensor = torch.from_numpy(policy)
+        policy_tensor = torch.from_numpy(policy).type(dtype=torch.float32)
         outcome_tensor = torch.tensor(outcome, dtype=torch.float32)
 
         return state_tensor, policy_tensor, outcome_tensor

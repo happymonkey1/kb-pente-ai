@@ -1,5 +1,8 @@
 import copy
+import math
 import time
+
+import tqdm
 
 from src.game.pente.pente_game import PenteGame
 from src.mcts.mcts_v2 import MCTS, MCTSArgs
@@ -103,7 +106,7 @@ class SelfPlayTrainer:
     def __build_self_play_training_examples(self):
         training_examples = []
 
-        for game_index in range(self.args.batch_games):
+        for game_index in tqdm.tqdm(range(self.args.batch_games)):
             training_examples += self.__play_game()
 
         return training_examples
@@ -119,7 +122,7 @@ class SelfPlayTrainer:
 
     def __get_training_examples_for_current_iteration(self, iteration: int):
         if self.args.professional_games_training_iterations > 0 and iteration < self.args.professional_games_training_iterations:
-            if iteration == 0:
+            if iteration == 0 or len(self.training_examples) == 0:
                 logger.info("Loading training examples from professional games...")
                 return self.__load_training_examples()
             else:
@@ -255,41 +258,35 @@ class SelfPlayTrainer:
 
     def __train_model(self, training_examples: list[tuple[np.ndarray, np.ndarray, float]]) -> ModelTrainingStats:
         num_batches = 0
-        dataloader = DataLoader(PenteDataset(training_examples), batch_size=self.args.batch_size, shuffle=True)
+        pin_memory = True if self.device != torch.device("cpu") else False
+        dataloader = DataLoader(
+            PenteDataset(training_examples),
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            pin_memory=pin_memory,
+        )
         total_loss, total_policy_loss, total_value_loss = 0, 0, 0
 
         logger.info(f"Training with {len(training_examples)} training positions")
-        for batch_idx, batch in enumerate(dataloader, 1):
+        logger.info(f"  batches: {math.ceil(len(training_examples) / self.args.batch_size)}")
+        logger.info(f"  pin_memory: {pin_memory}")
+        for batch_idx, batch in tqdm.tqdm(enumerate(dataloader, 1)):
+            batch_start_time = time.time()
             states, target_policies, target_values = batch
-            states = states.to(self.device)
-            target_policies = target_policies.to(self.device)
-            target_values = target_values.to(self.device).view(-1, 1)
+            states = states.to(self.device, non_blocking=pin_memory)
+            target_policies = target_policies.to(self.device, non_blocking=pin_memory)
+            target_values = target_values.to(self.device, non_blocking=pin_memory).view(-1, 1)
 
             self.optimizer.zero_grad()
 
             pred_policies_logits, pred_values = self.net.forward(states)
-
-            if self.args.debug:
-                if torch.isnan(states).any():
-                    logger.error("Detected NaN in states")
-
-                if torch.isnan(target_policies).any():
-                    logger.error("Detected NaN in target_policies")
-
-                if torch.isnan(target_values).any():
-                    logger.error("Detected NaN in target_values")
-
-                if torch.isnan(pred_policies_logits).any():
-                    logger.error("Detected NaN in pred_policies_logits")
-
-                if torch.isnan(pred_values).any():
-                    logger.error("Detected NaN in pred_values")
 
             p_loss = self.policy_loss(pred_policies_logits, target_policies.type(dtype=torch.float32))
             v_loss = self.value_loss(pred_values, target_values)
             loss = p_loss + v_loss
 
             loss.backward()
+
             torch.nn.utils.clip_grad_value_(self.net.parameters(), 1.0)
             self.optimizer.step()
 
@@ -297,6 +294,10 @@ class SelfPlayTrainer:
             total_policy_loss += p_loss.item()
             total_value_loss += v_loss.item()
             num_batches += 1
+
+            batch_time = time.time() - batch_start_time
+            if self.args.debug:
+                logger.info(f"Finished batch {batch_idx} in {batch_time:.2f} seconds")
 
         return ModelTrainingStats(total_loss, total_policy_loss, total_value_loss, num_batches)
 

@@ -29,9 +29,9 @@ class PenteNet(nn.Module):
         board_size=19,
         #action_size=19*19+1,
         action_size=19*19,
-        num_res_blocks=6,
-        num_channels=512,
-        hidden_fc_size: int = 1024,
+        num_res_blocks=5,
+        num_channels=256,
+        hidden_fc_size: int = 256,
     ):
         super().__init__()
         self.device = device

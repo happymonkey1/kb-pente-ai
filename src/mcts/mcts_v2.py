@@ -150,7 +150,6 @@ class MCTS:
         q_values = np.full(self.game.get_action_size(), -np.inf, dtype=np.float32)
         nsa_values = np.zeros(self.game.get_action_size(), dtype=np.int32)
 
-        # Gather existing stats into arrays
         actions_with_stats = []
         for a in range(self.game.get_action_size()):
             if (s, a) in self.qsa:
@@ -158,26 +157,15 @@ class MCTS:
                 q_values[a] = self.qsa[(s, a)]
                 nsa_values[a] = self.nsa[(s, a)]
 
-        # Calculate UCB score for all valid moves at once
-        # Only calculate for moves with existing stats
         if len(actions_with_stats) > 0:
-            #ucb_values = np.zeros(self.game.get_action_size(), dtype=np.float32)
-
-            # Calculate PUCT part
             puct_part = self.args.c_puct * self.ps[s] * (np.sqrt(self.ns[s]) / (1 + nsa_values))
             ucb_values = q_values + puct_part
 
-            # Mask out invalid moves to ensure they are not chosen
             ucb_values[~valid_moves.astype(bool)] = -np.inf
 
-            # Select best action
             best_act = np.argmax(ucb_values)
 
-        else: # If no moves have been explored yet, pick based on policy
-            # Handle the case where no actions have stats yet (all are new)
-            # The original code's logic handles this with the 'else' part of the UCB
-            # We can simplify by just choosing the move with the highest policy * c_puct
-            # since Q and nsa are 0.
+        else:
             ucb_values = self.args.c_puct * self.ps[s] * math.sqrt(self.ns[s] + EPS)
             ucb_values[~valid_moves.astype(bool)] = -np.inf
             best_act = np.argmax(ucb_values)

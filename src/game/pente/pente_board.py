@@ -38,7 +38,9 @@ class PenteBoard:
         return PenteBoard(new_board, new_captures)
 
     def get_capture_count(self, player: int) -> int:
-        return self.captures[player-1]
+        assert self.captures.size == 2, "get_capture_count only supports two players"
+        index = 0 if player == Game.PLAYER_ONE else 1
+        return self.captures[index]
 
     def get_legal_moves(self) -> list[tuple[int, int]]:
         return _get_legal_moves(self.board)

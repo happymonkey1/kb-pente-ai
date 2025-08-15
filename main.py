@@ -47,6 +47,7 @@ if __name__ == "__main__":
     parser.add_argument("--arena", action="store_true", help="Enable Arena during self-play training")
     parser.add_argument("--num-arena-games", type=int, help="Number of games to play during Arena evaluation", default=35)
     parser.add_argument("--arena-threshold", type=clamped_float, metavar="[0.0-1.0]", help="Threshold ([0.0, 1.0]) for whether the current model should promoted during Arena self-play.", default=0.6)
+    parser.add_argument("--board-size", type=int, help="Size of the board", default=19)
 
     parser.add_argument("--raw-dataset", type=str, help="Path to the raw 'pro' examples dataset", default="data/pente_dataset.txt")
     parser.add_argument("--processed-dataset", type=str, help="Path to the 'pro' processed examples dataset", default="data/pente-dataset-processed.pkl")
@@ -73,8 +74,8 @@ if __name__ == "__main__":
 
     device = torch.device('cuda' if torch.cuda.is_available() and program_args.gpu else 'cpu')
 
-    professional_games_training_iterations = 30
-    board_size = 9 # Pente is usually played on 19x19
+    professional_games_training_iterations = 0
+    board_size = program_args.board_size # Pente is usually played on 19x19
     if professional_games_training_iterations:
         # Professional game dataset is played on 19x19, so we force the board size
         board_size = 19
@@ -111,6 +112,7 @@ if __name__ == "__main__":
     logger.info(f"  num_simulations: {args.mcts_args.num_simulations}")
     logger.info(f"  batch_games: {args.batch_games}")
     logger.info(f"  batch_size: {args.batch_size}")
+    logger.info(f"  board_size: {args.board_size}")
     logger.info(f"  device: {device}")
     logger.info(f"  ----------------------")
     logger.info(f"  arena: {args.should_use_arena}")
@@ -132,14 +134,12 @@ if __name__ == "__main__":
         device,
         board_size=board_size,
         action_size=game.get_action_size(),
-        hidden_fc_size=1024,
+        num_res_blocks=8,
+        num_channels=512,
+        hidden_fc_size=768,
     )
-    optimizer = optim.Adam(pente_network.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    if program_args.model:
-        logger.info(f"Trying to load model: '{program_args.model}'")
-        start_iteration = PenteNet.load_checkpoint_from_path(program_args.model, pente_network, optimizer=optimizer)
-        args.start_iteration = start_iteration
+    optimizer = optim.AdamW(pente_network.parameters(), lr=1e-3, weight_decay=1e-4, foreach=True)
 
     # Compile model and do other torch initialization
     # TODO: this only works on Linux, and my hardware...
@@ -148,6 +148,12 @@ if __name__ == "__main__":
         pente_network.compile(fullgraph=True)
 
         torch.set_float32_matmul_precision('high')
+
+    if program_args.model:
+        logger.info(f"Trying to load model: '{program_args.model}'")
+        start_iteration = PenteNet.load_checkpoint_from_path(program_args.model, pente_network, optimizer=optimizer)
+        args.start_iteration = start_iteration
+
 
     logger.info(
         f"Created PenteNet with {pente_network.get_parameter_count()} trainable parameters"
@@ -221,7 +227,7 @@ if __name__ == "__main__":
 
         arena = Arena(
             player1=NNetPlayer(pente_network, mcts1, name="Player1"),
-            player2=RandomPlayer(),#NNetPlayer(pente_network, mcts2, name="Player2"),
+            player2=NNetPlayer(pente_network, mcts2, name="Player2"),
             game=game,
             debug=True,
             display=pretty_print_board
