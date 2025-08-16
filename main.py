@@ -98,7 +98,7 @@ if __name__ == "__main__":
         update_threshold=program_args.arena_threshold,
         checkpoint_dir=program_args.model_dir if program_args.model_dir else f"pente-model-v1.3",
         should_checkpoint=True,
-        max_training_examples = 0,
+        max_training_examples = 256_000,
         board_size=board_size,
         player_count=2,
         debug=program_args.debug,
@@ -134,12 +134,12 @@ if __name__ == "__main__":
         device,
         board_size=board_size,
         action_size=game.get_action_size(),
-        num_res_blocks=8,
+        num_res_blocks=4,
         num_channels=512,
         hidden_fc_size=768,
     )
 
-    optimizer = optim.AdamW(pente_network.parameters(), lr=1e-3, weight_decay=1e-4, foreach=True)
+    optimizer = optim.SGD(pente_network.parameters(), lr=1e-3, weight_decay=1e-4, foreach=True)
 
     # Compile model and do other torch initialization
     # TODO: this only works on Linux, and my hardware...

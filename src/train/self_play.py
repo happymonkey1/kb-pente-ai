@@ -227,12 +227,12 @@ class SelfPlayTrainer:
                     )
                 else:
                     logger.info(f"Accepting new model due to high performance")
-                    training_state = {
-                        'iteration': iteration + 1,
-                        'state_dict': self.net.state_dict(),
-                        'optimizer': self.optimizer.state_dict(),
-                    }
                     if self.args.should_checkpoint:
+                        training_state = {
+                            'iteration': iteration + 1,
+                            'state_dict': self.net.state_dict(),
+                            'optimizer': self.optimizer.state_dict(),
+                        }
                         PenteNet.save_checkpoint(
                             state=training_state,
                             checkpoint_dir=self.args.checkpoint_dir,
