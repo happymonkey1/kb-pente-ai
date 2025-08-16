@@ -5,7 +5,13 @@ AlphaZero inspired machine learning applied to the board game Pente.
 
 Spiritual successor to my [college thesis' source code](https://github.com/happymonkey1/uci-chc-NNUE-thesis).
 
+## Dependencies
+- [uv](https://docs.astral.sh/uv/)
+  - `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
+## Developer Setup
+
+- `uv sync`
 
 ## Usage
 
