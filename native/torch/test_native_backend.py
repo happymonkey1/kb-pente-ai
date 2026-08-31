@@ -11,6 +11,9 @@ from src.game.pente.rules import PenteRuleset
 from src.mcts.mcts_v2 import MCTSArgs
 from src.mcts.native_backend import NativeSearchBackend
 from src.model.model_v1 import PenteNet
+from src.train.arena import Arena
+from src.train.native_player import NativeMCTSPlayer
+from src.train.player import Player
 from src.train.self_play_generation import SelfPlayGenerator
 
 
@@ -306,6 +309,57 @@ class NativeBackendExtensionTests(unittest.TestCase):
             )
             self.assertEqual(1.0, float(example.policy.sum()))
             self.assertEqual(0.0, float(example.policy[legal == 0].sum()))
+
+    def test_native_arena_player_reuses_a_bounded_tree(self) -> None:
+        class FirstLegalPlayer(Player):
+            def play(
+                self,
+                game: PenteGame,
+                board: PenteBoard,
+                player: int,
+                debug: bool = False,
+            ) -> int:
+                del debug
+                return int(np.flatnonzero(game.get_valid_moves(board, player))[0])
+
+        game = PenteGame(5, ruleset=PenteRuleset.FREESTYLE)
+        net = PenteNet(
+            torch.device("cpu"),
+            board_size=5,
+            action_size=25,
+            num_res_blocks=1,
+            num_channels=4,
+            hidden_fc_size=8,
+        )
+        net.eval()
+        args = MCTSArgs(num_simulations=1, root_noise_epsilon=0.0)
+        backends: list[NativeSearchBackend] = []
+
+        def native_factory(*factory_args, **factory_kwargs):
+            backend = NativeSearchBackend(
+                *factory_args,
+                extension=self.extension,
+                pin_memory=False,
+                **factory_kwargs,
+            )
+            backends.append(backend)
+            return backend
+
+        native = NativeMCTSPlayer(
+            net,
+            game,
+            args,
+            seed=83,
+            native_worker_threads=2,
+            _native_backend_factory=native_factory,
+        )
+        arena = Arena(FirstLegalPlayer(), native, game)
+        stats = arena.play_games(1)
+
+        self.assertGreater(stats.avg_moves, 0.0)
+        self.assertEqual(1, len(backends))
+        self.assertEqual(1, backends[0].capacity)
+        native.reset()
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda_pinned_transfer_and_wait_timing(self) -> None:
