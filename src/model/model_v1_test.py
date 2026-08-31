@@ -74,6 +74,40 @@ class PenteNetTest(unittest.TestCase):
         np.testing.assert_allclose(single_policy, batch_policies[0])
         self.assertAlmostEqual(single_value, float(batch_values[0]))
 
+    def test_tensor_feature_evaluation_stays_on_torch_boundary(self) -> None:
+        positions = (
+            PenteBoard.new_board(5),
+            PenteBoard.new_board(5).apply_move(1, (0, 0)),
+        )
+        inputs = positions_to_tensor(positions, self.device)
+        self.net.eval()
+
+        policies, values = self.net.evaluate_features(inputs)
+
+        self.assertIsInstance(policies, torch.Tensor)
+        self.assertIsInstance(values, torch.Tensor)
+        self.assertEqual(torch.float32, policies.dtype)
+        self.assertEqual(torch.float32, values.dtype)
+        self.assertEqual(torch.device("cpu"), policies.device)
+        self.assertEqual(torch.device("cpu"), values.device)
+        self.assertEqual((2, 25), tuple(policies.shape))
+        self.assertEqual((2,), tuple(values.shape))
+        self.assertTrue(policies.is_contiguous())
+        self.assertTrue(values.is_contiguous())
+        self.assertFalse(policies.requires_grad)
+        self.assertFalse(values.requires_grad)
+        np_policies, np_values = self.net.evaluate_batch(positions)
+        np.testing.assert_allclose(policies.numpy(), np_policies)
+        np.testing.assert_allclose(values.numpy(), np_values)
+
+    def test_tensor_feature_evaluation_rejects_wrong_boundary(self) -> None:
+        with self.assertRaises(ValueError):
+            self.net.evaluate_features(torch.zeros((1, 4, 6, 6), dtype=torch.float32))
+        with self.assertRaises(ValueError):
+            self.net.evaluate_features(torch.zeros((1, 4, 5, 5), dtype=torch.float64))
+        with self.assertRaises(ValueError):
+            self.net.evaluate_features(torch.zeros((0, 4, 5, 5), dtype=torch.float32))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda_autocast_evaluation_returns_float32_numpy_arrays(self) -> None:
         device = torch.device("cuda")

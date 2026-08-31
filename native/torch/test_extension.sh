@@ -11,5 +11,7 @@ trap 'rm -rf "$build_root"' EXIT
 MAX_JOBS="${MAX_JOBS:-2}" "$python_bin" "$script_dir/setup.py" build_ext \
     --build-temp "$build_root/temp" \
     --build-lib "$build_root/lib"
-PYTHONPATH="$build_root/lib${PYTHONPATH:+:$PYTHONPATH}" \
+PYTHONPATH="$repository_root:$build_root/lib${PYTHONPATH:+:$PYTHONPATH}" \
     "$python_bin" "$script_dir/test_binding.py"
+PYTHONPATH="$repository_root:$build_root/lib${PYTHONPATH:+:$PYTHONPATH}" \
+    "$python_bin" "$script_dir/test_native_backend.py"

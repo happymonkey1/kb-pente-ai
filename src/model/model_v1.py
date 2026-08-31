@@ -115,26 +115,66 @@ class PenteNet(nn.Module):
         value = torch.tanh(self.fc_value_out(value))
         return policy, value
 
-    def evaluate(self, position: PenteBoard) -> tuple[np.ndarray, float]:
-        policies, values = self.evaluate_batch((position,))
-        return policies[0], float(values[0])
+    def evaluate_features(
+        self,
+        inputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate already encoded NCHW features on the model device.
 
-    def evaluate_batch(self, positions: Sequence[PenteBoard]) -> tuple[np.ndarray, np.ndarray]:
+        This boundary is used by the native search adapter, so it deliberately
+        keeps both outputs as detached Torch tensors on ``self.device``.  The
+        position-object and NumPy conversion path remains in
+        :meth:`evaluate_batch` for the existing Python search and training
+        callers.
+        """
+        if not isinstance(inputs, torch.Tensor):
+            raise TypeError("Tensor evaluation requires a torch.Tensor input")
+        expected_trailing_shape = (
+            self.config.input_planes,
+            self.board_size,
+            self.board_size,
+        )
+        if inputs.ndim != 4 or tuple(inputs.shape[1:]) != expected_trailing_shape:
+            raise ValueError(
+                "Tensor evaluation requires shape "
+                f"(batch, {self.config.input_planes}, {self.board_size}, {self.board_size}), "
+                f"found {tuple(inputs.shape)}"
+            )
+        if inputs.shape[0] < 1:
+            raise ValueError("Tensor evaluation requires at least one feature row")
+        if inputs.dtype != torch.float32:
+            raise ValueError(
+                f"Tensor evaluation requires float32 features, found {inputs.dtype}"
+            )
+        if not _same_device(inputs.device, self.device):
+            raise ValueError(
+                f"Tensor evaluation requires features on {self.device}, found {inputs.device}"
+            )
+        if not inputs.is_contiguous():
+            raise ValueError("Tensor evaluation requires contiguous NCHW features")
+
         use_autocast = self.device.type == "cuda"
         autocast_dtype = (
             torch.bfloat16
             if use_autocast and torch.cuda.is_bf16_supported()
             else torch.float16
         )
-        with torch.inference_mode():
-            inputs = positions_to_tensor(positions, self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=autocast_dtype,
-                enabled=use_autocast,
-            ):
-                policy_logits, values = self.forward(inputs)
-                policies = F.softmax(policy_logits, dim=1)
+        with torch.inference_mode(), torch.autocast(
+            device_type=self.device.type,
+            dtype=autocast_dtype,
+            enabled=use_autocast,
+        ):
+            policy_logits, values = self.forward(inputs)
+            policies = F.softmax(policy_logits, dim=1)
+        return policies.detach().float(), values.detach().float().reshape(-1)
+
+    def evaluate(self, position: PenteBoard) -> tuple[np.ndarray, float]:
+        policies, values = self.evaluate_batch((position,))
+        return policies[0], float(values[0])
+
+    def evaluate_batch(self, positions: Sequence[PenteBoard]) -> tuple[np.ndarray, np.ndarray]:
+        inputs = positions_to_tensor(positions, self.device)
+        policies, values = self.evaluate_features(inputs)
         return (
             policies.detach().float().cpu().numpy(),
             values.detach().float().cpu().numpy().reshape(-1),
@@ -305,3 +345,9 @@ class ResBlock(nn.Module):
         hidden = F.relu(self.bn1(self.conv1(inputs)))
         hidden = self.bn2(self.conv2(hidden))
         return F.relu(hidden + residual)
+
+
+def _same_device(actual: torch.device, expected: torch.device) -> bool:
+    return actual.type == expected.type and (
+        expected.index is None or actual.index == expected.index
+    )
