@@ -195,6 +195,54 @@ void test_legal_action_rejection() {
             (void)kb_pente::apply_action(even, 0, Ruleset::Tournament);
         },
         "transition rejects an even tournament board");
+
+    Position invalid = Position::initial(9);
+    invalid.stones[0] = 2;
+    expect(!kb_pente::is_legal_action(invalid, Ruleset::Freestyle, 1),
+           "invalid position is rejected without throwing");
+    expect(!kb_pente::is_legal_action(
+               position, static_cast<Ruleset>(255), 1),
+           "invalid ruleset is rejected without throwing");
+}
+
+void expect_mask_matches_public_actions(
+    const kb_pente::Position& position,
+    kb_pente::Ruleset ruleset,
+    const char* message) {
+    const auto mask = kb_pente::legal_action_mask(position, ruleset);
+    for (kb_pente::Action action = 0;
+         action < position.action_count(); ++action) {
+        expect(
+            mask.contains(action) ==
+                kb_pente::is_legal_action(position, ruleset, action),
+            message);
+    }
+}
+
+void test_legal_mask_matches_public_actions() {
+    using kb_pente::Position;
+    using kb_pente::Ruleset;
+
+    const Position freestyle = Position::initial(9);
+    expect_mask_matches_public_actions(
+        freestyle, Ruleset::Freestyle,
+        "freestyle mask agrees with public action validation");
+
+    const Position standard = Position::initial(9);
+    expect_mask_matches_public_actions(
+        standard, Ruleset::Standard,
+        "standard mask agrees with public action validation");
+
+    Position tournament = Position::initial(9);
+    tournament = kb_pente::apply_action(
+                     tournament, action_at(9, 4, 4), Ruleset::Tournament)
+                     .position;
+    tournament = kb_pente::apply_action(
+                     tournament, 0, Ruleset::Tournament)
+                     .position;
+    expect_mask_matches_public_actions(
+        tournament, Ruleset::Tournament,
+        "tournament mask agrees with public action validation");
 }
 
 void test_initial_positions_at_boundaries() {
@@ -714,6 +762,7 @@ int main() {
         test_position_invariants();
         test_legal_actions_and_openings();
         test_legal_action_rejection();
+        test_legal_mask_matches_public_actions();
         test_single_captures_for_both_players();
         test_captures_in_all_eight_directions();
         test_multiple_captures_and_capture_wins();

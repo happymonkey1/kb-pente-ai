@@ -27,15 +27,11 @@ namespace {
     return row_distance >= 3 || column_distance >= 3;
 }
 
-}  // namespace
-
-bool is_legal_action(
+[[nodiscard]] bool is_legal_action_for_valid_position(
     const Position& position,
     Ruleset ruleset,
     Action action) noexcept {
-    if (!position.is_valid() ||
-        !is_valid_ruleset_configuration(position.board_size, ruleset) ||
-        !position.is_active_action(action) || position.stones[action] != 0) {
+    if (position.stones[action] != 0) {
         return false;
     }
 
@@ -52,6 +48,21 @@ bool is_legal_action(
            is_outside_tournament_exclusion(position, action);
 }
 
+}  // namespace
+
+bool is_legal_action(
+    const Position& position,
+    Ruleset ruleset,
+    Action action) noexcept {
+    if (!position.is_valid() ||
+        !is_valid_ruleset_configuration(position.board_size, ruleset) ||
+        !position.is_active_action(action)) {
+        return false;
+    }
+
+    return is_legal_action_for_valid_position(position, ruleset, action);
+}
+
 ActionMask legal_action_mask(const Position& position, Ruleset ruleset) {
     position.validate();
     if (!is_valid_ruleset_configuration(position.board_size, ruleset)) {
@@ -60,7 +71,7 @@ ActionMask legal_action_mask(const Position& position, Ruleset ruleset) {
 
     ActionMask mask;
     for (Action action = 0; action < position.action_count(); ++action) {
-        if (is_legal_action(position, ruleset, action)) {
+        if (is_legal_action_for_valid_position(position, ruleset, action)) {
             mask.set(action);
         }
     }
