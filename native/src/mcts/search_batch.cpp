@@ -52,6 +52,7 @@ SearchBatch::SearchBatch(
     : config_(validate_config(config)),
       slots_(validate_capacity(max_active_games)),
       selection_scratch_(max_active_games),
+      inference_workspace_(max_active_games),
       worker_pool_(validate_workers(worker_threads)) {
     requests_.reserve(max_active_games);
 }
@@ -97,6 +98,7 @@ Selection SearchBatch::select() {
     }
 
     requests_.clear();
+    inference_workspace_.clear();
     for (SelectionScratch& scratch : selection_scratch_) {
         scratch.has_request = false;
         scratch.leaf = kInvalidNode;
@@ -128,12 +130,29 @@ Selection SearchBatch::select() {
                 throw std::logic_error(
                     "SearchBatch selected leaf is not pending");
             }
-            requests_.push_back(LeafRequest{
+            const Position* position =
+                &selected_slot.session->tree().leaf_position(scratch.leaf);
+            inference_workspace_.add(InferenceCandidate{
                 slot,
                 scratch.leaf,
-                &selected_slot.session->tree().leaf_position(scratch.leaf),
+                position,
+                selected_slot.tree->ruleset(),
             });
         }
+
+        inference_workspace_.finalize();
+        for (std::size_t index = 0U;
+             index < inference_workspace_.unique_count();
+             ++index) {
+            const InferenceCandidate& representative =
+                inference_workspace_.representative(index);
+            requests_.push_back(LeafRequest{
+                representative.slot,
+                representative.leaf,
+                representative.position,
+            });
+        }
+        update_deduplication_telemetry();
     } catch (...) {
         poison();
         throw;
@@ -143,7 +162,12 @@ Selection SearchBatch::select() {
     if (!requests_.empty()) {
         pending_token_ = last_token_;
     }
-    return Selection{last_token_, requests_.data(), requests_.size()};
+    return Selection{
+        last_token_,
+        requests_.data(),
+        requests_.size(),
+        inference_workspace_.raw_count(),
+    };
 }
 
 void SearchBatch::backup(
@@ -190,23 +214,26 @@ void SearchBatch::backup(
 
     try {
         worker_pool_.parallel_for(
-            requests_.size(), [this, policies, policy_stride, values](
-                                  std::size_t request_index) {
-                const LeafRequest& request = requests_[request_index];
-                Slot& slot = slots_[request.slot];
+            inference_workspace_.raw_count(),
+            [this, policies, policy_stride, values](std::size_t request_index) {
+                const InferenceCandidate& candidate =
+                    inference_workspace_.raw_candidate(request_index);
+                Slot& slot = slots_[candidate.slot];
                 if (!slot.tree || !slot.session ||
                     !slot.tree->has_pending_evaluation() ||
-                    slot.tree->pending_leaf() != request.leaf) {
+                    slot.tree->pending_leaf() != candidate.leaf) {
                     throw std::logic_error(
                         "SearchBatch backup leaf is no longer pending");
                 }
+                const std::size_t evaluation_index =
+                    inference_workspace_.evaluation_index_for_raw(request_index);
                 const std::size_t active_actions =
-                    request.position->action_count();
+                    candidate.position->action_count();
                 slot.session->accept_evaluation(
-                    request.leaf,
-                    policies + request_index * policy_stride,
+                    candidate.leaf,
+                    policies + evaluation_index * policy_stride,
                     active_actions,
-                    values[request_index]);
+                    values[evaluation_index]);
             });
     } catch (...) {
         poison();
@@ -215,6 +242,7 @@ void SearchBatch::backup(
 
     pending_token_ = kInvalidBatchToken;
     requests_.clear();
+    inference_workspace_.clear();
 }
 
 bool SearchBatch::complete() const noexcept {
@@ -344,6 +372,7 @@ RootAdvanceStats SearchBatch::advance_root(
             checked.session = std::move(session);
         }
         requests_.clear();
+        inference_workspace_.clear();
         return stats;
     } catch (...) {
         poison();
@@ -422,6 +451,80 @@ const SearchBatch::Slot& SearchBatch::checked_slot(SlotId slot) const {
         throw std::out_of_range("SearchBatch slot is out of range");
     }
     return slots_[slot];
+}
+
+void SearchBatch::update_deduplication_telemetry() {
+    static_assert(
+        std::numeric_limits<std::size_t>::digits <=
+            std::numeric_limits<std::uint64_t>::digits,
+        "SearchBatch deduplication counters require a uint64_t-sized size_t");
+
+    const std::size_t raw_count = inference_workspace_.raw_count();
+    const std::size_t unique_count = inference_workspace_.unique_count();
+    if (unique_count > raw_count) {
+        throw std::logic_error(
+            "Inference workspace unique count exceeds raw count");
+    }
+
+    const std::uint64_t raw_requests = static_cast<std::uint64_t>(raw_count);
+    const std::uint64_t unique_evaluations =
+        static_cast<std::uint64_t>(unique_count);
+    const std::uint64_t eliminated_duplicates =
+        raw_requests - unique_evaluations;
+
+    DeduplicationStats last_wave{};
+    last_wave.selection_waves = 1U;
+    last_wave.raw_evaluation_requests = raw_requests;
+    last_wave.unique_evaluations = unique_evaluations;
+    last_wave.eliminated_duplicate_evaluations = eliminated_duplicates;
+    last_wave.duplicate_leaf_rate =
+        raw_requests == 0U
+            ? 0.0
+            : static_cast<double>(eliminated_duplicates) /
+                  static_cast<double>(raw_requests);
+    if (!std::isfinite(last_wave.duplicate_leaf_rate)) {
+        throw std::overflow_error(
+            "SearchBatch deduplication rate is not finite");
+    }
+
+    DeduplicationStats cumulative = deduplication_telemetry_.cumulative;
+    const auto checked_add = [](std::uint64_t current,
+                                std::uint64_t increment,
+                                const char* message) {
+        if (increment > std::numeric_limits<std::uint64_t>::max() - current) {
+            throw std::overflow_error(message);
+        }
+        return current + increment;
+    };
+    cumulative.selection_waves = checked_add(
+        cumulative.selection_waves,
+        last_wave.selection_waves,
+        "SearchBatch deduplication wave counter overflow");
+    cumulative.raw_evaluation_requests = checked_add(
+        cumulative.raw_evaluation_requests,
+        last_wave.raw_evaluation_requests,
+        "SearchBatch deduplication raw counter overflow");
+    cumulative.unique_evaluations = checked_add(
+        cumulative.unique_evaluations,
+        last_wave.unique_evaluations,
+        "SearchBatch deduplication unique counter overflow");
+    cumulative.eliminated_duplicate_evaluations = checked_add(
+        cumulative.eliminated_duplicate_evaluations,
+        last_wave.eliminated_duplicate_evaluations,
+        "SearchBatch deduplication duplicate counter overflow");
+    cumulative.duplicate_leaf_rate =
+        cumulative.raw_evaluation_requests == 0U
+            ? 0.0
+            : static_cast<double>(
+                  cumulative.eliminated_duplicate_evaluations) /
+                  static_cast<double>(cumulative.raw_evaluation_requests);
+    if (!std::isfinite(cumulative.duplicate_leaf_rate)) {
+        throw std::overflow_error(
+            "SearchBatch cumulative deduplication rate is not finite");
+    }
+
+    deduplication_telemetry_.cumulative = cumulative;
+    deduplication_telemetry_.last_wave = last_wave;
 }
 
 SearchBatch::Slot& SearchBatch::checked_slot(SlotId slot) {

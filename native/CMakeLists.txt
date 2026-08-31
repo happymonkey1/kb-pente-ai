@@ -87,6 +87,7 @@ if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_library(kb_pente_mcts STATIC
+    src/mcts/inference_workspace.cpp
     src/mcts/tree_arena.cpp
     src/mcts/tree.cpp
     src/mcts/search_session.cpp
@@ -208,6 +209,14 @@ if(BUILD_TESTING)
     )
     target_link_libraries(kb_pente_native_search_batch_tests PRIVATE kb_pente_mcts)
 
+    add_executable(kb_pente_native_inference_workspace_tests
+        tests/inference_workspace_test.cpp
+    )
+    target_link_libraries(
+        kb_pente_native_inference_workspace_tests
+        PRIVATE kb_pente_mcts
+    )
+
     add_executable(kb_pente_native_worker_pool_tests
         tests/worker_pool_test.cpp
     )
@@ -320,6 +329,18 @@ if(BUILD_TESTING)
     endif()
 
     if(MSVC)
+        target_compile_options(
+            kb_pente_native_inference_workspace_tests
+            PRIVATE /W4 /permissive-
+        )
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            kb_pente_native_inference_workspace_tests
+            PRIVATE -Wall -Wextra -Wpedantic
+        )
+    endif()
+
+    if(MSVC)
         target_compile_options(kb_pente_native_worker_pool_tests PRIVATE /W4 /permissive-)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_worker_pool_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -386,6 +407,16 @@ if(BUILD_TESTING)
     endif()
 
     if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_inference_workspace_tests PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_inference_workspace_tests PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_worker_pool_tests PRIVATE
             -fsanitize=address,undefined
             -fno-omit-frame-pointer
@@ -409,6 +440,10 @@ if(BUILD_TESTING)
     add_test(NAME kb_pente_native_advance COMMAND kb_pente_native_advance_tests)
     add_test(NAME kb_pente_native_telemetry COMMAND kb_pente_native_telemetry_tests)
     add_test(NAME kb_pente_native_search_batch COMMAND kb_pente_native_search_batch_tests)
+    add_test(
+        NAME kb_pente_native_inference_workspace
+        COMMAND kb_pente_native_inference_workspace_tests
+    )
     add_test(NAME kb_pente_native_worker_pool COMMAND kb_pente_native_worker_pool_tests)
     set_tests_properties(kb_pente_native_worker_pool PROPERTIES TIMEOUT 60)
 

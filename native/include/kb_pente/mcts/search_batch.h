@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "kb_pente/mcts/inference_workspace.h"
 #include "kb_pente/mcts/search_session.h"
 #include "kb_pente/parallel/worker_pool.h"
 
@@ -38,12 +39,64 @@ struct LeafRequest final {
     }
 };
 
+// DeduplicationStats is a detached snapshot of one selection-wave grouping
+// interval. Rates are derived from the corresponding raw and eliminated
+// counts and are zero when no leaves were selected.
+struct DeduplicationStats final {
+    std::uint64_t selection_waves = 0U;
+    std::uint64_t raw_evaluation_requests = 0U;
+    std::uint64_t unique_evaluations = 0U;
+    std::uint64_t eliminated_duplicate_evaluations = 0U;
+    double duplicate_leaf_rate = 0.0;
+};
+
+[[nodiscard]] inline bool operator==(
+    const DeduplicationStats& left,
+    const DeduplicationStats& right) noexcept {
+    return left.selection_waves == right.selection_waves &&
+           left.raw_evaluation_requests == right.raw_evaluation_requests &&
+           left.unique_evaluations == right.unique_evaluations &&
+           left.eliminated_duplicate_evaluations ==
+               right.eliminated_duplicate_evaluations &&
+           left.duplicate_leaf_rate == right.duplicate_leaf_rate;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const DeduplicationStats& left,
+    const DeduplicationStats& right) noexcept {
+    return !(left == right);
+}
+
+// DeduplicationTelemetry keeps both the cumulative run report and the most
+// recently grouped wave so callers can inspect optimization behavior without
+// observing mutable SearchBatch internals.
+struct DeduplicationTelemetry final {
+    DeduplicationStats cumulative{};
+    DeduplicationStats last_wave{};
+};
+
+[[nodiscard]] inline bool operator==(
+    const DeduplicationTelemetry& left,
+    const DeduplicationTelemetry& right) noexcept {
+    return left.cumulative == right.cumulative &&
+           left.last_wave == right.last_wave;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const DeduplicationTelemetry& left,
+    const DeduplicationTelemetry& right) noexcept {
+    return !(left == right);
+}
+
 // Selection is a non-owning, slot-ordered view returned by SearchBatch::select.
 // It is invalidated by the next mutating SearchBatch operation.
 struct Selection final {
     BatchToken token = kInvalidBatchToken;
     const LeafRequest* data = nullptr;
+    // Count of contiguous evaluator rows accepted by backup().
     std::size_t count = 0U;
+    // Count of raw selected leaves represented by those evaluator rows.
+    std::size_t raw_count = 0U;
 
     [[nodiscard]] const LeafRequest* begin() const noexcept {
         return count == 0U ? nullptr : data;
@@ -58,6 +111,7 @@ struct Selection final {
         return data[index];
     }
     [[nodiscard]] std::size_t size() const noexcept { return count; }
+    [[nodiscard]] std::size_t raw_size() const noexcept { return raw_count; }
     [[nodiscard]] bool empty() const noexcept { return count == 0U; }
 };
 
@@ -88,8 +142,9 @@ public:
     // Terminal leaves are resolved internally by each SearchSession.
     [[nodiscard]] Selection select();
 
-    // Apply a complete contiguous [request_count, kMaxActions] policy matrix
-    // and [request_count] value vector for the latest selection token.
+    // Apply a complete contiguous [unique_request_count, kMaxActions] policy
+    // matrix and [unique_request_count] value vector for the latest selection
+    // token. Each unique result is fanned out to every raw selected leaf.
     void backup(
         BatchToken token,
         const float* policies,
@@ -123,8 +178,15 @@ public:
     [[nodiscard]] std::size_t active_count() const noexcept {
         return active_count_;
     }
+    // Return the number of evaluator rows required by the pending wave after
+    // duplicate grouping.
     [[nodiscard]] std::size_t pending_request_count() const noexcept {
         return requests_.size();
+    }
+    // Return the number of raw selected leaves represented by the pending
+    // unique evaluator rows.
+    [[nodiscard]] std::size_t pending_selected_count() const noexcept {
+        return inference_workspace_.raw_count();
     }
     [[nodiscard]] bool has_pending() const noexcept {
         return pending_token_ != kInvalidBatchToken;
@@ -134,6 +196,15 @@ public:
     }
     [[nodiscard]] BatchToken last_token() const noexcept {
         return last_token_;
+    }
+    [[nodiscard]] std::size_t raw_request_capacity() const noexcept {
+        return inference_workspace_.raw_selected_request_capacity();
+    }
+    [[nodiscard]] std::size_t unique_request_capacity() const noexcept {
+        return requests_.capacity();
+    }
+    [[nodiscard]] DeduplicationTelemetry deduplication_telemetry() const noexcept {
+        return deduplication_telemetry_;
     }
     [[nodiscard]] std::size_t thread_count() const noexcept {
         return worker_pool_.thread_count();
@@ -191,16 +262,19 @@ private:
     void ensure_no_pending() const;
     [[nodiscard]] const Slot& checked_slot(SlotId slot) const;
     [[nodiscard]] Slot& checked_slot(SlotId slot);
+    void update_deduplication_telemetry();
     void poison() noexcept;
 
     SearchConfig config_;
     std::vector<Slot> slots_;
     std::vector<SelectionScratch> selection_scratch_;
+    InferenceWorkspace inference_workspace_;
     std::vector<LeafRequest> requests_;
     std::size_t active_count_ = 0U;
     std::uint64_t admission_count_ = 0U;
     BatchToken last_token_ = kInvalidBatchToken;
     BatchToken pending_token_ = kInvalidBatchToken;
+    DeduplicationTelemetry deduplication_telemetry_{};
     bool poisoned_ = false;
     WorkerPool worker_pool_;
 };

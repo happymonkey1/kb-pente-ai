@@ -598,6 +598,8 @@ void test_selection_order_and_request_views() {
     const kb_pente::Selection selection = batch.select();
     expect(selection.token == 1U, "first selection receives token one");
     expect(selection.size() == 3U, "one request is returned per active tree");
+    expect(selection.raw_size() == 3U,
+           "raw selected count matches unique requests without duplicates");
     expect(batch.pending_request_count() == 3U,
            "pending count matches returned requests");
     expect(batch.has_pending() && batch.pending_token() == selection.token,
@@ -636,6 +638,239 @@ void test_selection_order_and_request_views() {
     expect(next.data == selection.data,
            "reserved request storage is reused across waves");
     backup_uniform(batch, next);
+}
+
+void test_deduplication_and_fanout() {
+    kb_pente::SearchBatch batch(batch_config(2U, 29U), 2U, 2U);
+    const auto first_slot = batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+    const auto second_slot = batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+    const auto raw_request_capacity = batch.raw_request_capacity();
+    const auto unique_request_capacity = batch.unique_request_capacity();
+    expect(raw_request_capacity == 2U && unique_request_capacity == 2U,
+           "raw and unique request storage are preallocated to capacity");
+
+    const kb_pente::Selection first = batch.select();
+    expect(first.size() == 1U && first.raw_size() == 2U,
+           "identical roots collapse to one evaluator row");
+    expect(first[0].slot_id() == first_slot,
+           "lowest slot is the duplicate representative");
+    expect(batch.pending_request_count() == 1U &&
+               batch.pending_selected_count() == 2U,
+           "pending counts expose unique rows and raw leaves");
+    expect(batch.raw_request_capacity() == raw_request_capacity &&
+               batch.unique_request_capacity() == unique_request_capacity,
+           "selection does not grow dedup workspace capacity");
+
+    std::vector<float> raw_policies = uniform_policies(first.raw_size());
+    std::vector<float> raw_values(first.raw_size(), 0.5F);
+    expect_throws<std::invalid_argument>(
+        [&batch, &first, &raw_policies, &raw_values] {
+            batch.backup(
+                first.token,
+                raw_policies.data(),
+                first.raw_size(),
+                kb_pente::kMaxActions,
+                raw_values.data(),
+                raw_values.size());
+        },
+        "deduplicated backup rejects raw-row policy shape");
+    expect(batch.has_pending() && batch.pending_request_count() == 1U &&
+               batch.pending_selected_count() == 2U,
+           "raw-row rejection preserves deduplicated pending state");
+
+    std::vector<float> policies(kb_pente::kMaxActions, 0.0F);
+    policies[0] = 1.0F;
+    const std::vector<float> values{0.5F};
+    batch.backup(
+        first.token,
+        policies.data(),
+        first.size(),
+        kb_pente::kMaxActions,
+        values.data(),
+        values.size());
+    expect(batch.pending_request_count() == 0U &&
+               batch.pending_selected_count() == 0U,
+           "successful fan-out clears all pending request storage");
+    expect(batch.raw_request_capacity() == raw_request_capacity &&
+               batch.unique_request_capacity() == unique_request_capacity,
+           "backup does not grow or release dedup workspace capacity");
+    const auto first_telemetry = batch.slot_telemetry(first_slot);
+    const auto second_telemetry = batch.slot_telemetry(second_slot);
+    expect(first_telemetry.evaluator_completions == 1U &&
+               second_telemetry.evaluator_completions == 1U,
+           "one evaluator result fans out to every duplicate leaf");
+
+    const auto telemetry_after_first = batch.deduplication_telemetry();
+    const kb_pente::DeduplicationStats expected_first{
+        1U,
+        2U,
+        1U,
+        1U,
+        0.5,
+    };
+    expect(telemetry_after_first.cumulative == expected_first &&
+               telemetry_after_first.last_wave == expected_first,
+           "first-wave duplicate telemetry is exact");
+
+    const kb_pente::Selection second = batch.select();
+    expect(second.size() == 1U && second.raw_size() == 2U,
+           "identical descendants collapse on the next wave");
+    backup_uniform(batch, second);
+    expect(batch.complete(), "deduplicated batch completes after fan-out");
+    const auto telemetry_after_second = batch.deduplication_telemetry();
+    const kb_pente::DeduplicationStats expected_cumulative{
+        2U,
+        4U,
+        2U,
+        2U,
+        0.5,
+    };
+    expect(telemetry_after_second.cumulative == expected_cumulative &&
+               telemetry_after_second.last_wave == expected_first,
+           "multiwave duplicate telemetry accumulates deterministically");
+}
+
+void test_deduplication_respects_ruleset_and_backup_shape() {
+    kb_pente::SearchBatch batch(batch_config(1U, 31U), 2U, 2U);
+    (void)batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Standard);
+    (void)batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+    const kb_pente::Selection selection = batch.select();
+    expect(selection.size() == 2U && selection.raw_size() == 2U,
+           "ruleset participates in the deduplication key");
+    expect(batch.deduplication_telemetry().last_wave.eliminated_duplicate_evaluations ==
+               0U,
+           "mixed rulesets do not eliminate identical semantic roots");
+
+    std::vector<float> policies = uniform_policies(selection.size());
+    std::vector<float> values(selection.size(), 0.0F);
+    expect_throws<std::invalid_argument>(
+        [&batch, &selection, &policies, &values] {
+            batch.backup(
+                selection.token,
+                policies.data(),
+                1U,
+                kb_pente::kMaxActions,
+                values.data(),
+                1U);
+        },
+        "backup shape is validated against unique evaluator rows");
+    expect(batch.has_pending() && batch.pending_request_count() == 2U &&
+               batch.pending_selected_count() == 2U,
+           "rejected unique-row shape preserves all pending leaves");
+
+    batch.backup(
+        selection.token,
+        policies.data(),
+        selection.size(),
+        kb_pente::kMaxActions,
+        values.data(),
+        values.size());
+    expect(batch.complete(), "mixed-ruleset deduplication fixture completes");
+    const auto telemetry = batch.deduplication_telemetry();
+    const kb_pente::DeduplicationStats expected{
+        1U,
+        2U,
+        2U,
+        0U,
+        0.0,
+    };
+    expect(telemetry.cumulative == expected && telemetry.last_wave == expected,
+           "mixed-ruleset telemetry reports no eliminated evaluations");
+}
+
+void test_deduplication_worker_equivalence() {
+    kb_pente::SearchBatch one_worker(batch_config(4U, 37U), 2U, 1U);
+    kb_pente::SearchBatch many_workers(batch_config(4U, 37U), 2U, 4U);
+    for (kb_pente::SearchBatch* batch : {&one_worker, &many_workers}) {
+        (void)batch->add(
+            kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+        (void)batch->add(
+            kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+    }
+
+    std::size_t waves = 0U;
+    while (!one_worker.complete()) {
+        const kb_pente::Selection one = one_worker.select();
+        const kb_pente::Selection many = many_workers.select();
+        expect(one.size() == many.size() && one.raw_size() == many.raw_size(),
+               "worker counts agree on deduplicated request shapes");
+        backup_uniform(one_worker, one);
+        backup_uniform(many_workers, many);
+        ++waves;
+        if (waves > 128U) {
+            throw TestFailure("deduplicated worker fixture did not complete");
+        }
+    }
+
+    expect(many_workers.complete(), "both deduplicated worker batches complete");
+    expect(one_worker.deduplication_telemetry() ==
+               many_workers.deduplication_telemetry(),
+           "worker counts agree on duplicate telemetry");
+    for (std::size_t slot = 0U; slot < 2U; ++slot) {
+        expect(one_worker.root_position(slot) == many_workers.root_position(slot),
+               "worker counts agree on deduplicated root positions");
+        expect(one_worker.root_policy(slot) == many_workers.root_policy(slot),
+               "worker counts agree on deduplicated root policies");
+    }
+    expect(one_worker.deduplication_telemetry()
+                   .cumulative.eliminated_duplicate_evaluations > 0U,
+           "duplicate worker fixture records eliminated evaluations");
+}
+
+void test_deduplication_multiwave_split_and_merge() {
+    kb_pente::SearchBatch batch(batch_config(1U, 41U), 2U, 2U);
+    const auto first_slot = batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+    const auto second_slot = batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+
+    const auto first = batch.select();
+    expect(first.size() == 1U && first.raw_size() == 2U,
+           "split-and-merge fixture starts with a collapsed wave");
+    backup_uniform(batch, first);
+
+    (void)batch.advance_root(first_slot, 0U);
+    const auto split = batch.select();
+    expect(split.size() == 1U && split.raw_size() == 1U &&
+               split[0].slot_id() == first_slot,
+           "advancing one completed slot produces a distinct wave");
+    backup_uniform(batch, split);
+
+    batch.replace_root(
+        first_slot,
+        kb_pente::Position::initial(5),
+        kb_pente::Ruleset::Freestyle);
+    batch.replace_root(
+        second_slot,
+        kb_pente::Position::initial(5),
+        kb_pente::Ruleset::Freestyle);
+    const auto merged = batch.select();
+    expect(merged.size() == 1U && merged.raw_size() == 2U,
+           "replaced identical roots merge again on a later wave");
+    backup_uniform(batch, merged);
+    expect(batch.complete(), "split-and-merge fixture completes");
+
+    const auto telemetry = batch.deduplication_telemetry();
+    const kb_pente::DeduplicationStats cumulative{
+        3U,
+        5U,
+        3U,
+        2U,
+        0.4,
+    };
+    const kb_pente::DeduplicationStats last_wave{
+        1U,
+        2U,
+        1U,
+        1U,
+        0.5,
+    };
+    expect(telemetry.cumulative == cumulative && telemetry.last_wave == last_wave,
+           "split-and-merge telemetry tracks every wave");
 }
 
 void test_backup_validation_and_retry() {
@@ -815,6 +1050,20 @@ void test_terminal_progress_and_completed_slots() {
         ++empty_range_count;
     }
     expect(empty_range_count == 0U, "empty selection range has no requests");
+    const auto empty_wave_telemetry = terminal_only.deduplication_telemetry();
+    expect(empty_wave_telemetry.cumulative.selection_waves == 2U &&
+               empty_wave_telemetry.cumulative.raw_evaluation_requests == 1U &&
+               empty_wave_telemetry.cumulative.unique_evaluations == 1U &&
+               empty_wave_telemetry.cumulative.eliminated_duplicate_evaluations ==
+                   0U &&
+               empty_wave_telemetry.cumulative.duplicate_leaf_rate == 0.0 &&
+               empty_wave_telemetry.last_wave.selection_waves == 1U &&
+               empty_wave_telemetry.last_wave.raw_evaluation_requests == 0U &&
+               empty_wave_telemetry.last_wave.unique_evaluations == 0U &&
+               empty_wave_telemetry.last_wave.eliminated_duplicate_evaluations ==
+                   0U &&
+               empty_wave_telemetry.last_wave.duplicate_leaf_rate == 0.0,
+           "terminal-only empty waves update duplicate telemetry");
 }
 
 void test_worker_equivalence_and_telemetry() {
@@ -910,6 +1159,10 @@ int main() {
     try {
         test_construction_and_admission();
         test_selection_order_and_request_views();
+        test_deduplication_and_fanout();
+        test_deduplication_respects_ruleset_and_backup_shape();
+        test_deduplication_worker_equivalence();
+        test_deduplication_multiwave_split_and_merge();
         test_backup_validation_and_retry();
         test_terminal_progress_and_completed_slots();
         test_worker_equivalence_and_telemetry();
