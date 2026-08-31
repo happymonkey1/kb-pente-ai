@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -38,6 +39,19 @@ void expect_throws(Function&& function, const char* message) {
     }
     throw TestFailure(message);
 }
+
+struct ReenteringResource final {
+    explicit ReenteringResource(kb_pente::WorkerPool* worker_pool)
+        : pool(worker_pool) {}
+
+    ~ReenteringResource() {
+        if (pool != nullptr) {
+            pool->parallel_for(1U, [](std::size_t) {});
+        }
+    }
+
+    kb_pente::WorkerPool* pool;
+};
 
 void test_construction_and_traits() {
     static_assert(!std::is_copy_constructible_v<kb_pente::WorkerPool>);
@@ -217,8 +231,14 @@ void test_concurrent_call_serialization() {
 
 void test_nested_call_rejection() {
     kb_pente::WorkerPool pool(2U);
+    std::atomic<bool> zero_completed{false};
+    std::atomic<std::size_t> zero_callbacks{0U};
     std::atomic<bool> rejected{false};
     pool.parallel_for(1U, [&](std::size_t) {
+        pool.parallel_for(0U, [&](std::size_t) {
+            zero_callbacks.fetch_add(1U, std::memory_order_relaxed);
+        });
+        zero_completed.store(true, std::memory_order_release);
         try {
             pool.parallel_for(1U, [](std::size_t) {});
         } catch (const std::logic_error& error) {
@@ -227,8 +247,25 @@ void test_nested_call_rejection() {
                 std::memory_order_release);
         }
     });
+    expect(zero_completed.load(std::memory_order_acquire),
+           "nested zero-count waves are no-ops");
+    expect(zero_callbacks.load(std::memory_order_relaxed) == 0U,
+           "nested zero-count waves do not invoke callbacks");
     expect(rejected.load(std::memory_order_acquire),
            "same-pool nested calls fail promptly");
+}
+
+void test_completed_wave_releases_callable() {
+    kb_pente::WorkerPool pool(2U);
+    std::weak_ptr<ReenteringResource> resource;
+    {
+        auto owned_resource = std::make_shared<ReenteringResource>(&pool);
+        resource = owned_resource;
+        pool.parallel_for(1U, [owned_resource = std::move(owned_resource)](
+                                   std::size_t) {});
+    }
+    expect(resource.expired(),
+           "completed waves release callable-owned resources");
 }
 
 void test_exception_cancellation_and_reuse() {
@@ -288,6 +325,7 @@ int main() {
         test_synchronous_completion();
         test_concurrent_call_serialization();
         test_nested_call_rejection();
+        test_completed_wave_releases_callable();
         test_exception_cancellation_and_reuse();
     } catch (const TestFailure& failure) {
         std::cerr << "worker pool test failure: " << failure.what() << '\n';

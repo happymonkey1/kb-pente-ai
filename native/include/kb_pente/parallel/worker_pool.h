@@ -38,39 +38,47 @@ public:
     // submit another wave to this same pool.
     template <typename Function>
     void parallel_for(std::size_t count, Function&& function) {
+        if (count == 0U) {
+            return;
+        }
         if (current_pool_ == this) {
             throw std::logic_error(
                 "WorkerPool does not allow nested parallel_for calls");
         }
-        if (count == 0U) {
-            return;
-        }
 
-        std::unique_lock<std::mutex> caller_lock(call_mutex_);
-        WaveFunction next_function(std::forward<Function>(function));
-
-        {
-            std::lock_guard<std::mutex> state_lock(state_mutex_);
-            if (stopping_) {
-                throw std::logic_error("WorkerPool is stopping");
-            }
-
-            wave_function_ = std::move(next_function);
-            wave_count_ = count;
-            next_index_.store(0U, std::memory_order_relaxed);
-            cancellation_.store(false, std::memory_order_release);
-            first_exception_ = nullptr;
-            active_workers_ = workers_.size();
-            ++wave_generation_;
-        }
-        work_cv_.notify_all();
-
+        WaveFunction retired_function;
         std::exception_ptr failure;
         {
-            std::unique_lock<std::mutex> state_lock(state_mutex_);
-            completion_cv_.wait(
-                state_lock, [this] { return active_workers_ == 0U; });
-            failure = first_exception_;
+            std::unique_lock<std::mutex> caller_lock(call_mutex_);
+            WaveFunction next_function(std::forward<Function>(function));
+
+            {
+                std::lock_guard<std::mutex> state_lock(state_mutex_);
+                if (stopping_) {
+                    throw std::logic_error("WorkerPool is stopping");
+                }
+
+                wave_function_ = std::move(next_function);
+                wave_count_ = count;
+                next_index_.store(0U, std::memory_order_relaxed);
+                cancellation_.store(false, std::memory_order_release);
+                first_exception_ = nullptr;
+                active_workers_ = workers_.size();
+                ++wave_generation_;
+            }
+            work_cv_.notify_all();
+
+            {
+                std::unique_lock<std::mutex> state_lock(state_mutex_);
+                completion_cv_.wait(
+                    state_lock, [this] { return active_workers_ == 0U; });
+                failure = first_exception_;
+                first_exception_ = nullptr;
+                cancellation_.store(false, std::memory_order_release);
+                next_index_.store(0U, std::memory_order_relaxed);
+                wave_count_ = 0U;
+                retired_function = std::move(wave_function_);
+            }
         }
 
         if (failure) {
