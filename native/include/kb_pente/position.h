@@ -42,4 +42,19 @@ struct Position final {
     void validate() const;
 };
 
+[[nodiscard]] inline bool operator==(
+    const Position& left,
+    const Position& right) noexcept {
+    return left.stones == right.stones && left.captures == right.captures &&
+           left.ply == right.ply && left.last_action == right.last_action &&
+           left.board_size == right.board_size &&
+           left.current_player == right.current_player;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const Position& left,
+    const Position& right) noexcept {
+    return !(left == right);
+}
+
 }  // namespace kb_pente

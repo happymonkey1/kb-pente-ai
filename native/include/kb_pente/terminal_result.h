@@ -72,4 +72,17 @@ struct TerminalResult final {
     }
 };
 
+[[nodiscard]] inline bool operator==(
+    const TerminalResult& left,
+    const TerminalResult& right) noexcept {
+    return left.status == right.status && left.winner == right.winner &&
+           left.reason == right.reason;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const TerminalResult& left,
+    const TerminalResult& right) noexcept {
+    return !(left == right);
+}
+
 }  // namespace kb_pente

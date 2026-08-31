@@ -10,6 +10,8 @@ option(KB_PENTE_ENABLE_SANITIZERS "Build native targets with ASan and UBSan" OFF
 
 add_library(kb_pente_core STATIC
     src/position.cpp
+    src/rules.cpp
+    src/game.cpp
 )
 
 target_compile_features(kb_pente_core PUBLIC cxx_std_17)
