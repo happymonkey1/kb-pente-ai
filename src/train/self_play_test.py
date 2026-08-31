@@ -507,6 +507,7 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(1.0, metrics["p95_inference_batch_size"])
         self.assertEqual(1, metrics["active_game_target"])
         self.assertEqual(1.0, metrics["steady_state_mean_batch_occupancy"])
+        self.assertEqual(1.0, metrics["unique_trajectory_rate"])
 
 
 if __name__ == "__main__":

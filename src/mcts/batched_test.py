@@ -137,6 +137,29 @@ class BatchedSearchTest(unittest.TestCase):
         self.assertEqual([2, 2], evaluator.batch_sizes)
         self.assertEqual((2, 2), accumulator.telemetry().inference_batch_sizes)
 
+    def test_can_retain_duplicate_requests_to_fill_accelerator_batch(self) -> None:
+        root = self.game.init_board()
+        evaluator = RecordingEvaluator(self.game.get_action_size())
+        searches = [
+            MCTS(self.game, evaluator, MCTSArgs(num_simulations=2))
+            for _ in range(4)
+        ]
+
+        result = run_batched_search(
+            searches,
+            [root] * 4,
+            [1.0] * 4,
+            add_root_noise=False,
+            deduplicate_evaluations=False,
+        )
+
+        self.assertEqual((4, 4), result.telemetry.inference_batch_sizes)
+        self.assertEqual(8, result.telemetry.evaluation_requests)
+        self.assertEqual(2, result.telemetry.unique_evaluations)
+        self.assertEqual(0.75, result.telemetry.duplicate_leaf_rate)
+        for policy in result.policies[1:]:
+            np.testing.assert_array_equal(result.policies[0], policy)
+
 
 if __name__ == "__main__":
     unittest.main()

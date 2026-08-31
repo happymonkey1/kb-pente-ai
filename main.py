@@ -15,6 +15,7 @@ from src.game.pente.pente_game import PenteGame
 from src.game.pente.rules import PenteRuleset
 from src.mcts.mcts_v2 import MCTS, MCTSArgs
 from src.model.model_v1 import PenteNet
+from src.monitoring.replay_writer import JsonlReplaySampleSink
 from src.run_manifest import write_run_manifest
 from src.telemetry import JsonlMetricSink
 from src.train.arena import Arena
@@ -73,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learner-steps", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--telemetry-file", default="metrics/training.jsonl")
+    parser.add_argument("--replay-sample-file")
     parser.add_argument("--no-checkpoint", action="store_true")
     parser.add_argument("--replay-checkpoint-interval", type=int, default=5)
     parser.add_argument("--resume-replay")
@@ -211,7 +213,20 @@ def main() -> int:
 
     assert training_run_id is not None
     metric_sink = JsonlMetricSink(program_args.telemetry_file, training_run_id)
-    trainer = SelfPlayTrainer(game, net, optimizer, device, trainer_args, metric_sink)
+    replay_sample_sink = (
+        JsonlReplaySampleSink(program_args.replay_sample_file)
+        if program_args.replay_sample_file
+        else None
+    )
+    trainer = SelfPlayTrainer(
+        game,
+        net,
+        optimizer,
+        device,
+        trainer_args,
+        metric_sink,
+        replay_sample_sink,
+    )
     manifest_root = (
         Path(program_args.model_dir)
         if not program_args.no_checkpoint

@@ -192,6 +192,15 @@ Training writes JSONL records with a stable schema. Current metrics include:
 - fixed tactical-suite accuracy;
 - sampled mean, p95, and maximum GPU utilization for self-play and learning;
 - device-wide memory-controller activity plus peak Torch allocation and reservation.
+- normalized process CPU utilization and resident memory for self-play and learning,
+  including sample counts, mean/p95/maximum utilization, mean/peak RSS, logical core
+  count, and sampling errors.
+
+Pass `--replay-sample-file replays/training.jsonl` to emit at most eight
+deterministically selected, validated completed-game samples after each successful
+self-play iteration. These browser-safe records contain only the run and game
+identifiers, board configuration, action sequence, winner, and win reason. They do
+not serialize positions, policies, models, search trees, or replay-buffer entries.
 
 Passing `--gpu` is strict. Training exits with a diagnostic if Torch cannot access CUDA; it never silently falls back to CPU. WSL GPU access may need to be granted outside a restricted execution sandbox even when `nvidia-smi` works in an ordinary WSL terminal.
 

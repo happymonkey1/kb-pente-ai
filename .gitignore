@@ -5,3 +5,4 @@ __pycache__/
 metrics/
 pente-model*/
 *.pkl
+replays/

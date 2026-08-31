@@ -48,6 +48,7 @@ def collect_self_play_metrics(
         "positions_per_second": positions / elapsed_seconds if elapsed_seconds else 0.0,
         "games_per_second": len(games) / elapsed_seconds if elapsed_seconds else 0.0,
         "unique_trajectories": len(trajectories),
+        "unique_trajectory_rate": len(trajectories) / len(games),
         "player_one_wins": p1_wins,
         "player_two_wins": p2_wins,
         "draws": draws,

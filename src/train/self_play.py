@@ -24,6 +24,7 @@ from src.train.learner import ModelTrainingStats, train_policy_value_model
 from src.train.profession_game_loader import ProfessionGameLoader
 from src.train.randomness import seed_training_iteration
 from src.train.replay_buffer import ReplayBuffer, ReplaySource
+from src.train.replay_samples import ReplaySampleSink, emit_replay_samples
 from src.train.self_play_args import SelfPlayTrainerArgs
 from src.train.self_play_generation import (
     PlayedGame,
@@ -43,6 +44,7 @@ class SelfPlayTrainer:
         device: torch.device,
         args: SelfPlayTrainerArgs,
         metric_sink: MetricSink | None = None,
+        replay_sample_sink: ReplaySampleSink | None = None,
     ) -> None:
         self.args = args
         self._replay_snapshot_path = os.path.join(
@@ -92,6 +94,7 @@ class SelfPlayTrainer:
         self.optimizer = optimizer
         self.device = device
         self.metric_sink = metric_sink if metric_sink is not None else NullMetricSink()
+        self.replay_sample_sink = replay_sample_sink
         self.rng = np.random.default_rng(args.seed)
         self.previous_net = copy.deepcopy(self.net)
         self.professional_validation_examples: list[TrainingExample] = []
@@ -118,6 +121,7 @@ class SelfPlayTrainer:
             self.args.mcts_args,
             self.args.temp_threshold,
             self.rng,
+            deduplicate_evaluations=self.device.type != "cuda",
         )
 
     def _default_resume_replay_path(self, expected_generation: int | None) -> str:
@@ -378,6 +382,20 @@ class SelfPlayTrainer:
                 )
             if self.args.should_checkpoint:
                 self._save_checkpoint(iteration + 1)
+            if self.replay_sample_sink is not None and played_games:
+                sample_count = emit_replay_samples(
+                    self.replay_sample_sink,
+                    played_games,
+                    self.training_run_id,
+                    iteration + 1,
+                    self.game.get_board_size(),
+                    self.game.ruleset.value,
+                )
+                self.metric_sink.emit(
+                    "replay_samples",
+                    iteration + 1,
+                    {"samples": sample_count},
+                )
 
     def train_model(
         self,

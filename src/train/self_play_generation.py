@@ -44,12 +44,14 @@ class SelfPlayGenerator:
         mcts_args: MCTSArgs,
         temp_threshold: int,
         rng: np.random.Generator,
+        deduplicate_evaluations: bool = True,
     ) -> None:
         self.game = game
         self.evaluator = evaluator
         self.mcts_args = mcts_args
         self.temp_threshold = temp_threshold
         self.rng = rng
+        self.deduplicate_evaluations = deduplicate_evaluations
 
     def play_game(self) -> PlayedGame:
         games, _ = self.play_games(1)
@@ -115,6 +117,7 @@ class SelfPlayGenerator:
                 evaluate_search_wave(
                     [game.search_session for game in active],
                     accumulator,
+                    self.deduplicate_evaluations,
                 )
 
         return completed, [

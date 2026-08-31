@@ -113,6 +113,7 @@ class BatchedSearchAccumulator:
     def __post_init__(self) -> None:
         if self.root_count < 1:
             raise ValueError("At least one root is required")
+
     def telemetry(self) -> BatchedSearchTelemetry:
         batch_sizes = self.inference_batch_sizes
         duplicate_rate = (
@@ -146,6 +147,7 @@ class BatchedSearchAccumulator:
 def evaluate_search_wave(
     sessions: Sequence[SearchSession],
     accumulator: BatchedSearchAccumulator,
+    deduplicate_evaluations: bool = True,
 ) -> None:
     if not sessions:
         raise ValueError("At least one search session is required")
@@ -157,20 +159,29 @@ def evaluate_search_wave(
 
     accumulator.simulation_waves += 1
     selections: dict[int, LeafSelection] = {}
-    evaluation_groups: dict[bytes, list[int]] = {}
+    evaluation_groups: list[list[int]] = []
+    group_by_state: dict[bytes, list[int]] = {}
     for index, session in enumerate(sessions):
         selection, selected_leaves = session.select_evaluation_leaf()
         accumulator.selected_leaves += selected_leaves
         if selection is None:
             continue
         selections[index] = selection
-        evaluation_groups.setdefault(selection.state_key, []).append(index)
+        if deduplicate_evaluations:
+            group = group_by_state.get(selection.state_key)
+            if group is None:
+                group = []
+                group_by_state[selection.state_key] = group
+                evaluation_groups.append(group)
+            group.append(index)
+        else:
+            evaluation_groups.append([index])
         accumulator.evaluation_requests += 1
 
     if not evaluation_groups:
         return
 
-    representative_indices = [indices[0] for indices in evaluation_groups.values()]
+    representative_indices = [indices[0] for indices in evaluation_groups]
     positions = [selections[index].position for index in representative_indices]
     started = time.perf_counter()
     policies, values = evaluator.evaluate_batch(positions)
@@ -187,8 +198,10 @@ def evaluate_search_wave(
     batch_sizes = accumulator.inference_batch_sizes
     batch_sizes.append(batch_size)
     accumulator.evaluator_calls += 1
-    accumulator.unique_evaluations += batch_size
-    for group_offset, indices in enumerate(evaluation_groups.values()):
+    accumulator.unique_evaluations += len(
+        {selection.state_key for selection in selections.values()}
+    )
+    for group_offset, indices in enumerate(evaluation_groups):
         evaluation = (policies[group_offset], float(values[group_offset]))
         for index in indices:
             sessions[index].accept_evaluation(
@@ -204,6 +217,7 @@ def run_batched_search(
     roots: Sequence[PenteBoard],
     temperatures: Sequence[float],
     add_root_noise: bool,
+    deduplicate_evaluations: bool = True,
 ) -> BatchedSearchResult:
     if not searches:
         raise ValueError("At least one search is required")
@@ -218,6 +232,7 @@ def run_batched_search(
         evaluate_search_wave(
             [session for session in sessions if not session.is_complete],
             accumulator,
+            deduplicate_evaluations,
         )
     return BatchedSearchResult(
         [session.policy() for session in sessions],
