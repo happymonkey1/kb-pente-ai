@@ -75,6 +75,11 @@ if(BUILD_TESTING)
     )
     target_link_libraries(kb_pente_native_diff_runner PRIVATE kb_pente_core)
 
+    add_executable(kb_pente_native_mcts_diff_runner
+        tests/mcts_differential_runner.cpp
+    )
+    target_link_libraries(kb_pente_native_mcts_diff_runner PRIVATE kb_pente_mcts)
+
     add_executable(kb_pente_native_mcts_tests
         tests/mcts_test.cpp
     )
@@ -122,12 +127,28 @@ if(BUILD_TESTING)
         target_compile_options(kb_pente_native_diff_runner PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    if(MSVC)
+        target_compile_options(kb_pente_native_mcts_diff_runner PRIVATE /W4 /permissive-)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_mcts_diff_runner PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_diff_runner PRIVATE
             -fsanitize=address,undefined
             -fno-omit-frame-pointer
         )
         target_link_options(kb_pente_native_diff_runner PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_mcts_diff_runner PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_mcts_diff_runner PRIVATE
             -fsanitize=address,undefined
         )
     endif()
@@ -241,6 +262,16 @@ if(BUILD_TESTING)
                 --runner $<TARGET_FILE:kb_pente_native_diff_runner>
         )
         set_tests_properties(kb_pente_native_differential PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+            TIMEOUT 600
+        )
+        add_test(
+            NAME kb_pente_native_mcts_differential
+            COMMAND "${KB_PENTE_DIFFERENTIAL_PYTHON}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../script/native_mcts_differential.py"
+                --runner $<TARGET_FILE:kb_pente_native_mcts_diff_runner>
+        )
+        set_tests_properties(kb_pente_native_mcts_differential PROPERTIES
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
             TIMEOUT 600
         )
