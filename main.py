@@ -13,14 +13,15 @@ import torch
 from src.device import select_torch_device
 from src.game.pente.pente_game import PenteGame
 from src.game.pente.rules import PenteRuleset
-from src.mcts.mcts_v2 import MCTS, MCTSArgs
+from src.mcts.mcts_v2 import MCTSArgs
+from src.mcts.native_backend import load_native_extension
 from src.model.model_v1 import PenteNet
 from src.monitoring.replay_writer import JsonlReplaySampleSink
 from src.run_manifest import write_run_manifest
 from src.telemetry import JsonlMetricSink
 from src.train.arena import Arena
-from src.train.nnet_player import NNetPlayer
 from src.train.random_player import RandomPlayer
+from src.train.player_builder import build_player
 from src.train.self_play import SelfPlayTrainer, SelfPlayTrainerArgs
 from src.train.self_play_health import SelfPlayHealthThresholds
 
@@ -39,6 +40,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="Compatible schema-v2 checkpoint to load")
     parser.add_argument("--infer-mcts", action="store_true")
     parser.add_argument("--mcts-sim", type=int, default=64)
+    parser.add_argument(
+        "--search-backend",
+        choices=("python", "cpp"),
+        default="python",
+        help="MCTS search implementation used for training and MCTS inference",
+    )
+    parser.add_argument(
+        "--native-search-threads",
+        type=int,
+        default=1,
+        help="Native MCTS worker threads",
+    )
     parser.add_argument("--temp-threshold", type=int, default=15)
     parser.add_argument("--batch-games", type=int, default=512)
     parser.add_argument("--active-games", type=int, default=128)
@@ -176,6 +189,8 @@ def main() -> int:
         self_play_value_loss_weight=program_args.self_play_value_loss_weight,
         training_run_id=training_run_id,
         expected_replay_generation=expected_replay_generation,
+        search_backend=program_args.search_backend,
+        native_worker_threads=program_args.native_search_threads,
         search_health=SelfPlayHealthThresholds(
             minimum_steady_state_batch_occupancy=(
                 program_args.minimum_batch_occupancy
@@ -210,6 +225,9 @@ def main() -> int:
     )
     if program_args.infer:
         return run_inference(program_args, game, net, trainer_args)
+
+    if trainer_args.search_backend == "cpp":
+        load_native_extension()
 
     assert training_run_id is not None
     metric_sink = JsonlMetricSink(program_args.telemetry_file, training_run_id)
@@ -258,13 +276,18 @@ def run_inference(
     if not program_args.model:
         raise ValueError("Inference requires --model")
     net.eval()
-    mcts = (
-        MCTS(game, net, trainer_args.mcts_args, np.random.default_rng(program_args.seed))
-        if program_args.infer_mcts
-        else None
+    network_player = build_player(
+        net,
+        None,
+        "network",
+        search_backend=trainer_args.search_backend,
+        game=game,
+        mcts_args=trainer_args.mcts_args if program_args.infer_mcts else None,
+        seed=program_args.seed,
+        native_worker_threads=trainer_args.native_worker_threads,
     )
     arena = Arena(
-        NNetPlayer(net, mcts, "network"),
+        network_player,
         RandomPlayer(np.random.default_rng(program_args.seed + 1)),
         game,
         opening_plies=program_args.arena_opening_plies,

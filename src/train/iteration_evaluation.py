@@ -5,12 +5,13 @@ import numpy as np
 from src.evaluation.statistics import elo_difference, wilson_interval
 from src.evaluation.tactical import evaluate_tactical_suite
 from src.game.pente.pente_game import PenteGame
-from src.mcts.mcts_v2 import MCTS, MCTSArgs
+from src.mcts.mcts_v2 import MCTSArgs
 from src.model.model_v1 import PenteNet
 from src.telemetry import MetricSink
 from src.train.arena import Arena
-from src.train.nnet_player import NNetPlayer
+from src.train.player_builder import build_player
 from src.train.random_player import RandomPlayer
+from src.train.self_play_args import SearchBackend
 from src.train.tactical_heuristic_player import TacticalHeuristicPlayer
 
 
@@ -25,14 +26,32 @@ def evaluate_training_iteration(
     opening_plies: int,
     debug: bool,
     seed: int,
+    search_backend: SearchBackend = "python",
+    native_worker_threads: int = 1,
 ) -> None:
     previous_net.eval()
     current_net.eval()
-    previous_mcts = MCTS(game, previous_net, mcts_args, np.random.default_rng(seed))
-    current_mcts = MCTS(game, current_net, mcts_args, np.random.default_rng(seed + 1))
     arena = Arena(
-        player1=NNetPlayer(previous_net, previous_mcts, "previous"),
-        player2=NNetPlayer(current_net, current_mcts, "current"),
+        player1=build_player(
+            previous_net,
+            None,
+            "previous",
+            search_backend=search_backend,
+            game=game,
+            mcts_args=mcts_args,
+            seed=seed,
+            native_worker_threads=native_worker_threads,
+        ),
+        player2=build_player(
+            current_net,
+            None,
+            "current",
+            search_backend=search_backend,
+            game=game,
+            mcts_args=mcts_args,
+            seed=seed + 1,
+            native_worker_threads=native_worker_threads,
+        ),
         game=game,
         debug=debug,
         opening_plies=opening_plies,
@@ -51,14 +70,18 @@ def evaluate_training_iteration(
     )
     current_score = (stats.p2_wins + 0.5 * stats.draws) / num_games
 
-    random_mcts = MCTS(
-        game,
+    random_player = build_player(
         current_net,
-        mcts_args,
-        np.random.default_rng(seed + 2),
+        None,
+        "current",
+        search_backend=search_backend,
+        game=game,
+        mcts_args=mcts_args,
+        seed=seed + 2,
+        native_worker_threads=native_worker_threads,
     )
     random_arena = Arena(
-        player1=NNetPlayer(current_net, random_mcts, "current"),
+        player1=random_player,
         player2=RandomPlayer(np.random.default_rng(seed + iteration + 3)),
         game=game,
         debug=debug,
@@ -76,14 +99,18 @@ def evaluate_training_iteration(
     )
     random_score = (random_stats.p1_wins + 0.5 * random_stats.draws) / num_games
 
-    heuristic_mcts = MCTS(
-        game,
+    heuristic_player = build_player(
         current_net,
-        mcts_args,
-        np.random.default_rng(seed + 4),
+        None,
+        "current",
+        search_backend=search_backend,
+        game=game,
+        mcts_args=mcts_args,
+        seed=seed + 4,
+        native_worker_threads=native_worker_threads,
     )
     heuristic_arena = Arena(
-        player1=NNetPlayer(current_net, heuristic_mcts, "current"),
+        player1=heuristic_player,
         player2=TacticalHeuristicPlayer(),
         game=game,
         debug=debug,

@@ -381,6 +381,8 @@ class SelfPlayTrainer:
                     self.args.arena_opening_plies,
                     self.args.debug,
                     self.args.seed,
+                    search_backend=self.args.search_backend,
+                    native_worker_threads=self.args.native_worker_threads,
                 )
             if self.args.should_checkpoint:
                 self._save_checkpoint(iteration + 1)
