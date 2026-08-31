@@ -5,9 +5,18 @@
 #include <stdexcept>
 #include <utility>
 
+#include "kb_pente/features.h"
+
 namespace kb_pente {
 
 namespace {
+
+[[nodiscard]] bool multiplication_fits(
+    std::size_t left,
+    std::size_t right) noexcept {
+    return right == 0U ||
+           left <= std::numeric_limits<std::size_t>::max() / right;
+}
 
 [[nodiscard]] SearchConfig admission_config(
     const SearchConfig& base,
@@ -168,6 +177,83 @@ Selection SearchBatch::select() {
         requests_.size(),
         inference_workspace_.raw_count(),
     };
+}
+
+void SearchBatch::write_features(
+    BatchToken token,
+    float* output,
+    std::size_t rows,
+    std::size_t planes,
+    std::size_t board_height,
+    std::size_t board_width) {
+    ensure_usable();
+    if (pending_token_ == kInvalidBatchToken) {
+        throw std::logic_error(
+            "SearchBatch has no pending features to write");
+    }
+    if (token != pending_token_) {
+        throw std::invalid_argument("SearchBatch feature token is stale");
+    }
+    if (output == nullptr) {
+        throw std::invalid_argument(
+            "SearchBatch feature output cannot be null");
+    }
+
+    const std::size_t unique_rows = inference_workspace_.unique_count();
+    if (rows != unique_rows) {
+        throw std::invalid_argument(
+            "SearchBatch feature row count does not match pending requests");
+    }
+    if (planes != 4U) {
+        throw std::invalid_argument(
+            "SearchBatch feature plane count must equal four");
+    }
+    if (board_height != board_width ||
+        board_height > static_cast<std::size_t>(kMaxBoardSize) ||
+        !is_supported_board_size(static_cast<std::uint8_t>(board_height))) {
+        throw std::invalid_argument(
+            "SearchBatch feature dimensions must be a supported square board");
+    }
+
+    if (!multiplication_fits(board_height, board_width)) {
+        throw std::overflow_error("SearchBatch feature area size overflow");
+    }
+    const std::size_t area = board_height * board_width;
+    if (!multiplication_fits(planes, area)) {
+        throw std::overflow_error("SearchBatch feature row size overflow");
+    }
+    const std::size_t row_elements = planes * area;
+    if (!multiplication_fits(rows, row_elements)) {
+        throw std::overflow_error("SearchBatch feature storage size overflow");
+    }
+
+    const auto requested_board_size =
+        static_cast<std::uint8_t>(board_height);
+    for (std::size_t index = 0U; index < unique_rows; ++index) {
+        const InferenceCandidate& candidate =
+            inference_workspace_.representative(index);
+        if (candidate.position == nullptr) {
+            throw std::logic_error(
+                "SearchBatch feature representative has no position");
+        }
+        if (candidate.position->board_size != requested_board_size) {
+            throw std::invalid_argument(
+                "SearchBatch feature wave contains mixed board sizes");
+        }
+        candidate.position->validate();
+    }
+
+    worker_pool_.parallel_for(
+        unique_rows,
+        [this, output](std::size_t index) {
+            const InferenceCandidate& candidate =
+                inference_workspace_.representative(index);
+            const std::size_t row_elements =
+                4U * candidate.position->action_count();
+            ::kb_pente::write_features(
+                *candidate.position,
+                output + index * row_elements);
+        });
 }
 
 void SearchBatch::backup(

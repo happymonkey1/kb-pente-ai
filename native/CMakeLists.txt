@@ -217,6 +217,14 @@ if(BUILD_TESTING)
         PRIVATE kb_pente_mcts
     )
 
+    add_executable(kb_pente_native_feature_batch_tests
+        tests/feature_batch_test.cpp
+    )
+    target_link_libraries(
+        kb_pente_native_feature_batch_tests
+        PRIVATE kb_pente_mcts
+    )
+
     add_executable(kb_pente_native_worker_pool_tests
         tests/worker_pool_test.cpp
     )
@@ -341,6 +349,18 @@ if(BUILD_TESTING)
     endif()
 
     if(MSVC)
+        target_compile_options(
+            kb_pente_native_feature_batch_tests
+            PRIVATE /W4 /permissive-
+        )
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            kb_pente_native_feature_batch_tests
+            PRIVATE -Wall -Wextra -Wpedantic
+        )
+    endif()
+
+    if(MSVC)
         target_compile_options(kb_pente_native_worker_pool_tests PRIVATE /W4 /permissive-)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_worker_pool_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -417,6 +437,16 @@ if(BUILD_TESTING)
     endif()
 
     if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_feature_batch_tests PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_feature_batch_tests PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_worker_pool_tests PRIVATE
             -fsanitize=address,undefined
             -fno-omit-frame-pointer
@@ -443,6 +473,10 @@ if(BUILD_TESTING)
     add_test(
         NAME kb_pente_native_inference_workspace
         COMMAND kb_pente_native_inference_workspace_tests
+    )
+    add_test(
+        NAME kb_pente_native_feature_batch
+        COMMAND kb_pente_native_feature_batch_tests
     )
     add_test(NAME kb_pente_native_worker_pool COMMAND kb_pente_native_worker_pool_tests)
     set_tests_properties(kb_pente_native_worker_pool PROPERTIES TIMEOUT 60)

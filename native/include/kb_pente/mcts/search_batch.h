@@ -116,8 +116,8 @@ struct Selection final {
 };
 
 // SearchBatch coordinates independent single-tree sessions through
-// synchronous evaluator-selection waves. Slot admission is stable, while
-// later slices may add root replacement and removal.
+// synchronous evaluator-selection waves, with stable slot admission and
+// explicit root lifecycle operations.
 class SearchBatch final {
 public:
     SearchBatch(
@@ -141,6 +141,18 @@ public:
     // Select at most one nonterminal evaluator leaf per incomplete slot.
     // Terminal leaves are resolved internally by each SearchSession.
     [[nodiscard]] Selection select();
+
+    // Write the unique pending representative positions into caller-owned
+    // contiguous [rows, planes, board_height, board_width] NCHW storage.
+    // Rows must equal the unique request count, planes must equal four, and
+    // the board dimensions must describe one supported homogeneous size.
+    void write_features(
+        BatchToken token,
+        float* output,
+        std::size_t rows,
+        std::size_t planes,
+        std::size_t board_height,
+        std::size_t board_width);
 
     // Apply a complete contiguous [unique_request_count, kMaxActions] policy
     // matrix and [unique_request_count] value vector for the latest selection
