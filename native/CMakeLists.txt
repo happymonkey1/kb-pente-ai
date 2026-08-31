@@ -34,6 +34,32 @@ if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(kb_pente_core PRIVATE -fsanitize=address,undefined)
 endif()
 
+add_library(kb_pente_mcts STATIC
+    src/mcts/tree_arena.cpp
+)
+target_link_libraries(kb_pente_mcts PUBLIC kb_pente_core)
+target_compile_features(kb_pente_mcts PUBLIC cxx_std_17)
+target_include_directories(kb_pente_mcts
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+
+if(MSVC)
+    target_compile_options(kb_pente_mcts PRIVATE /W4 /permissive-)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(kb_pente_mcts PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(kb_pente_mcts PRIVATE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(kb_pente_mcts PRIVATE
+        -fsanitize=address,undefined
+    )
+endif()
+
 include(CTest)
 
 if(BUILD_TESTING)
@@ -46,6 +72,11 @@ if(BUILD_TESTING)
         tests/differential_runner.cpp
     )
     target_link_libraries(kb_pente_native_diff_runner PRIVATE kb_pente_core)
+
+    add_executable(kb_pente_native_mcts_tests
+        tests/mcts_test.cpp
+    )
+    target_link_libraries(kb_pente_native_mcts_tests PRIVATE kb_pente_mcts)
 
     if(MSVC)
         target_compile_options(kb_pente_native_tests PRIVATE /W4 /permissive-)
@@ -79,7 +110,24 @@ if(BUILD_TESTING)
         )
     endif()
 
+    if(MSVC)
+        target_compile_options(kb_pente_native_mcts_tests PRIVATE /W4 /permissive-)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_mcts_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_mcts_tests PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_mcts_tests PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
     add_test(NAME kb_pente_native_core COMMAND kb_pente_native_tests)
+    add_test(NAME kb_pente_native_arena COMMAND kb_pente_native_mcts_tests)
 
     set(KB_PENTE_DIFFERENTIAL_PYTHON "" CACHE FILEPATH
         "Python interpreter with the project dependencies for differential tests")
