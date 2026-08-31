@@ -7,6 +7,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(KB_PENTE_ENABLE_SANITIZERS "Build native targets with ASan and UBSan" OFF)
+option(KB_PENTE_ENABLE_TSAN
+    "Build the standalone worker-pool target with ThreadSanitizer" OFF)
+
+if(KB_PENTE_ENABLE_TSAN AND KB_PENTE_ENABLE_SANITIZERS)
+    message(FATAL_ERROR "KB_PENTE_ENABLE_TSAN cannot be combined with KB_PENTE_ENABLE_SANITIZERS")
+endif()
+
+find_package(Threads REQUIRED)
 
 add_library(kb_pente_core STATIC
     src/position.cpp
@@ -32,6 +40,44 @@ if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -fno-omit-frame-pointer
     )
     target_link_options(kb_pente_core PRIVATE -fsanitize=address,undefined)
+endif()
+
+add_library(kb_pente_parallel STATIC
+    src/parallel/worker_pool.cpp
+)
+target_link_libraries(kb_pente_parallel PUBLIC Threads::Threads)
+target_compile_features(kb_pente_parallel PUBLIC cxx_std_17)
+target_include_directories(kb_pente_parallel
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+
+if(MSVC)
+    target_compile_options(kb_pente_parallel PRIVATE /W4 /permissive-)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(kb_pente_parallel PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(kb_pente_parallel PRIVATE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(kb_pente_parallel PRIVATE
+        -fsanitize=address,undefined
+    )
+endif()
+
+if(KB_PENTE_ENABLE_TSAN AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(kb_pente_parallel PRIVATE
+        -fsanitize=thread
+        -fno-omit-frame-pointer
+        -fno-pie
+    )
+    target_link_options(kb_pente_parallel PRIVATE
+        -fsanitize=thread
+        -no-pie
+    )
 endif()
 
 add_library(kb_pente_mcts STATIC
@@ -104,6 +150,11 @@ if(BUILD_TESTING)
         tests/telemetry_test.cpp
     )
     target_link_libraries(kb_pente_native_telemetry_tests PRIVATE kb_pente_mcts)
+
+    add_executable(kb_pente_native_worker_pool_tests
+        tests/worker_pool_test.cpp
+    )
+    target_link_libraries(kb_pente_native_worker_pool_tests PRIVATE kb_pente_parallel)
 
     if(MSVC)
         target_compile_options(kb_pente_native_tests PRIVATE /W4 /permissive-)
@@ -183,6 +234,12 @@ if(BUILD_TESTING)
         target_compile_options(kb_pente_native_telemetry_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    if(MSVC)
+        target_compile_options(kb_pente_native_worker_pool_tests PRIVATE /W4 /permissive-)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_worker_pool_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_mcts_tests PRIVATE
             -fsanitize=address,undefined
@@ -233,6 +290,28 @@ if(BUILD_TESTING)
         )
     endif()
 
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_worker_pool_tests PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_worker_pool_tests PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    if(KB_PENTE_ENABLE_TSAN AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_worker_pool_tests PRIVATE
+            -fsanitize=thread
+            -fno-omit-frame-pointer
+            -fno-pie
+        )
+        target_link_options(kb_pente_native_worker_pool_tests PRIVATE
+            -fsanitize=thread
+            -no-pie
+        )
+    endif()
+
     add_test(NAME kb_pente_native_core COMMAND kb_pente_native_tests)
     add_test(NAME kb_pente_native_arena COMMAND kb_pente_native_mcts_tests)
     add_test(NAME kb_pente_native_search COMMAND kb_pente_native_search_tests)
@@ -242,6 +321,8 @@ if(BUILD_TESTING)
     )
     add_test(NAME kb_pente_native_advance COMMAND kb_pente_native_advance_tests)
     add_test(NAME kb_pente_native_telemetry COMMAND kb_pente_native_telemetry_tests)
+    add_test(NAME kb_pente_native_worker_pool COMMAND kb_pente_native_worker_pool_tests)
+    set_tests_properties(kb_pente_native_worker_pool PROPERTIES TIMEOUT 60)
 
     set(KB_PENTE_DIFFERENTIAL_PYTHON "" CACHE FILEPATH
         "Python interpreter with the project dependencies for differential tests")
