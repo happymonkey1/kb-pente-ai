@@ -18,6 +18,31 @@ uv sync
 
 The repository scripts use the local .venv directly so Windows executables cannot be selected accidentally under WSL.
 
+## Optional native search backend
+
+Python search remains the default for training, inference, and model-improvement verification. To enable the optional C++ MCTS backend, install its extension from the repository root:
+
+~~~bash
+uv pip install --no-build-isolation ./native/torch
+~~~
+
+Select the native backend and worker count explicitly for training:
+
+~~~bash
+./script/run-venv.sh python main.py --search-backend cpp --native-search-threads 4
+~~~
+
+The same options apply to MCTS inference and model-improvement verification:
+
+~~~bash
+./script/run-venv.sh python main.py --infer --infer-mcts --model CHECKPOINT \
+  --search-backend cpp --native-search-threads 4
+./script/run-venv.sh python script/verify-model-improvement.py CANDIDATE BASELINE \
+  --search-backend cpp --native-search-threads 4
+~~~
+
+Omit these options to keep the Python backend. Direct inference without `--infer-mcts` remains extension-free.
+
 ## Validation
 
 Run the complete local gate:

@@ -8,10 +8,11 @@ import numpy as np
 from src.evaluation.statistics import elo_difference, wilson_interval
 from src.evaluation.tactical import TacticalSuiteStats, evaluate_tactical_suite
 from src.game.pente.pente_game import PenteGame
-from src.mcts.mcts_v2 import MCTS, MCTSArgs
+from src.mcts.mcts_v2 import MCTSArgs
 from src.model.model_v1 import PenteNet
 from src.train.arena import Arena, ArenaStats
-from src.train.nnet_player import NNetPlayer
+from src.train.player_builder import build_player
+from src.train.self_play_args import SearchBackend
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,25 +77,37 @@ def evaluate_model_match(
     simulations: int,
     opening_plies: int = 4,
     criteria: ModelMatchCriteria | None = None,
+    search_backend: SearchBackend = "python",
+    native_worker_threads: int = 1,
 ) -> ModelMatchReport:
     if simulations < 0:
         raise ValueError("Simulation count cannot be negative")
     candidate.eval()
     baseline.eval()
     mcts_args = MCTSArgs(num_simulations=simulations) if simulations else None
-    candidate_mcts = (
-        MCTS(game, candidate, mcts_args, np.random.default_rng(seed + 1))
-        if mcts_args is not None
-        else None
+    candidate_player = build_player(
+        candidate,
+        None,
+        "candidate",
+        search_backend=search_backend,
+        game=game,
+        mcts_args=mcts_args,
+        seed=seed + 1,
+        native_worker_threads=native_worker_threads,
     )
-    baseline_mcts = (
-        MCTS(game, baseline, mcts_args, np.random.default_rng(seed + 2))
-        if mcts_args is not None
-        else None
+    baseline_player = build_player(
+        baseline,
+        None,
+        "baseline",
+        search_backend=search_backend,
+        game=game,
+        mcts_args=mcts_args,
+        seed=seed + 2,
+        native_worker_threads=native_worker_threads,
     )
     arena = Arena(
-        NNetPlayer(candidate, candidate_mcts, "candidate"),
-        NNetPlayer(baseline, baseline_mcts, "baseline"),
+        candidate_player,
+        baseline_player,
         game,
         opening_plies=opening_plies,
         rng=np.random.default_rng(seed),

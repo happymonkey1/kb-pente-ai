@@ -28,6 +28,44 @@ from src.train.self_play import SelfPlayTrainerArgs
 
 RUN_MANIFEST_SCHEMA_VERSION = 1
 
+_NATIVE_SOURCE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cmake",
+        ".cpp",
+        ".cu",
+        ".cuh",
+        ".cxx",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx",
+        ".inc",
+        ".inl",
+    }
+)
+_TORCH_SOURCE_SUFFIXES = _NATIVE_SOURCE_SUFFIXES | {
+    ".json",
+    ".py",
+    ".sh",
+    ".toml",
+}
+_GENERATED_NATIVE_DIRECTORIES = frozenset(
+    {
+        "__pycache__",
+        "build",
+        "build-debug",
+        "build-release",
+        "cmake-build-debug",
+        "cmake-build-minsizerel",
+        "cmake-build-release",
+        "cmake-build-relwithdebinfo",
+        "dist",
+        "target",
+    }
+)
+
 
 def write_run_manifest(
     path: str | Path,
@@ -77,6 +115,19 @@ def source_fingerprint(repository_root: str | Path) -> str:
     candidates = [root / "main.py", root / "pyproject.toml", root / "uv.lock"]
     candidates.extend((root / "src").rglob("*.py"))
     candidates.extend((root / "script").glob("*.py"))
+    native_root = root / "native"
+    candidates.append(native_root / "CMakeLists.txt")
+    for directory_name in ("include", "src", "tests", "bench"):
+        candidates.extend(
+            _native_source_files(native_root / directory_name, _NATIVE_SOURCE_SUFFIXES)
+        )
+    torch_root = native_root / "torch"
+    if torch_root.is_dir():
+        candidates.extend(
+            path
+            for path in torch_root.iterdir()
+            if path.is_file() and path.suffix.lower() in _TORCH_SOURCE_SUFFIXES
+        )
     digest = hashlib.sha256()
     for path in sorted({path for path in candidates if path.is_file()}):
         relative = path.relative_to(root).as_posix().encode("utf-8")
@@ -86,6 +137,31 @@ def source_fingerprint(repository_root: str | Path) -> str:
         digest.update(len(contents).to_bytes(8, "big"))
         digest.update(contents)
     return digest.hexdigest()
+
+
+def _native_source_files(
+    directory: Path,
+    suffixes: frozenset[str],
+) -> list[Path]:
+    if not directory.is_dir():
+        return []
+
+    paths: list[Path] = []
+    for current_directory, child_directories, filenames in os.walk(
+        directory,
+        topdown=True,
+    ):
+        child_directories[:] = sorted(
+            name
+            for name in child_directories
+            if name.lower() not in _GENERATED_NATIVE_DIRECTORIES
+        )
+        paths.extend(
+            Path(current_directory) / filename
+            for filename in filenames
+            if Path(filename).suffix.lower() in suffixes
+        )
+    return paths
 
 
 def _repository_metadata(root: Path) -> dict[str, object]:

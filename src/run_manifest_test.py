@@ -26,6 +26,39 @@ class RunManifestTest(unittest.TestCase):
 
             self.assertNotEqual(initial, source_fingerprint(root))
 
+    def test_source_fingerprint_covers_native_sources_and_skips_build_trees(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tracked_files = {
+                root / "native" / "CMakeLists.txt": "add_library(core)\n",
+                root / "native" / "include" / "core.h": "int core();\n",
+                root / "native" / "src" / "core.cpp": "int core() { return 1; }\n",
+                root / "native" / "tests" / "core_test.cpp": "int main() {}\n",
+                root / "native" / "bench" / "core_bench.cpp": "int main() {}\n",
+                root / "native" / "torch" / "bindings.cpp": "void bind();\n",
+                root / "native" / "torch" / "setup.py": "setup()\n",
+                root / "native" / "torch" / "test_binding.py": "pass\n",
+                root / "native" / "torch" / "test_extension.sh": "#!/bin/sh\n",
+            }
+            for path, contents in tracked_files.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="utf-8")
+
+            initial = source_fingerprint(root)
+            for path, contents in tracked_files.items():
+                path.write_text(contents + "changed\n", encoding="utf-8")
+                self.assertNotEqual(initial, source_fingerprint(root), path.as_posix())
+                path.write_text(contents, encoding="utf-8")
+
+            generated = root / "native" / "build" / "generated.cpp"
+            generated.parent.mkdir(parents=True, exist_ok=True)
+            generated.write_text("int generated;\n", encoding="utf-8")
+            torch_generated = root / "native" / "torch" / "build" / "generated.cpp"
+            torch_generated.parent.mkdir(parents=True, exist_ok=True)
+            torch_generated.write_text("int generated;\n", encoding="utf-8")
+
+            self.assertEqual(initial, source_fingerprint(root))
+
     def test_writes_reproducible_configuration_and_runtime_identity(self) -> None:
         game = PenteGame(5, ruleset=PenteRuleset.FREESTYLE)
         device = torch.device("cpu")
