@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -146,7 +147,30 @@ public:
     // Return the deterministic per-admission seed assigned to one slot.
     [[nodiscard]] std::uint64_t slot_seed(SlotId slot) const;
     [[nodiscard]] const Position& root_position(SlotId slot) const;
+    // Return the current root status, including terminal roots after advance.
+    [[nodiscard]] TerminalResult root_terminal(SlotId slot) const;
+    // Return the completed session's legal root policy by value.
+    [[nodiscard]] std::array<float, kMaxActions> root_policy(SlotId slot);
     [[nodiscard]] SearchTelemetry slot_telemetry(SlotId slot) const;
+
+    // Advance a completed session onto one legal root action. The retained
+    // subtree is compacted by Tree, and a nonterminal root receives a fresh
+    // session with the supplied configuration.
+    [[nodiscard]] RootAdvanceStats advance_root(
+        SlotId slot,
+        Action action,
+        SearchSessionConfig session_config = SearchSessionConfig{});
+
+    // Remove a completed active slot. Slot IDs become available to add().
+    void remove(SlotId slot);
+
+    // Replace a completed active slot without changing its slot ID. The new
+    // tree and session are constructed before the existing slot is touched.
+    void replace_root(
+        SlotId slot,
+        Position root,
+        Ruleset ruleset = kDefaultRuleset,
+        SearchSessionConfig session_config = SearchSessionConfig{});
 
 private:
     struct Slot final {

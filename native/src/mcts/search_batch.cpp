@@ -7,6 +7,23 @@
 
 namespace kb_pente {
 
+namespace {
+
+[[nodiscard]] SearchConfig admission_config(
+    const SearchConfig& base,
+    std::uint64_t admission) {
+    if (admission == std::numeric_limits<std::uint64_t>::max() ||
+        admission >
+            std::numeric_limits<std::uint64_t>::max() - base.seed) {
+        throw std::overflow_error("SearchBatch admission seed overflow");
+    }
+    SearchConfig result = base;
+    result.seed = base.seed + admission;
+    return result;
+}
+
+}  // namespace
+
 SearchConfig SearchBatch::validate_config(SearchConfig config) {
     config.validate();
     return config;
@@ -58,13 +75,8 @@ SlotId SearchBatch::add(
         throw std::length_error("SearchBatch has no available slot");
     }
 
-    if (admission_count_ == std::numeric_limits<std::uint64_t>::max() ||
-        admission_count_ >
-            std::numeric_limits<std::uint64_t>::max() - config_.seed) {
-        throw std::overflow_error("SearchBatch admission seed overflow");
-    }
-    SearchConfig tree_config = config_;
-    tree_config.seed = config_.seed + admission_count_;
+    const SearchConfig tree_config =
+        admission_config(config_, admission_count_);
     auto tree = std::make_unique<Tree>(root, ruleset, tree_config);
     auto session = std::make_unique<SearchSession>(*tree, session_config);
     slots_[free_slot].tree = std::move(tree);
@@ -94,7 +106,7 @@ Selection SearchBatch::select() {
         worker_pool_.parallel_for(
             slots_.size(), [this](std::size_t slot_index) {
                 Slot& slot = slots_[slot_index];
-                if (!slot.tree || slot.session->complete()) {
+                if (!slot.tree || !slot.session || slot.session->complete()) {
                     return;
                 }
                 const auto leaf = slot.session->select_evaluation_leaf();
@@ -223,10 +235,10 @@ bool SearchBatch::slot_active(SlotId slot) const {
 
 bool SearchBatch::slot_complete(SlotId slot) const {
     const Slot& checked = checked_slot(slot);
-    if (!checked.session) {
+    if (!checked.tree) {
         throw std::out_of_range("SearchBatch slot is not active");
     }
-    return checked.session->complete();
+    return !checked.session || checked.session->complete();
 }
 
 std::uint64_t SearchBatch::slot_seed(SlotId slot) const {
@@ -245,12 +257,151 @@ const Position& SearchBatch::root_position(SlotId slot) const {
     return checked.tree->root_position();
 }
 
-SearchTelemetry SearchBatch::slot_telemetry(SlotId slot) const {
+TerminalResult SearchBatch::root_terminal(SlotId slot) const {
     const Slot& checked = checked_slot(slot);
-    if (!checked.session) {
+    if (!checked.tree) {
         throw std::out_of_range("SearchBatch slot is not active");
     }
+    return checked.tree->arena().node(checked.tree->root_id()).terminal;
+}
+
+std::array<float, kMaxActions> SearchBatch::root_policy(SlotId slot) {
+    ensure_usable();
+    ensure_no_pending();
+    const Slot& checked = checked_slot(slot);
+    if (!checked.tree) {
+        throw std::out_of_range("SearchBatch slot is not active");
+    }
+    if (!checked.session) {
+        throw std::logic_error(
+            "Terminal SearchBatch slots do not have a root policy");
+    }
+    if (!checked.session->complete()) {
+        throw std::logic_error(
+            "SearchBatch root policy requires a completed session");
+    }
+    if (checked.tree->has_pending_evaluation()) {
+        throw std::logic_error(
+            "SearchBatch root policy is unavailable while an evaluation is pending");
+    }
+    return checked.session->root_policy();
+}
+
+SearchTelemetry SearchBatch::slot_telemetry(SlotId slot) const {
+    const Slot& checked = checked_slot(slot);
+    if (!checked.tree) {
+        throw std::out_of_range("SearchBatch slot is not active");
+    }
+    if (!checked.session) {
+        throw std::logic_error(
+            "Terminal SearchBatch slots have no session telemetry");
+    }
     return checked.session->telemetry();
+}
+
+RootAdvanceStats SearchBatch::advance_root(
+    SlotId slot,
+    Action action,
+    SearchSessionConfig session_config) {
+    ensure_usable();
+    ensure_no_pending();
+
+    Slot& checked = checked_slot(slot);
+    if (!checked.tree) {
+        throw std::out_of_range("SearchBatch slot is not active");
+    }
+    if (!checked.session) {
+        throw std::logic_error(
+            "SearchBatch root advancement requires a live completed session");
+    }
+    if (!checked.session->complete()) {
+        throw std::logic_error(
+            "SearchBatch root advancement requires a completed session");
+    }
+    session_config.validate();
+
+    const Tree& tree = *checked.tree;
+    const NodeMeta& root = tree.arena().node(tree.root_id());
+    if (!root.terminal.is_valid()) {
+        throw std::logic_error("SearchBatch root has an invalid terminal result");
+    }
+    if (root.terminal.is_terminal()) {
+        throw std::logic_error("Cannot advance a terminal SearchBatch root");
+    }
+    if (!is_legal_action(root.position, tree.ruleset(), action) ||
+        !root.legal.contains(action)) {
+        throw std::invalid_argument("SearchBatch root advance action is not legal");
+    }
+
+    checked.session.reset();
+
+    try {
+        const RootAdvanceStats stats = checked.tree->advance_root(action);
+        const TerminalResult terminal = root_terminal(slot);
+        if (!terminal.is_terminal()) {
+            auto session = std::make_unique<SearchSession>(
+                *checked.tree, session_config);
+            checked.session = std::move(session);
+        }
+        requests_.clear();
+        return stats;
+    } catch (...) {
+        poison();
+        throw;
+    }
+}
+
+void SearchBatch::remove(SlotId slot) {
+    ensure_usable();
+    ensure_no_pending();
+
+    Slot& checked = checked_slot(slot);
+    if (!checked.tree) {
+        throw std::out_of_range("SearchBatch slot is not active");
+    }
+    if (checked.session && !checked.session->complete()) {
+        throw std::logic_error(
+            "SearchBatch removal requires a completed session");
+    }
+    if (active_count_ == 0U) {
+        throw std::logic_error("SearchBatch active slot count underflow");
+    }
+
+    checked.session.reset();
+    checked.tree.reset();
+    --active_count_;
+}
+
+void SearchBatch::replace_root(
+    SlotId slot,
+    Position root,
+    Ruleset ruleset,
+    SearchSessionConfig session_config) {
+    ensure_usable();
+    ensure_no_pending();
+
+    Slot& checked = checked_slot(slot);
+    if (!checked.tree) {
+        throw std::out_of_range("SearchBatch slot is not active");
+    }
+    if (checked.session && !checked.session->complete()) {
+        throw std::logic_error(
+            "SearchBatch replacement requires a completed session");
+    }
+    session_config.validate();
+
+    const SearchConfig replacement_config =
+        admission_config(config_, admission_count_);
+    auto replacement_tree = std::make_unique<Tree>(
+        root, ruleset, replacement_config);
+    auto replacement_session = std::make_unique<SearchSession>(
+        *replacement_tree, session_config);
+
+    checked.session.reset();
+    checked.tree.reset();
+    checked.tree = std::move(replacement_tree);
+    checked.session = std::move(replacement_session);
+    ++admission_count_;
 }
 
 void SearchBatch::ensure_usable() const {
