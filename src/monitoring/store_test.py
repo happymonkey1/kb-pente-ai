@@ -61,6 +61,14 @@ class TelemetryStoreTest(unittest.TestCase):
         self.assertEqual(1.0, summary["latest_metrics"]["loss"])
         self.assertEqual(
             {
+                "type": "cpu",
+                "logical_core_count": None,
+                "phases": {"self_play": None, "learner": None},
+            },
+            summary["device"],
+        )
+        self.assertEqual(
+            {
                 "count": 3,
                 "latest": 1.0,
                 "minimum": 1.0,
@@ -90,6 +98,19 @@ class TelemetryStoreTest(unittest.TestCase):
         self.assertEqual("degraded", summary["status"])
         self.assertEqual(1, len(summary["issues"]))
         self.assertEqual(2, summary["issues"][0]["line"])
+
+    def test_uses_telemetry_run_identity_for_replay_matching(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "custom-filename.jsonl"
+            record = {**_telemetry_record(1, 1.0), "run_id": "stable-run-id"}
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            store = TelemetryStore(root)
+
+            summary = cast(dict[str, Any], store.summary("custom-filename.jsonl"))
+
+        self.assertEqual("stable-run-id", summary["training_run_id"])
+        self.assertEqual("stable-run-id", summary["run_key"])
 
     def test_rejects_paths_outside_the_configured_root(self) -> None:
         with TemporaryDirectory() as directory:

@@ -48,6 +48,29 @@ class CudaMetricSamplerTest(unittest.TestCase):
         self.assertEqual(17, result)
         self.assertIsNone(metrics)
 
+    @patch("src.monitoring.cuda_metrics.torch.cuda.max_memory_reserved", return_value=0)
+    @patch("src.monitoring.cuda_metrics.torch.cuda.max_memory_allocated", return_value=0)
+    @patch("src.monitoring.cuda_metrics.torch.cuda.reset_peak_memory_stats")
+    @patch(
+        "src.monitoring.cuda_metrics.torch.cuda.utilization",
+        side_effect=OSError("NVML unavailable"),
+    )
+    def test_sampling_failure_is_reported_without_escaping_sampler(
+        self,
+        utilization: object,
+        reset_peak: object,
+        max_allocated: object,
+        max_reserved: object,
+    ) -> None:
+        sampler = CudaMetricSampler(torch.device("cuda"))
+
+        with patch("src.monitoring.cuda_metrics.threading.Thread"):
+            sampler.start()
+        metrics = sampler.stop()
+
+        self.assertEqual(0, metrics.samples)
+        self.assertEqual(1, metrics.sampling_errors)
+
 
 if __name__ == "__main__":
     unittest.main()

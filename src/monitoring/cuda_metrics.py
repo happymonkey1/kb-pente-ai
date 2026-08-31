@@ -89,7 +89,8 @@ class CudaMetricSampler:
         try:
             self._utilization.append(int(torch.cuda.utilization(self._device)))
             self._device_memory.append(int(torch.cuda.memory_usage(self._device)))
-        except (ModuleNotFoundError, RuntimeError):
+        except Exception:
+            # NVML exception classes vary by driver and PyTorch version.
             self._sampling_errors += 1
 
 

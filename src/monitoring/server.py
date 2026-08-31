@@ -237,6 +237,7 @@ class MonitoringRequestHandler(BaseHTTPRequestHandler):
             "/": ("index.html", "text/html; charset=utf-8"),
             "/pico.min.css": ("pico.min.css", "text/css; charset=utf-8"),
             "/app.css": ("app.css", "text/css; charset=utf-8"),
+            "/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
         }
         static_file = static_files.get(path)

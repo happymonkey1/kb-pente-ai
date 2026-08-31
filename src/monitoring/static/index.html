@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Local metrics and replay monitor for kb-pente-ai">
-    <meta name="color-scheme" content="light">
+    <meta name="color-scheme" content="light dark">
     <title>kb-pente-ai monitor</title>
+    <script src="/theme.js"></script>
     <link rel="stylesheet" href="/pico.min.css">
     <link rel="stylesheet" href="/app.css">
   </head>
@@ -20,6 +21,16 @@
         </ul>
         <ul>
           <li><small id="connection-state" class="connection-state">Connecting</small></li>
+          <li>
+            <label class="theme-control">
+              <span class="theme-label">Theme</span>
+              <select id="theme-select" aria-label="Theme">
+                <option value="system">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+            </label>
+          </li>
           <li>
             <button id="refresh-toggle" class="secondary outline compact" type="button" aria-pressed="false">
               Pause
@@ -36,9 +47,6 @@
           <small id="run-count">0</small>
         </header>
         <div id="run-list" class="run-list" role="list"></div>
-        <footer>
-          <small>Reads JSONL files from the metrics directory.</small>
-        </footer>
       </aside>
 
       <main class="container-fluid">
@@ -56,7 +64,6 @@
                 <span id="run-updated">Not updated</span>
               </p>
               <h2 id="run-name">Training run</h2>
-              <small id="run-context">No records.</small>
             </div>
             <dl class="step-value">
               <dt>Step</dt>
@@ -64,128 +71,161 @@
             </dl>
           </header>
 
-          <section class="summary-grid" aria-label="Run summary">
-            <article>
-              <small>Loss</small>
-              <strong id="signal-loss">--</strong>
-              <span id="signal-policy-loss">Policy --</span>
-            </article>
-            <article>
-              <small>Positions/s</small>
-              <strong id="signal-throughput">--</strong>
-              <span>Self-play throughput</span>
-            </article>
-            <article>
-              <small>Replay size</small>
-              <strong id="signal-replay">--</strong>
-              <span id="signal-replay-detail">-- unique</span>
-            </article>
-            <article id="signal-search-card">
-              <small>Collapse rate</small>
-              <strong id="signal-search">--</strong>
-              <span id="signal-search-detail">-- eligible roots</span>
-            </article>
-            <article>
-              <small>Evaluation</small>
-              <strong id="signal-evaluation">--</strong>
-              <span id="signal-evaluation-detail">No result</span>
-            </article>
-          </section>
+          <div id="run-tabs" class="run-tabs" role="tablist" aria-label="Run views">
+            <button id="tab-overview" class="run-tab" type="button" role="tab" aria-controls="panel-overview" aria-selected="true" data-tab="overview">Overview</button>
+            <button id="tab-metrics" class="run-tab" type="button" role="tab" aria-controls="panel-metrics" aria-selected="false" tabindex="-1" data-tab="metrics">Latest metrics</button>
+            <button id="tab-replay" class="run-tab" type="button" role="tab" aria-controls="panel-replay" aria-selected="false" tabindex="-1" data-tab="replay">Replay</button>
+          </div>
 
-          <section class="analysis-grid">
-            <article class="panel chart-panel">
-              <header class="panel-header">
-                <h3>Metric history</h3>
-                <label class="inline-field">
-                  <span>Metric</span>
-                  <select id="metric-select" aria-label="Chart metric"></select>
-                </label>
-              </header>
-              <div class="chart-wrap">
-                <canvas id="metric-chart" role="img" aria-labelledby="chart-description"></canvas>
-                <p id="chart-description" class="visually-hidden">No metric selected.</p>
-                <p id="chart-empty" class="empty-message">No numeric values.</p>
-              </div>
-              <footer id="chart-summary" class="chart-summary"></footer>
-            </article>
+          <section id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview">
+            <section class="summary-grid" aria-label="Run summary">
+              <article>
+                <small>Loss</small>
+                <strong id="signal-loss">--</strong>
+                <span id="signal-policy-loss">Policy --</span>
+              </article>
+              <article>
+                <small>Positions/s</small>
+                <strong id="signal-throughput">--</strong>
+                <span>Self-play throughput</span>
+              </article>
+              <article>
+                <small>Replay size</small>
+                <strong id="signal-replay">--</strong>
+                <span id="signal-replay-detail">-- unique</span>
+              </article>
+              <article id="signal-search-card">
+                <small>Collapse rate</small>
+                <strong id="signal-search">--</strong>
+                <span id="signal-search-detail">-- eligible roots</span>
+              </article>
+              <article>
+                <small>Evaluation</small>
+                <strong id="signal-evaluation">--</strong>
+                <span id="signal-evaluation-detail">No result</span>
+              </article>
+              <article>
+                <small>Device</small>
+                <strong id="signal-device">--</strong>
+                <span id="signal-device-detail">Not reported</span>
+              </article>
+            </section>
 
-            <article class="panel event-panel">
+            <section class="analysis-grid">
+              <article class="panel chart-panel">
+                <header class="panel-header">
+                  <h3>Metric history</h3>
+                  <label class="inline-field">
+                    <span>Metric</span>
+                    <select id="metric-select" aria-label="Chart metric"></select>
+                  </label>
+                </header>
+                <div class="chart-wrap">
+                  <canvas id="metric-chart" role="img" aria-labelledby="chart-description"></canvas>
+                  <p id="chart-description" class="visually-hidden">No metric selected.</p>
+                  <p id="chart-empty" class="empty-message">No numeric values.</p>
+                </div>
+                <footer id="chart-summary" class="chart-summary"></footer>
+              </article>
+
+              <article class="panel event-panel">
+                <header class="panel-header">
+                  <h3>Events</h3>
+                  <small id="event-count">0</small>
+                </header>
+                <div class="table-scroll">
+                  <table class="striped">
+                    <thead>
+                      <tr>
+                        <th scope="col">Event</th>
+                        <th scope="col">Step</th>
+                        <th scope="col">Time</th>
+                      </tr>
+                    </thead>
+                    <tbody id="event-table"></tbody>
+                  </table>
+                </div>
+              </article>
+            </section>
+
+            <article class="panel device-panel">
               <header class="panel-header">
-                <h3>Events</h3>
-                <small id="event-count">0</small>
+                <h3>Device metrics</h3>
+                <small id="device-metrics-state">Not reported</small>
               </header>
-              <div class="table-scroll">
+              <p id="device-metrics-empty" class="empty-message">This run does not report a device.</p>
+              <div id="device-metrics-table" class="table-scroll" hidden>
                 <table class="striped">
                   <thead>
-                    <tr>
-                      <th scope="col">Event</th>
-                      <th scope="col">Step</th>
-                      <th scope="col">Time</th>
-                    </tr>
+                    <tr id="device-metrics-head"></tr>
                   </thead>
-                  <tbody id="event-table"></tbody>
+                  <tbody id="device-metrics-body"></tbody>
                 </table>
               </div>
             </article>
           </section>
 
-          <article class="panel metrics-panel">
-            <header class="panel-header">
-              <h3>Latest metrics</h3>
-              <input id="metric-filter" type="search" placeholder="Filter" aria-label="Filter metrics">
-            </header>
-            <div id="metric-inventory" class="metric-inventory"></div>
-          </article>
+          <section id="panel-metrics" class="tab-panel" role="tabpanel" aria-labelledby="tab-metrics" hidden>
+            <article class="panel metrics-panel">
+              <header class="panel-header">
+                <h3>Latest metrics</h3>
+                <input id="metric-filter" type="search" placeholder="Filter" aria-label="Filter metrics">
+              </header>
+              <div id="metric-inventory" class="metric-inventory"></div>
+            </article>
+          </section>
 
-          <article class="panel replay-panel">
-            <header class="panel-header">
-              <h3>Replay</h3>
-              <label class="inline-field replay-picker">
-                <span>Game</span>
-                <select id="replay-select" aria-label="Replay sample"></select>
-              </label>
-            </header>
-            <p id="replay-empty" class="empty-message">No replay samples for this run.</p>
-            <div id="replay-view" class="replay-view" hidden>
-              <div class="board-column">
-                <div id="pente-board" class="pente-board" role="img" aria-label="Pente replay board"></div>
-              </div>
-              <div class="replay-details">
-                <section class="replay-result">
-                  <small>Result</small>
-                  <strong id="replay-result">In progress</strong>
-                  <span id="replay-meta"></span>
-                </section>
-                <dl class="capture-list">
-                  <div>
-                    <dt><span class="stone-key black"></span>Player 1 captures</dt>
-                    <dd id="capture-one">0</dd>
-                  </div>
-                  <div>
-                    <dt><span class="stone-key white"></span>Player 2 captures</dt>
-                    <dd id="capture-two">0</dd>
-                  </div>
-                </dl>
-                <label class="move-slider">
-                  <span id="move-label">Start</span>
-                  <input id="move-range" type="range" min="0" max="0" value="0">
+          <section id="panel-replay" class="tab-panel" role="tabpanel" aria-labelledby="tab-replay" hidden>
+            <article class="panel replay-panel">
+              <header class="panel-header">
+                <h3>Replay</h3>
+                <label class="inline-field replay-picker">
+                  <span>Game</span>
+                  <select id="replay-select" aria-label="Replay sample"></select>
                 </label>
-                <div class="replay-controls" role="group" aria-label="Replay controls">
-                  <button id="replay-previous" class="secondary" type="button">Back</button>
-                  <button id="replay-play" type="button">Play</button>
-                  <button id="replay-next" class="secondary" type="button">Next</button>
-                  <label>
-                    <span class="visually-hidden">Speed</span>
-                    <select id="replay-speed" aria-label="Replay speed">
-                      <option value="900">1x</option>
-                      <option value="450">2x</option>
-                      <option value="225">4x</option>
-                    </select>
+              </header>
+              <p id="replay-empty" class="empty-message">No replay samples for this run.</p>
+              <div id="replay-view" class="replay-view" hidden>
+                <div class="board-column">
+                  <div id="pente-board" class="pente-board" role="img" aria-label="Pente replay board"></div>
+                </div>
+                <div class="replay-details">
+                  <section class="replay-result">
+                    <small>Result</small>
+                    <strong id="replay-result">In progress</strong>
+                    <span id="replay-meta"></span>
+                  </section>
+                  <dl class="capture-list">
+                    <div>
+                      <dt><span class="stone-key black"></span>Player 1 captures</dt>
+                      <dd id="capture-one">0</dd>
+                    </div>
+                    <div>
+                      <dt><span class="stone-key white"></span>Player 2 captures</dt>
+                      <dd id="capture-two">0</dd>
+                    </div>
+                  </dl>
+                  <label class="move-slider">
+                    <span id="move-label">Start</span>
+                    <input id="move-range" type="range" min="0" max="0" value="0">
                   </label>
+                  <div class="replay-controls" role="group" aria-label="Replay controls">
+                    <button id="replay-previous" class="secondary" type="button">Back</button>
+                    <button id="replay-play" type="button">Play</button>
+                    <button id="replay-next" class="secondary" type="button">Next</button>
+                    <label>
+                      <span class="visually-hidden">Speed</span>
+                      <select id="replay-speed" aria-label="Replay speed">
+                        <option value="900">1x</option>
+                        <option value="450">2x</option>
+                        <option value="225">4x</option>
+                      </select>
+                    </label>
+                  </div>
                 </div>
               </div>
-            </div>
-          </article>
+            </article>
+          </section>
         </div>
       </main>
     </div>

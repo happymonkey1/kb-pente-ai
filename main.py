@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import logging
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+import sys
+import uuid
 
 import numpy as np
 import torch
@@ -12,11 +15,13 @@ from src.game.pente.pente_game import PenteGame
 from src.game.pente.rules import PenteRuleset
 from src.mcts.mcts_v2 import MCTS, MCTSArgs
 from src.model.model_v1 import PenteNet
+from src.run_manifest import write_run_manifest
 from src.telemetry import JsonlMetricSink
 from src.train.arena import Arena
 from src.train.nnet_player import NNetPlayer
 from src.train.random_player import RandomPlayer
 from src.train.self_play import SelfPlayTrainer, SelfPlayTrainerArgs
+from src.train.self_play_health import SelfPlayHealthThresholds
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-dataset-processing", action="store_true")
     parser.add_argument("--max-training-examples", type=int, default=500_000)
     parser.add_argument("--professional-replay-fraction", type=float, default=0.25)
+    parser.add_argument("--professional-value-loss-weight", type=float, default=1.0)
+    parser.add_argument("--self-play-value-loss-weight", type=float, default=1.0)
+    parser.add_argument("--minimum-batch-occupancy", type=float, default=0.0)
+    parser.add_argument("--minimum-mean-root-children", type=float, default=0.0)
+    parser.add_argument("--maximum-search-collapse-rate", type=float, default=1.0)
+    parser.add_argument("--maximum-invalid-policy-fallbacks", type=int, default=0)
+    parser.add_argument("--maximum-zero-visit-fallbacks", type=int, default=-1)
     parser.add_argument("--model-blocks", type=int, default=4)
     parser.add_argument("--model-channels", type=int, default=64)
     parser.add_argument("--model-hidden-size", type=int, default=256)
@@ -129,6 +141,8 @@ def main() -> int:
             start_iteration = resume_state.iteration
             training_run_id = resume_state.training_run_id
             expected_replay_generation = resume_state.replay_snapshot_generation
+    elif not program_args.infer:
+        training_run_id = uuid.uuid4().hex
 
     trainer_args = SelfPlayTrainerArgs(
         start_iteration=start_iteration,
@@ -156,8 +170,27 @@ def main() -> int:
         resume_replay_filepath=program_args.resume_replay,
         seed_replay_from_professional=program_args.seed_replay_from_professional,
         professional_replay_fraction=program_args.professional_replay_fraction,
+        professional_value_loss_weight=program_args.professional_value_loss_weight,
+        self_play_value_loss_weight=program_args.self_play_value_loss_weight,
         training_run_id=training_run_id,
         expected_replay_generation=expected_replay_generation,
+        search_health=SelfPlayHealthThresholds(
+            minimum_steady_state_batch_occupancy=(
+                program_args.minimum_batch_occupancy
+            ),
+            minimum_mean_root_children_visited=(
+                program_args.minimum_mean_root_children
+            ),
+            maximum_search_collapse_rate=(
+                program_args.maximum_search_collapse_rate
+            ),
+            maximum_invalid_policy_fallbacks=(
+                program_args.maximum_invalid_policy_fallbacks
+            ),
+            maximum_zero_visit_fallbacks=(
+                program_args.maximum_zero_visit_fallbacks
+            ),
+        ),
     )
 
     if program_args.compile:
@@ -176,8 +209,27 @@ def main() -> int:
     if program_args.infer:
         return run_inference(program_args, game, net, trainer_args)
 
-    metric_sink = JsonlMetricSink(program_args.telemetry_file)
+    assert training_run_id is not None
+    metric_sink = JsonlMetricSink(program_args.telemetry_file, training_run_id)
     trainer = SelfPlayTrainer(game, net, optimizer, device, trainer_args, metric_sink)
+    manifest_root = (
+        Path(program_args.model_dir)
+        if not program_args.no_checkpoint
+        else Path(program_args.telemetry_file).resolve().parent
+    )
+    write_run_manifest(
+        manifest_root / f"run-manifest-step-{start_iteration}.json",
+        Path(__file__).resolve().parent,
+        [sys.executable, *sys.argv],
+        trainer.training_run_id,
+        start_iteration,
+        device,
+        program_args.compile,
+        net,
+        trainer_args,
+        vars(program_args),
+        program_args.telemetry_file,
+    )
     trainer.train()
     return 0
 

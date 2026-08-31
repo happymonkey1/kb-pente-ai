@@ -3,14 +3,13 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import os
-import shutil
-import tempfile
 import time
 import uuid
 
 import numpy as np
 import torch
 
+from src.artifact_io import replace_with_link_or_copy
 from src.evaluation.supervised import (
     evaluate_supervised_examples,
     supervised_evaluation_metrics,
@@ -19,6 +18,7 @@ from src.game.pente.pente_game import PenteGame
 from src.mcts.batched import BatchedSearchTelemetry
 from src.mcts.mcts_v2 import MCTSArgs
 from src.model.model_v1 import PenteNet
+from src.monitoring.cpu_metrics import CpuMetrics, measure_cpu_operation
 from src.monitoring.cuda_metrics import measure_cuda_operation
 from src.telemetry import MetricSink, NullMetricSink
 from src.train.iteration_evaluation import evaluate_training_iteration
@@ -29,6 +29,10 @@ from src.train.self_play_generation import (
     PlayedGame,
     SelfPlayGenerator,
     finalize_training_examples,
+)
+from src.train.self_play_health import (
+    SelfPlayHealthThresholds,
+    validate_self_play_health,
 )
 from src.train.self_play_metrics import collect_self_play_metrics
 from src.train.training_example import TrainingExample
@@ -64,6 +68,9 @@ class SelfPlayTrainerArgs:
     training_run_id: str | None = None
     expected_replay_generation: int | None = None
     professional_replay_fraction: float = 0.25
+    professional_value_loss_weight: float = 1.0
+    self_play_value_loss_weight: float = 1.0
+    search_health: SelfPlayHealthThresholds = SelfPlayHealthThresholds()
 
     def __post_init__(self) -> None:
         if self.start_iteration < 0:
@@ -101,6 +108,8 @@ class SelfPlayTrainerArgs:
             raise ValueError("Expected replay generation is outside the checkpoint history")
         if not 0 <= self.professional_replay_fraction <= 1:
             raise ValueError("Professional replay fraction must be between zero and one")
+        if self.professional_value_loss_weight < 0 or self.self_play_value_loss_weight < 0:
+            raise ValueError("Value loss weights cannot be negative")
 
 
 class SelfPlayTrainer:
@@ -283,6 +292,8 @@ class SelfPlayTrainer:
             generation_started = time.perf_counter()
             played_games: list[PlayedGame] = []
             search_batches: list[BatchedSearchTelemetry] = []
+            generation_cpu_metrics: CpuMetrics | None = None
+            generation_cuda_metrics = None
             if is_professional:
                 if professional_examples is None:
                     professional_examples = self.load_professional_training_examples()
@@ -300,12 +311,51 @@ class SelfPlayTrainer:
                         supervised_evaluation_metrics(baseline),
                     )
             else:
-                generation_result, generation_cuda_metrics = measure_cuda_operation(
-                    self.device,
-                    self.build_self_play_training_examples,
+                measured_generation, generation_cpu_metrics = measure_cpu_operation(
+                    lambda: measure_cuda_operation(
+                        self.device,
+                        self.build_self_play_training_examples,
+                    )
                 )
+                generation_result, generation_cuda_metrics = measured_generation
                 new_examples, played_games, search_batches = generation_result
             generation_seconds = time.perf_counter() - generation_started
+            self_play_metrics: dict[str, int | float] = {}
+            if played_games:
+                self_play_metrics.update(
+                    collect_self_play_metrics(
+                        played_games,
+                        search_batches,
+                        generation_seconds,
+                    )
+                )
+                if generation_cuda_metrics is not None:
+                    self_play_metrics.update(
+                        generation_cuda_metrics.to_metrics("self_play_gpu")
+                    )
+                assert generation_cpu_metrics is not None
+                self_play_metrics.update(generation_cpu_metrics.to_metrics("self_play"))
+                try:
+                    validate_self_play_health(
+                        self_play_metrics,
+                        self.args.search_health,
+                    )
+                except RuntimeError as error:
+                    failure_metrics: dict[str, int | float | str] = {
+                        "device_type": self.device.type,
+                        "cpu_logical_core_count": (
+                            generation_cpu_metrics.logical_core_count
+                        ),
+                        "generation_seconds": generation_seconds,
+                        "error": str(error),
+                    }
+                    failure_metrics.update(self_play_metrics)
+                    self.metric_sink.emit(
+                        "self_play_health_failure",
+                        iteration + 1,
+                        failure_metrics,
+                    )
+                    raise
 
             self.replay.extend(
                 new_examples,
@@ -326,14 +376,39 @@ class SelfPlayTrainer:
             learner_examples = learner_sample.examples
 
             training_started = time.perf_counter()
-            training_stats, learner_cuda_metrics = measure_cuda_operation(
-                self.device,
-                lambda: self.train_model(learner_examples),
+            measured_training, learner_cpu_metrics = measure_cpu_operation(
+                lambda: measure_cuda_operation(
+                    self.device,
+                    lambda: self.train_model(
+                        learner_examples,
+                        (
+                            self.args.professional_value_loss_weight
+                            if is_professional
+                            else self.args.self_play_value_loss_weight
+                        ),
+                    ),
+                )
             )
+            training_stats, learner_cuda_metrics = measured_training
             training_seconds = time.perf_counter() - training_started
+            if (
+                learner_cuda_metrics is not None
+                and learner_cuda_metrics.sampling_errors > 0
+            ):
+                raise RuntimeError(
+                    "Learner GPU utilization sampling failed "
+                    f"{learner_cuda_metrics.sampling_errors} times"
+                )
+            if learner_cpu_metrics.sampling_errors > 0:
+                raise RuntimeError(
+                    "Learner CPU utilization sampling failed "
+                    f"{learner_cpu_metrics.sampling_errors} times"
+                )
             replay_stats = self.replay.stats(iteration + 1)
 
-            metrics: dict[str, int | float] = {
+            metrics: dict[str, int | float | str] = {
+                "device_type": self.device.type,
+                "cpu_logical_core_count": learner_cpu_metrics.logical_core_count,
                 "new_positions": len(new_examples),
                 "new_unique_positions": len({example.position.state_key() for example in new_examples}),
                 "replay_positions": replay_stats.size,
@@ -356,20 +431,13 @@ class SelfPlayTrainer:
                     training_stats.total_value_absolute_error / training_stats.num_batches
                 ),
                 "value_bias": training_stats.total_value_bias / training_stats.num_batches,
+                "value_loss_weight": training_stats.value_loss_weight,
             }
             metrics.update(training_stats.value_metrics.to_metrics())
-            if not is_professional and generation_cuda_metrics is not None:
-                metrics.update(generation_cuda_metrics.to_metrics("self_play_gpu"))
             if learner_cuda_metrics is not None:
                 metrics.update(learner_cuda_metrics.to_metrics("learner_gpu"))
-            if played_games:
-                metrics.update(
-                    collect_self_play_metrics(
-                        played_games,
-                        search_batches,
-                        generation_seconds,
-                    )
-                )
+            metrics.update(learner_cpu_metrics.to_metrics("learner"))
+            metrics.update(self_play_metrics)
             if is_professional and self.professional_validation_examples:
                 validation = evaluate_supervised_examples(
                     self.net,
@@ -400,7 +468,11 @@ class SelfPlayTrainer:
             if self.args.should_checkpoint:
                 self._save_checkpoint(iteration + 1)
 
-    def train_model(self, training_examples: list[TrainingExample]) -> ModelTrainingStats:
+    def train_model(
+        self,
+        training_examples: list[TrainingExample],
+        value_loss_weight: float = 1.0,
+    ) -> ModelTrainingStats:
         return train_policy_value_model(
             self.net,
             self.optimizer,
@@ -409,6 +481,7 @@ class SelfPlayTrainer:
             training_examples,
             self.args.batch_size,
             self.args.augment_training,
+            value_loss_weight,
         )
 
     def _save_checkpoint(self, iteration: int) -> None:
@@ -425,7 +498,7 @@ class SelfPlayTrainer:
                 board_size=self.game.get_board_size(),
                 ruleset=self.game.ruleset.value,
             )
-            _replace_with_link_or_copy(
+            replace_with_link_or_copy(
                 versioned_replay_path,
                 self._replay_snapshot_path,
             )
@@ -443,20 +516,3 @@ class SelfPlayTrainer:
             self.net.get_checkpoint_file_name(iteration),
         )
         PenteNet.save_checkpoint(state, self.args.checkpoint_dir, "latest.pth.tar")
-
-
-def _replace_with_link_or_copy(source: str, destination: str) -> None:
-    directory = os.path.dirname(os.path.abspath(destination))
-    os.makedirs(directory, exist_ok=True)
-    file_descriptor, temporary_path = tempfile.mkstemp(dir=directory)
-    os.close(file_descriptor)
-    os.unlink(temporary_path)
-    try:
-        try:
-            os.link(source, temporary_path)
-        except OSError:
-            shutil.copy2(source, temporary_path)
-        os.replace(temporary_path, destination)
-    finally:
-        if os.path.exists(temporary_path):
-            os.unlink(temporary_path)

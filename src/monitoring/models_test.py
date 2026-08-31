@@ -11,6 +11,7 @@ class TelemetryRecordTest(unittest.TestCase):
             {
                 "schema_version": 1,
                 "timestamp_unix": 100.5,
+                "run_id": "training-run",
                 "event": "training_iteration",
                 "step": 3,
                 "metrics": {
@@ -24,8 +25,22 @@ class TelemetryRecordTest(unittest.TestCase):
         )
 
         self.assertEqual("training_iteration", record.event)
+        self.assertEqual("training-run", record.run_id)
         self.assertEqual(3, record.step)
         self.assertEqual(1.25, record.metrics["loss"])
+
+    def test_accepts_legacy_record_without_run_identity(self) -> None:
+        record = TelemetryRecord.from_object(
+            {
+                "schema_version": 1,
+                "timestamp_unix": 100.5,
+                "event": "training_iteration",
+                "step": 3,
+                "metrics": {},
+            }
+        )
+
+        self.assertIsNone(record.run_id)
 
     def test_rejects_unsupported_schema_and_non_finite_metric(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unsupported telemetry schema"):

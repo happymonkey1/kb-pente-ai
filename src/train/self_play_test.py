@@ -16,6 +16,7 @@ from src.model.model_v1 import PenteNet
 from src.telemetry import InMemoryMetricSink
 from src.train.self_play import SelfPlayTrainer, SelfPlayTrainerArgs, finalize_training_examples
 from src.train.self_play_generation import SelfPlayGenerator
+from src.train.self_play_health import SelfPlayHealthThresholds
 from src.train.self_play_metrics import collect_self_play_metrics
 from src.train.replay_buffer import ReplayBuffer
 from src.train.training_example import TrainingExample
@@ -240,6 +241,62 @@ class SelfPlayTest(unittest.TestCase):
         assert isinstance(updated, dict)
         self.assertEqual(1, baseline["professional_validation_examples"])
         self.assertEqual(1, updated["professional_validation_examples"])
+        self.assertEqual("cpu", updated["device_type"])
+        self.assertGreaterEqual(updated["cpu_logical_core_count"], 1)
+        self.assertIn("learner_cpu_utilization_samples", updated)
+        self.assertNotIn("self_play_cpu_utilization_samples", updated)
+
+    def test_health_failure_emits_complete_self_play_evidence(self) -> None:
+        game = PenteGame(5, ruleset=PenteRuleset.FREESTYLE)
+        net = PenteNet(
+            torch.device("cpu"),
+            board_size=5,
+            action_size=25,
+            num_res_blocks=1,
+            num_channels=8,
+            hidden_fc_size=16,
+        )
+        optimizer = torch.optim.AdamW(net.parameters(), lr=1e-3)
+        sink = InMemoryMetricSink()
+        args = SelfPlayTrainerArgs(
+            start_iteration=0,
+            professional_games_training_iterations=0,
+            self_play_training_iterations=1,
+            temp_threshold=0,
+            mcts_args=MCTSArgs(num_simulations=2),
+            watch_training_raw_dataset_filepath="unused",
+            watch_training_processed_dataset_filepath="unused",
+            force_watch_training_raw_dataset_processing=False,
+            batch_size=1,
+            batch_games=1,
+            active_games=1,
+            should_checkpoint=False,
+            augment_training=False,
+            learner_steps_per_iteration=1,
+            search_health=SelfPlayHealthThresholds(
+                minimum_mean_root_children_visited=1000,
+            ),
+        )
+        trainer = SelfPlayTrainer(
+            game,
+            net,
+            optimizer,
+            torch.device("cpu"),
+            args,
+            sink,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "mean_root_children_visited"):
+            trainer.train()
+
+        self.assertEqual(1, len(sink.records))
+        self.assertEqual("self_play_health_failure", sink.records[0]["event"])
+        metrics = sink.records[0]["metrics"]
+        assert isinstance(metrics, dict)
+        self.assertEqual("cpu", metrics["device_type"])
+        self.assertIn("steady_state_mean_batch_occupancy", metrics)
+        self.assertIn("self_play_cpu_utilization_samples", metrics)
+        self.assertIn("mean_root_children_visited", metrics["error"])
 
     def test_resume_requires_replay_or_explicit_professional_seed(self) -> None:
         game = PenteGame(5, ruleset=PenteRuleset.FREESTYLE)

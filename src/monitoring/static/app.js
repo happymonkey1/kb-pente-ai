@@ -2,6 +2,7 @@
 
 const POLL_INTERVAL_MS = 2000;
 const MAX_VISIBLE_RECORDS = 1000;
+const THEME_STORAGE_KEY = "kb-pente-monitor-theme";
 
 const state = {
   runs: [],
@@ -10,6 +11,7 @@ const state = {
   records: [],
   paused: false,
   polling: false,
+  selectedTab: "overview",
   selectedMetric: null,
   replayEntries: [],
   selectedReplayId: null,
@@ -20,6 +22,7 @@ const state = {
 
 const elements = {
   connection: document.querySelector("#connection-state"),
+  themeSelect: document.querySelector("#theme-select"),
   refreshToggle: document.querySelector("#refresh-toggle"),
   runCount: document.querySelector("#run-count"),
   runList: document.querySelector("#run-list"),
@@ -28,8 +31,14 @@ const elements = {
   runStatus: document.querySelector("#run-status"),
   runUpdated: document.querySelector("#run-updated"),
   runName: document.querySelector("#run-name"),
-  runContext: document.querySelector("#run-context"),
   latestStep: document.querySelector("#latest-step"),
+  runTabs: document.querySelector("#run-tabs"),
+  overviewTab: document.querySelector("#tab-overview"),
+  metricsTab: document.querySelector("#tab-metrics"),
+  replayTab: document.querySelector("#tab-replay"),
+  overviewPanel: document.querySelector("#panel-overview"),
+  metricsPanel: document.querySelector("#panel-metrics"),
+  replayPanel: document.querySelector("#panel-replay"),
   signalLoss: document.querySelector("#signal-loss"),
   signalPolicyLoss: document.querySelector("#signal-policy-loss"),
   signalThroughput: document.querySelector("#signal-throughput"),
@@ -40,6 +49,13 @@ const elements = {
   signalSearchDetail: document.querySelector("#signal-search-detail"),
   signalEvaluation: document.querySelector("#signal-evaluation"),
   signalEvaluationDetail: document.querySelector("#signal-evaluation-detail"),
+  signalDevice: document.querySelector("#signal-device"),
+  signalDeviceDetail: document.querySelector("#signal-device-detail"),
+  deviceMetricsState: document.querySelector("#device-metrics-state"),
+  deviceMetricsEmpty: document.querySelector("#device-metrics-empty"),
+  deviceMetricsTable: document.querySelector("#device-metrics-table"),
+  deviceMetricsHead: document.querySelector("#device-metrics-head"),
+  deviceMetricsBody: document.querySelector("#device-metrics-body"),
   metricSelect: document.querySelector("#metric-select"),
   metricChart: document.querySelector("#metric-chart"),
   chartDescription: document.querySelector("#chart-description"),
@@ -72,6 +88,64 @@ function assertElements() {
       throw new Error(`Dashboard element is missing: ${name}`);
     }
   }
+}
+
+function tabEntries() {
+  return [
+    ["overview", elements.overviewTab, elements.overviewPanel],
+    ["metrics", elements.metricsTab, elements.metricsPanel],
+    ["replay", elements.replayTab, elements.replayPanel],
+  ];
+}
+
+function selectTab(name, focus = false) {
+  const entries = tabEntries();
+  const selected = entries.find(([entryName]) => entryName === name) ?? entries[0];
+  state.selectedTab = selected[0];
+  for (const [entryName, button, panel] of entries) {
+    const active = entryName === state.selectedTab;
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+    panel.hidden = !active;
+  }
+  if (state.selectedTab !== "replay") {
+    stopReplay();
+  }
+  if (state.selectedTab === "overview") {
+    renderChart();
+  }
+  if (focus) {
+    selected[1].focus();
+  }
+}
+
+function themePreference() {
+  try {
+    const preference = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return preference === "light" || preference === "dark" ? preference : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function setTheme(preference) {
+  const selected = preference === "light" || preference === "dark" ? preference : "system";
+  if (selected === "system") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.dataset.theme = selected;
+  }
+  elements.themeSelect.value = selected;
+  try {
+    if (selected === "system") {
+      window.localStorage.removeItem(THEME_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(THEME_STORAGE_KEY, selected);
+    }
+  } catch {
+    // The selected theme still applies for this page when storage is unavailable.
+  }
+  renderChart();
 }
 
 async function fetchJson(path) {
@@ -202,9 +276,9 @@ function renderRun() {
   elements.runUpdated.textContent = `Updated ${relativeTime(summary.modified_at_unix)}`;
   elements.runName.textContent = summary.name;
   elements.latestStep.textContent = formatInteger(summary.last_step ?? 0);
-  elements.runContext.textContent = `${formatInteger(summary.record_count)} records, ${formatInteger(Object.keys(summary.event_counts).length)} event types${summary.issues.length ? `, ${summary.issues.length} file issue(s)` : ""}.`;
 
   renderSignals(summary.latest_metrics);
+  renderDevice(summary.device);
   renderMetricSelector(summary.numeric_metrics);
   renderChart();
   renderEvents();
@@ -232,6 +306,97 @@ function renderSignals(metrics) {
   const evaluation = evaluations.find(([value]) => numberOrNull(value) !== null);
   elements.signalEvaluation.textContent = evaluation ? formatPercent(Number(evaluation[0])) : "--";
   elements.signalEvaluationDetail.textContent = evaluation ? evaluation[1] : "No result";
+}
+
+function renderDevice(device) {
+  const deviceType = device?.type ?? "unknown";
+  const phases = device?.phases ?? {};
+  const rows = [
+    ["Self-play", phases.self_play],
+    ["Learner", phases.learner],
+  ].filter(([, metrics]) => metrics !== null && metrics !== undefined);
+
+  elements.signalDevice.textContent = deviceType === "unknown" ? "--" : deviceType.toUpperCase();
+  elements.deviceMetricsHead.replaceChildren();
+  elements.deviceMetricsBody.replaceChildren();
+
+  if (deviceType !== "cuda" && deviceType !== "cpu") {
+    elements.signalDeviceDetail.textContent = "Not reported";
+    elements.deviceMetricsState.textContent = "Not reported";
+    elements.deviceMetricsEmpty.textContent = "This run does not report a device.";
+    elements.deviceMetricsEmpty.hidden = false;
+    elements.deviceMetricsTable.hidden = true;
+    return;
+  }
+
+  const preferred = phases.learner ?? phases.self_play;
+  const utilizationName = deviceType === "cuda"
+    ? "mean_utilization_percent"
+    : "mean_process_utilization_percent";
+  const average = numberOrNull(preferred?.[utilizationName]);
+  const coreCount = Number.isInteger(device?.logical_core_count)
+    ? `, ${device.logical_core_count} logical cores`
+    : "";
+  elements.signalDeviceDetail.textContent = average === null
+    ? `${deviceType.toUpperCase()} training${coreCount}`
+    : `${formatDevicePercent(average)} average ${deviceType.toUpperCase()} load`;
+  elements.deviceMetricsState.textContent = deviceType.toUpperCase();
+
+  if (!rows.length) {
+    elements.deviceMetricsEmpty.textContent = `${deviceType.toUpperCase()} run. No device samples yet.`;
+    elements.deviceMetricsEmpty.hidden = false;
+    elements.deviceMetricsTable.hidden = true;
+    return;
+  }
+
+  const columns = deviceType === "cuda"
+    ? [
+        ["Phase", null, null],
+        ["Samples", "utilization_samples", formatIntegerOrDash],
+        ["GPU avg", "mean_utilization_percent", formatDevicePercent],
+        ["GPU p95", "p95_utilization_percent", formatDevicePercent],
+        ["GPU max", "max_utilization_percent", formatDevicePercent],
+        ["Memory activity avg", "mean_device_memory_percent", formatDevicePercent],
+        ["Memory activity max", "max_device_memory_percent", formatDevicePercent],
+        ["Torch allocated peak", "peak_memory_allocated_bytes", formatBytes],
+        ["Torch reserved peak", "peak_memory_reserved_bytes", formatBytes],
+        ["Errors", "utilization_sampling_errors", formatIntegerOrDash],
+      ]
+    : [
+        ["Phase", null, null],
+        ["Samples", "utilization_samples", formatIntegerOrDash],
+        ["Process CPU avg", "mean_process_utilization_percent", formatDevicePercent],
+        ["Process CPU p95", "p95_process_utilization_percent", formatDevicePercent],
+        ["Process CPU max", "max_process_utilization_percent", formatDevicePercent],
+        ["Memory avg", "mean_resident_memory_bytes", formatBytes],
+        ["Memory peak", "peak_resident_memory_bytes", formatBytes],
+        ["Errors", "sampling_errors", formatIntegerOrDash],
+      ];
+  const headingFragment = document.createDocumentFragment();
+  for (const [label] of columns) {
+    const heading = document.createElement("th");
+    heading.scope = "col";
+    heading.textContent = label;
+    headingFragment.append(heading);
+  }
+  elements.deviceMetricsHead.replaceChildren(headingFragment);
+
+  const fragment = document.createDocumentFragment();
+  for (const [label, metrics] of rows) {
+    const row = document.createElement("tr");
+    const values = columns.map(([, name, formatter]) => (
+      name === null ? label : formatter(metrics[name])
+    ));
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    fragment.append(row);
+  }
+  elements.deviceMetricsBody.replaceChildren(fragment);
+  elements.deviceMetricsEmpty.hidden = true;
+  elements.deviceMetricsTable.hidden = false;
 }
 
 function renderMetricSelector(metricNames) {
@@ -697,6 +862,26 @@ function formatPercent(value) {
   }).format(value);
 }
 
+function formatDevicePercent(value) {
+  const number = numberOrNull(value);
+  return number === null ? "--" : `${formatMetric(number)}%`;
+}
+
+function formatBytes(value) {
+  const number = numberOrNull(value);
+  if (number === null) {
+    return "--";
+  }
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let scaled = Math.max(0, number);
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${scaled.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${units[unit]}`;
+}
+
 function relativeTime(timestamp) {
   if (!Number.isFinite(timestamp)) {
     return "never";
@@ -726,6 +911,39 @@ function formatClock(timestamp) {
 }
 
 function bindEvents() {
+  elements.themeSelect.addEventListener("change", () => {
+    setTheme(elements.themeSelect.value);
+  });
+  elements.runTabs.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const button = event.target.closest("[role=tab]");
+    if (button?.dataset.tab) {
+      selectTab(button.dataset.tab);
+    }
+  });
+  elements.runTabs.addEventListener("keydown", (event) => {
+    const entries = tabEntries();
+    const currentIndex = entries.findIndex(([, button]) => button === event.target);
+    if (currentIndex < 0) {
+      return;
+    }
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowLeft") {
+      nextIndex = (currentIndex - 1 + entries.length) % entries.length;
+    } else if (event.key === "ArrowRight") {
+      nextIndex = (currentIndex + 1) % entries.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = entries.length - 1;
+    } else {
+      return;
+    }
+    event.preventDefault();
+    selectTab(entries[nextIndex][0], true);
+  });
   elements.refreshToggle.addEventListener("click", () => {
     state.paused = !state.paused;
     elements.refreshToggle.setAttribute("aria-pressed", String(state.paused));
@@ -768,9 +986,16 @@ function bindEvents() {
     }
   });
   window.addEventListener("resize", renderChart);
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (elements.themeSelect.value === "system") {
+      renderChart();
+    }
+  });
 }
 
 assertElements();
+elements.themeSelect.value = themePreference();
 bindEvents();
+selectTab(state.selectedTab);
 void refresh();
 window.setInterval(() => void refresh(), POLL_INTERVAL_MS);

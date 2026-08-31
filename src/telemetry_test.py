@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from src.telemetry import InMemoryMetricSink, JsonlMetricSink
 
@@ -30,6 +31,19 @@ class TelemetryTest(unittest.TestCase):
         self.assertEqual("training", record["event"])
         self.assertEqual(2, record["step"])
         self.assertEqual({"finite": True, "loss": 1.25}, record["metrics"])
+
+    def test_run_identity_prevents_mixed_telemetry_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.jsonl"
+            JsonlMetricSink(path, run_id="first").emit("training", 1, {})
+
+            JsonlMetricSink(path, run_id="first").emit("training", 2, {})
+            with self.assertRaisesRegex(ValueError, "different training run"):
+                JsonlMetricSink(path, run_id="second")
+
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(["first", "first"], [record["run_id"] for record in records])
 
 
 if __name__ == "__main__":

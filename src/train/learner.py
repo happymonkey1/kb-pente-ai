@@ -23,6 +23,7 @@ class ModelTrainingStats:
     total_value_bias: float
     num_batches: int
     value_metrics: ValueMetrics
+    value_loss_weight: float
 
 
 def train_policy_value_model(
@@ -33,7 +34,10 @@ def train_policy_value_model(
     training_examples: list[TrainingExample],
     batch_size: int,
     augment: bool,
+    value_loss_weight: float = 1.0,
 ) -> ModelTrainingStats:
+    if value_loss_weight < 0:
+        raise ValueError("Value loss weight cannot be negative")
     net.train()
     pin_memory = device.type != "cpu"
     dataloader = DataLoader(
@@ -72,7 +76,7 @@ def train_policy_value_model(
         ).mean()
         policy_kl = policy_loss - target_entropy
         value_loss = torch.nn.functional.mse_loss(predicted_values, target_values)
-        loss = policy_loss + value_loss
+        loss = policy_loss + value_loss_weight * value_loss
         if not torch.isfinite(loss):
             raise FloatingPointError("Training produced a non-finite loss")
 
@@ -105,4 +109,5 @@ def train_policy_value_model(
         total_value_bias=total_value_bias,
         num_batches=num_batches,
         value_metrics=value_metrics.finish(),
+        value_loss_weight=value_loss_weight,
     )

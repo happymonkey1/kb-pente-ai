@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import time
 from typing import cast, Generic, TypeVar
 
+from src.monitoring.device_summary import summarize_device
 from src.monitoring.models import ArtifactIssue, ReplaySample, TelemetryRecord
 
 
@@ -259,6 +260,7 @@ class TelemetryStore(JsonlStore[TelemetryRecord]):
         }
         return {
             **description,
+            "device": summarize_device(record for _, record in cached.parsed.records),
             "event_counts": dict(sorted(event_counts.items())),
             "latest_by_event": latest_by_event,
             "latest_metrics": latest_metrics,
@@ -287,9 +289,16 @@ class TelemetryStore(JsonlStore[TelemetryRecord]):
         else:
             status = "idle"
         run_id = self._identifier(path)
+        training_run_ids = {
+            record.run_id for _, record in records if record.run_id is not None
+        }
+        training_run_id = (
+            next(iter(training_run_ids)) if len(training_run_ids) == 1 else None
+        )
         return {
             "id": run_id,
-            "run_key": str(PurePosixPath(run_id).with_suffix("")),
+            "run_key": training_run_id or str(PurePosixPath(run_id).with_suffix("")),
+            "training_run_id": training_run_id,
             "name": path.stem,
             "status": status,
             "size_bytes": cached.size_bytes,

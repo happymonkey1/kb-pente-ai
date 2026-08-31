@@ -96,7 +96,7 @@ Professional validation is measured before and after the learner update. The ver
 
 Replay entries record whether they came from professional data or self-play. Once both sources exist, `--professional-replay-fraction` controls their learner-batch mix. Sampling uses replacement when necessary so `batch size * learner steps` remains the actual learner budget.
 
-Replay snapshots are versioned and include the training run identifier, generation, ruleset, board size, position schema, and training-example schema. Resuming training never silently creates an empty replay.
+Replay snapshots are versioned and include the training run identifier, generation, ruleset, board size, position schema, and training-example schema. Persisted generations are immutable, while `replay-latest.pkl` is an atomically replaced alias. A resumed checkpoint selects its referenced replay generation even if an interrupted newer write advanced the alias. Resuming training never silently creates an empty replay.
 
 Resume in the original model directory:
 
@@ -130,6 +130,8 @@ Use this only after the local gate and a small debug run pass on the target mach
   --model-blocks 6 \
   --model-channels 128 \
   --model-hidden-size 256 \
+  --professional-iterations 1 \
+  --self-play-iterations 5 \
   --mcts-sim 64 \
   --batch-games 512 \
   --active-games 128 \
@@ -137,14 +139,27 @@ Use this only after the local gate and a small debug run pass on the target mach
   --learner-steps 256 \
   --temp-threshold 16 \
   --max-training-examples 1000000 \
+  --professional-replay-fraction 0.25 \
+  --professional-value-loss-weight 0.25 \
+  --self-play-value-loss-weight 1.0 \
+  --replay-checkpoint-interval 1 \
+  --minimum-batch-occupancy 0.80 \
+  --minimum-mean-root-children 4 \
+  --maximum-search-collapse-rate 0.25 \
+  --maximum-invalid-policy-fallbacks 0 \
+  --maximum-zero-visit-fallbacks 0 \
   --arena \
-  --eval-interval 5 \
+  --eval-interval 3 \
   --num-arena-games 40 \
   --arena-opening-plies 4 \
-  --telemetry-file metrics/training-19x19.jsonl
+  --seed 103 \
+  --model-dir pente-model-p7-e001-seed103 \
+  --telemetry-file metrics/p7-e001-seed103.jsonl
 ~~~
 
-Completed games are replenished until all 512 games are generated, keeping approximately 128 active outside the final drain. Arena openings are seeded and paired: each opening is replayed with model colors swapped. Arena results are measurements. They never reject the latest model or stop the learning stream.
+This bounded command is the P7-E001 baseline, not an open-ended default. It performs one professional initialization and five self-play iterations. Completed games are replenished until all 512 games are generated, keeping approximately 128 active outside the final drain. Search-health thresholds abort before bad self-play enters replay. Arena openings are seeded and paired: each opening is replayed with model colors swapped. Arena results are measurements. They never reject the latest model or stop the learning stream.
+
+Each training invocation writes `run-manifest-step-N.json` beside its checkpoints. The manifest records the run identifier, complete command and parsed configuration, Git state, a SHA-256 fingerprint of executable source files, artifact schemas, Python/Torch/CUDA identity, hardware, and output paths. Every telemetry record carries the same run identifier, and appending to a telemetry file owned by another run is rejected.
 
 ## Inference
 
@@ -176,7 +191,7 @@ Training writes JSONL records with a stable schema. Current metrics include:
 - search-collapse warnings and invalid-policy fallbacks;
 - fixed tactical-suite accuracy;
 - sampled mean, p95, and maximum GPU utilization for self-play and learning;
-- device-wide memory percentage plus peak Torch allocation and reservation.
+- device-wide memory-controller activity plus peak Torch allocation and reservation.
 
 Passing `--gpu` is strict. Training exits with a diagnostic if Torch cannot access CUDA; it never silently falls back to CPU. WSL GPU access may need to be granted outside a restricted execution sandbox even when `nvidia-smi` works in an ordinary WSL terminal.
 

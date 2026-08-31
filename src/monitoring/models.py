@@ -30,6 +30,7 @@ class ArtifactIssue:
 class TelemetryRecord:
     schema_version: int
     timestamp_unix: float
+    run_id: str | None
     event: str
     step: int
     metrics: dict[str, MetricValue]
@@ -45,6 +46,8 @@ class TelemetryRecord:
             )
 
         timestamp_unix = _finite_number(record.get("timestamp_unix"), "timestamp_unix")
+        raw_run_id = record.get("run_id")
+        run_id = None if raw_run_id is None else _non_empty_string(raw_run_id, "run_id")
         event = _non_empty_string(record.get("event"), "event")
         step = _integer(record.get("step"), "step")
         if step < 0:
@@ -62,6 +65,7 @@ class TelemetryRecord:
         return cls(
             schema_version=schema_version,
             timestamp_unix=timestamp_unix,
+            run_id=run_id,
             event=event,
             step=step,
             metrics=metrics,
@@ -71,6 +75,7 @@ class TelemetryRecord:
         return {
             "schema_version": self.schema_version,
             "timestamp_unix": self.timestamp_unix,
+            "run_id": self.run_id,
             "event": self.event,
             "step": self.step,
             "metrics": self.metrics,

@@ -32,6 +32,7 @@ class MonitoringServerTest(unittest.TestCase):
         telemetry = {
             "schema_version": 1,
             "timestamp_unix": 100.0,
+            "run_id": "training",
             "event": "training_iteration",
             "step": 4,
             "metrics": {"loss": 0.75, "games": 8},
@@ -75,6 +76,7 @@ class MonitoringServerTest(unittest.TestCase):
     def test_serves_dashboard_run_api_records_and_security_headers(self) -> None:
         dashboard, headers = self._get("/")
         pico_css, pico_headers = self._get("/pico.min.css")
+        theme_script, theme_headers = self._get("/theme.js")
         runs, _ = self._get_json("/api/runs")
         summary, _ = self._get_json("/api/runs/training.jsonl/summary")
         records, _ = self._get_json("/api/runs/training.jsonl/records?after=0&limit=10")
@@ -85,10 +87,22 @@ class MonitoringServerTest(unittest.TestCase):
         self.assertNotIn("cdn.", dashboard_text)
         self.assertIn(b"Pico CSS", pico_css[:200])
         self.assertEqual("text/css; charset=utf-8", pico_headers["Content-Type"])
+        self.assertIn(b"localStorage", theme_script)
+        self.assertEqual("text/javascript; charset=utf-8", theme_headers["Content-Type"])
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
         self.assertEqual("nosniff", headers["X-Content-Type-Options"])
+        self.assertIn("Device metrics", dashboard_text)
+        self.assertIn('id="theme-select"', dashboard_text)
+        self.assertIn('role="tablist"', dashboard_text)
+        self.assertIn('data-tab="metrics"', dashboard_text)
+        self.assertIn('data-tab="replay"', dashboard_text)
+        self.assertNotIn("Reads JSONL files", dashboard_text)
+        self.assertNotIn('id="run-context"', dashboard_text)
         self.assertEqual("training.jsonl", runs["runs"][0]["id"])
         self.assertEqual(0.75, summary["latest_metrics"]["loss"])
+        self.assertEqual("cpu", summary["device"]["type"])
+        self.assertEqual("training", summary["run_key"])
+        self.assertEqual("training", records["records"][0]["run_id"])
         self.assertEqual(4, records["records"][0]["step"])
 
     def test_serves_replay_details_and_prometheus_instrumentation(self) -> None:
