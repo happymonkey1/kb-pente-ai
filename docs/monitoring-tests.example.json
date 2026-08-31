@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "tests": [
+    {
+      "id": "monitoring-unit-tests",
+      "name": "Monitoring unit tests",
+      "description": "Run the monitoring server, telemetry, and replay unit tests.",
+      "command": [
+        "./script/run-venv.sh",
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "src/monitoring",
+        "-p",
+        "*_test.py"
+      ]
+    },
+    {
+      "id": "cpu-search-benchmark",
+      "name": "CPU search benchmark",
+      "description": "Compare independent and batched search on the CPU.",
+      "command": [
+        "./script/run-venv.sh",
+        "python",
+        "script/benchmark-batched-search.py"
+      ]
+    },
+    {
+      "id": "cuda-search-benchmark",
+      "name": "CUDA search benchmark",
+      "description": "Compare independent and batched search on the GPU.",
+      "command": [
+        "./script/run-venv.sh",
+        "python",
+        "script/benchmark-batched-search.py",
+        "--gpu"
+      ]
+    }
+  ]
+}

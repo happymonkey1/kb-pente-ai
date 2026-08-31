@@ -51,6 +51,7 @@ class SearchPathEdge:
 @dataclass(frozen=True, slots=True)
 class LeafSelection:
     position: PenteBoard
+    state_key: bytes
     path: tuple[SearchPathEdge, ...]
     terminal_result: TerminalResult
 
@@ -92,6 +93,7 @@ class MCTS:
         self.ps: dict[bytes, np.ndarray] = {}
         self.terminals: dict[bytes, TerminalResult] = {}
         self.valids: dict[bytes, np.ndarray] = {}
+        self.visited_actions: dict[bytes, set[int]] = {}
 
         self.simulations = 0
         self.evaluator_calls = 0
@@ -109,6 +111,7 @@ class MCTS:
         self.ps.clear()
         self.terminals.clear()
         self.valids.clear()
+        self.visited_actions.clear()
 
         self.simulations = 0
         self.evaluator_calls = 0
@@ -147,10 +150,7 @@ class MCTS:
         if temp < 0:
             raise ValueError("Temperature cannot be negative")
         root_key = self.game.to_string(position)
-        counts = np.array(
-            [self.nsa.get((root_key, action), 0) for action in range(self.game.get_action_size())],
-            dtype=np.float64,
-        )
+        counts = self._action_visit_counts(root_key)
         if temp == 0:
             return self._maximum_visit_policy(position, counts)
 
@@ -175,9 +175,9 @@ class MCTS:
         position = root
         path: list[SearchPathEdge] = []
         expected_root_key = self.game.to_string(root) if root_key is None else root_key
+        state_key = expected_root_key
 
         while True:
-            state_key = self.game.to_string(position)
             terminal = self.terminals.get(state_key)
             if terminal is None:
                 terminal = self.game.check_game_end(position)
@@ -185,12 +185,13 @@ class MCTS:
 
             if terminal.is_terminal or state_key not in self.ps:
                 self.max_depth = max(self.max_depth, len(path))
-                return LeafSelection(position, tuple(path), terminal)
+                return LeafSelection(position, state_key, tuple(path), terminal)
 
             priors = root_priors if state_key == expected_root_key and root_priors is not None else self.ps[state_key]
             action = self._select_action(state_key, priors)
             path.append(SearchPathEdge(state_key, action))
             position, _ = self.game.apply_action(position, position.current_player, action)
+            state_key = self.game.to_string(position)
 
     def expand_and_backup(
         self,
@@ -208,7 +209,7 @@ class MCTS:
                 self.evaluated_positions += 1
                 self.inference_batch_sizes.append(1)
             policy, leaf_value = evaluation
-            self._expand(selection.position, policy)
+            self._expand(selection.position, policy, selection.state_key)
             self._validate_value(leaf_value)
 
         value = float(leaf_value)
@@ -219,6 +220,7 @@ class MCTS:
             old_value = self.qsa.get(edge_key, 0.0)
             self.qsa[edge_key] = (visits * old_value + value) / (visits + 1)
             self.nsa[edge_key] = visits + 1
+            self.visited_actions[edge.state_key].add(edge.action)
             self.ns[edge.state_key] += 1
 
     def record_batch_evaluation(
@@ -239,10 +241,7 @@ class MCTS:
     def telemetry(self, root: PenteBoard) -> SearchTelemetry:
         root_key = self.game.to_string(root)
         valid = self.valids.get(root_key)
-        counts = np.array(
-            [self.nsa.get((root_key, action), 0) for action in range(self.game.get_action_size())],
-            dtype=np.float64,
-        )
+        counts = self._action_visit_counts(root_key)
         visited = counts > 0
         total = float(counts.sum())
         if total > 0:
@@ -283,29 +282,26 @@ class MCTS:
         )
 
     def _select_action(self, state_key: bytes, priors: np.ndarray) -> int:
-        valid = self.valids[state_key].astype(bool)
-        action_size = self.game.get_action_size()
-        q_values = np.zeros(action_size, dtype=np.float64)
-        visit_counts = np.zeros(action_size, dtype=np.float64)
-
-        for action in np.flatnonzero(valid):
-            edge_key = (state_key, int(action))
-            if edge_key in self.nsa:
-                q_values[action] = self.qsa[edge_key]
-                visit_counts[action] = self.nsa[edge_key]
-
-        exploration = (
-            self.args.c_puct
-            * priors
-            * math.sqrt(self.ns[state_key] + EPSILON)
-            / (1.0 + visit_counts)
+        valid = self.valids[state_key]
+        exploration_scale = self.args.c_puct * math.sqrt(
+            self.ns[state_key] + EPSILON
         )
-        scores = q_values + exploration
+        scores = exploration_scale * priors
+        for action in self.visited_actions[state_key]:
+            edge_key = (state_key, int(action))
+            scores[action] = self.qsa[edge_key] + (
+                exploration_scale * priors[action] / (1.0 + self.nsa[edge_key])
+            )
         scores[~valid] = -np.inf
         return int(np.argmax(scores))
 
-    def _expand(self, position: PenteBoard, policy: np.ndarray) -> None:
-        state_key = self.game.to_string(position)
+    def _expand(
+        self,
+        position: PenteBoard,
+        policy: np.ndarray,
+        state_key: bytes | None = None,
+    ) -> None:
+        state_key = self.game.to_string(position) if state_key is None else state_key
         if state_key in self.ps:
             return
 
@@ -328,7 +324,14 @@ class MCTS:
 
         self.ps[state_key] = masked / policy_sum
         self.valids[state_key] = valid
+        self.visited_actions[state_key] = set()
         self.ns[state_key] = 0
+
+    def _action_visit_counts(self, state_key: bytes) -> np.ndarray:
+        counts = np.zeros(self.game.get_action_size(), dtype=np.float64)
+        for action in self.visited_actions.get(state_key, ()):
+            counts[action] = self.nsa[(state_key, action)]
+        return counts
 
     def _root_priors(self, root_key: bytes, add_noise: bool) -> np.ndarray | None:
         if root_key not in self.ps:

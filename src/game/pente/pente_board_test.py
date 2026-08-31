@@ -122,6 +122,10 @@ class PenteBoardTest(unittest.TestCase):
         np.testing.assert_allclose(planes[2], 0.8)
         np.testing.assert_allclose(planes[3], 0.4)
 
+        caller_owned = np.empty_like(planes)
+        board.write_feature_planes(caller_owned)
+        np.testing.assert_array_equal(planes, caller_owned)
+
     def test_rejects_invalid_state_and_move_inputs(self) -> None:
         with self.assertRaisesRegex(ValueError, "invalid stone"):
             PenteBoard(np.full((5, 5), 2), np.zeros(2))

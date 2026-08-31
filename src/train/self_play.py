@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
 import os
 import time
 import uuid
@@ -16,7 +15,6 @@ from src.evaluation.supervised import (
 )
 from src.game.pente.pente_game import PenteGame
 from src.mcts.batched import BatchedSearchTelemetry
-from src.mcts.mcts_v2 import MCTSArgs
 from src.model.model_v1 import PenteNet
 from src.monitoring.cpu_metrics import CpuMetrics, measure_cpu_operation
 from src.monitoring.cuda_metrics import measure_cuda_operation
@@ -24,93 +22,17 @@ from src.telemetry import MetricSink, NullMetricSink
 from src.train.iteration_evaluation import evaluate_training_iteration
 from src.train.learner import ModelTrainingStats, train_policy_value_model
 from src.train.profession_game_loader import ProfessionGameLoader
+from src.train.randomness import seed_training_iteration
 from src.train.replay_buffer import ReplayBuffer, ReplaySource
+from src.train.self_play_args import SelfPlayTrainerArgs
 from src.train.self_play_generation import (
     PlayedGame,
     SelfPlayGenerator,
     finalize_training_examples,
 )
-from src.train.self_play_health import (
-    SelfPlayHealthThresholds,
-    validate_self_play_health,
-)
+from src.train.self_play_health import validate_and_emit_self_play_health
 from src.train.self_play_metrics import collect_self_play_metrics
 from src.train.training_example import TrainingExample
-
-
-@dataclass(frozen=True, slots=True)
-class SelfPlayTrainerArgs:
-    start_iteration: int
-    professional_games_training_iterations: int
-    self_play_training_iterations: int
-    temp_threshold: int
-    mcts_args: MCTSArgs
-    watch_training_raw_dataset_filepath: str
-    watch_training_processed_dataset_filepath: str
-    force_watch_training_raw_dataset_processing: bool
-    eval_iteration_interval: int = 5
-    num_arena_games: int = 40
-    batch_size: int = 512
-    batch_games: int = 1
-    active_games: int = 128
-    checkpoint_dir: str = "checkpoints"
-    should_checkpoint: bool = True
-    max_training_examples: int = 500_000
-    debug: bool = False
-    should_use_arena: bool = False
-    seed: int = 0
-    augment_training: bool = True
-    replay_checkpoint_interval: int = 5
-    learner_steps_per_iteration: int = 256
-    arena_opening_plies: int = 4
-    resume_replay_filepath: str | None = None
-    seed_replay_from_professional: bool = False
-    training_run_id: str | None = None
-    expected_replay_generation: int | None = None
-    professional_replay_fraction: float = 0.25
-    professional_value_loss_weight: float = 1.0
-    self_play_value_loss_weight: float = 1.0
-    search_health: SelfPlayHealthThresholds = SelfPlayHealthThresholds()
-
-    def __post_init__(self) -> None:
-        if self.start_iteration < 0:
-            raise ValueError("Start iteration cannot be negative")
-        if self.professional_games_training_iterations < 0 or self.self_play_training_iterations < 0:
-            raise ValueError("Training iteration counts cannot be negative")
-        if self.temp_threshold < 0:
-            raise ValueError("Temperature threshold cannot be negative")
-        if self.eval_iteration_interval < 1:
-            raise ValueError("Evaluation interval must be positive")
-        if self.batch_size < 1 or self.batch_games < 1 or self.active_games < 1:
-            raise ValueError("Training batch and game counts must be positive")
-        if self.max_training_examples < 1:
-            raise ValueError("Replay capacity must be positive")
-        if self.replay_checkpoint_interval < 1:
-            raise ValueError("Replay checkpoint interval must be positive")
-        if self.learner_steps_per_iteration < 1:
-            raise ValueError("Learner steps per iteration must be positive")
-        if self.arena_opening_plies < 0:
-            raise ValueError("Arena opening plies cannot be negative")
-        if self.start_iteration == 0 and self.resume_replay_filepath is not None:
-            raise ValueError("A replay snapshot can only resume a nonzero iteration")
-        if self.start_iteration == 0 and self.seed_replay_from_professional:
-            raise ValueError("Professional replay seeding is only valid when resuming")
-        if self.resume_replay_filepath is not None and self.seed_replay_from_professional:
-            raise ValueError("Choose either a replay snapshot or professional replay seeding")
-        if self.start_iteration > 0 and not self.training_run_id:
-            raise ValueError("Resumed training requires a checkpoint training run identifier")
-        if self.start_iteration == 0 and self.expected_replay_generation is not None:
-            raise ValueError("A new run cannot expect an existing replay generation")
-        if (
-            self.expected_replay_generation is not None
-            and not 0 <= self.expected_replay_generation <= self.start_iteration
-        ):
-            raise ValueError("Expected replay generation is outside the checkpoint history")
-        if not 0 <= self.professional_replay_fraction <= 1:
-            raise ValueError("Professional replay fraction must be between zero and one")
-        if self.professional_value_loss_weight < 0 or self.self_play_value_loss_weight < 0:
-            raise ValueError("Value loss weights cannot be negative")
-
 
 class SelfPlayTrainer:
     def __init__(
@@ -284,6 +206,7 @@ class SelfPlayTrainer:
             self._save_checkpoint(0)
 
         for iteration in range(self.args.start_iteration, total_iterations):
+            self.rng = seed_training_iteration(self.args.seed, iteration)
             iteration_started = time.perf_counter()
             self.previous_net.load_state_dict(self.net.state_dict())
             self.previous_net.eval()
@@ -335,27 +258,15 @@ class SelfPlayTrainer:
                     )
                 assert generation_cpu_metrics is not None
                 self_play_metrics.update(generation_cpu_metrics.to_metrics("self_play"))
-                try:
-                    validate_self_play_health(
-                        self_play_metrics,
-                        self.args.search_health,
-                    )
-                except RuntimeError as error:
-                    failure_metrics: dict[str, int | float | str] = {
-                        "device_type": self.device.type,
-                        "cpu_logical_core_count": (
-                            generation_cpu_metrics.logical_core_count
-                        ),
-                        "generation_seconds": generation_seconds,
-                        "error": str(error),
-                    }
-                    failure_metrics.update(self_play_metrics)
-                    self.metric_sink.emit(
-                        "self_play_health_failure",
-                        iteration + 1,
-                        failure_metrics,
-                    )
-                    raise
+                validate_and_emit_self_play_health(
+                    self.metric_sink,
+                    iteration + 1,
+                    self.device.type,
+                    generation_cpu_metrics.logical_core_count,
+                    generation_seconds,
+                    self_play_metrics,
+                    self.args.search_health,
+                )
 
             self.replay.extend(
                 new_examples,

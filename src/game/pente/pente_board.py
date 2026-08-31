@@ -86,6 +86,14 @@ class PenteBoard:
         if self.board[row, column] != 0:
             raise ValueError(f"Move is occupied: {move}")
 
+        return self._apply_validated_move(player, row, column)
+
+    def _apply_validated_move(
+        self,
+        player: int,
+        row: int,
+        column: int,
+    ) -> PenteBoard:
         stones = np.array(self.board, copy=True)
         stones[row, column] = player
         captured_pairs = _apply_captures_inplace(stones, row, column, player)
@@ -93,15 +101,35 @@ class PenteBoard:
         captures = np.array(self.captures, copy=True)
         captures[Game.player_index(player)] += captured_pairs
 
-        action = row * board_size + column
+        action = row * self.board.shape[0] + column
         assert self.ply is not None
-        return PenteBoard(
-            board=stones,
-            captures=captures,
-            current_player=Game.opponent(player),
-            ply=self.ply + 1,
-            last_action=action,
+        return self._from_owned_transition_arrays(
+            stones,
+            captures,
+            Game.opponent(player),
+            self.ply + 1,
+            action,
         )
+
+    @classmethod
+    def _from_owned_transition_arrays(
+        cls,
+        stones: np.ndarray,
+        captures: np.ndarray,
+        current_player: int,
+        ply: int,
+        last_action: int,
+    ) -> PenteBoard:
+        """Build a transition result whose invariants were established by apply_move."""
+        stones.flags.writeable = False
+        captures.flags.writeable = False
+        position = object.__new__(cls)
+        object.__setattr__(position, "board", stones)
+        object.__setattr__(position, "captures", captures)
+        object.__setattr__(position, "current_player", current_player)
+        object.__setattr__(position, "ply", ply)
+        object.__setattr__(position, "last_action", last_action)
+        return position
 
     def get_capture_count(self, player: int) -> int:
         return int(self.captures[Game.player_index(player)])
@@ -118,21 +146,27 @@ class PenteBoard:
         return header + self.captures.astype("<i2", copy=False).tobytes() + self.board.tobytes()
 
     def feature_planes(self) -> np.ndarray:
+        planes = np.empty((4, *self.board.shape), dtype=np.float32)
+        self.write_feature_planes(planes)
+        return planes
+
+    def write_feature_planes(self, output: np.ndarray) -> None:
+        """Write relative neural features into a caller-owned float32 array."""
+        expected_shape = (4, *self.board.shape)
+        if output.shape != expected_shape or output.dtype != np.float32:
+            raise ValueError(
+                f"Feature output must have float32 shape {expected_shape}, "
+                f"found {output.dtype} {output.shape}"
+            )
         current = self.current_player
         opponent = Game.opponent(current)
         current_captures = self.get_capture_count(current) / CAPTURES_TO_WIN
         opponent_captures = self.get_capture_count(opponent) / CAPTURES_TO_WIN
-        shape = self.board.shape
 
-        return np.stack(
-            (
-                self.board == current,
-                self.board == opponent,
-                np.full(shape, current_captures, dtype=np.float32),
-                np.full(shape, opponent_captures, dtype=np.float32),
-            ),
-            axis=0,
-        ).astype(np.float32, copy=False)
+        np.equal(self.board, current, out=output[0])
+        np.equal(self.board, opponent, out=output[1])
+        output[2].fill(current_captures)
+        output[3].fill(opponent_captures)
 
 
 def _apply_captures_inplace(

@@ -178,6 +178,28 @@ class PenteGameTest(unittest.TestCase):
         self.assertFalse(game.is_valid_move(board, Game.PLAYER_ONE, game.get_action_size()))
         with self.assertRaisesRegex(ValueError, "Expected Player"):
             game.apply_action(board, Game.PLAYER_TWO, 0)
+
+    def test_scalar_legality_matches_complete_legal_mask(self) -> None:
+        for ruleset in PenteRuleset:
+            with self.subTest(ruleset=ruleset):
+                game = PenteGame(self.BOARD_SIZE, ruleset=ruleset)
+                board = game.init_board()
+                for _ in range(4):
+                    legal = game.get_valid_moves(board, board.current_player)
+                    scalar = np.array(
+                        [
+                            game.is_valid_move(board, board.current_player, action)
+                            for action in range(game.get_action_size())
+                        ],
+                        dtype=np.int8,
+                    )
+                    np.testing.assert_array_equal(legal, scalar)
+                    action = int(np.flatnonzero(legal)[0])
+                    board, _ = game.apply_action(
+                        board,
+                        board.current_player,
+                        action,
+                    )
         with self.assertRaisesRegex(ValueError, "Invalid action"):
             game.apply_action(board, Game.PLAYER_ONE, game.get_action_size())
 

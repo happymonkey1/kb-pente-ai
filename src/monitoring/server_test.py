@@ -38,6 +38,30 @@ class MonitoringServerTest(unittest.TestCase):
             "metrics": {"loss": 0.75, "games": 8},
         }
         (metrics / "training.jsonl").write_text(json.dumps(telemetry) + "\n", encoding="utf-8")
+        manifest_root = root / "model"
+        manifest_root.mkdir()
+        (manifest_root / "run-manifest-step-0.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "created_at_utc": "2026-08-30T00:00:00+00:00",
+                    "training_run_id": "training",
+                    "start_iteration": 0,
+                    "model": {
+                        "board_size": 5,
+                        "action_size": 25,
+                        "input_planes": 4,
+                        "num_res_blocks": 1,
+                        "num_channels": 8,
+                        "hidden_fc_size": 16,
+                    },
+                    "outputs": {"telemetry": str(metrics / "training.jsonl")},
+                    "runtime": {"device": "cpu", "compiled": False},
+                    "program_arguments": {"ruleset": "freestyle"},
+                }
+            ),
+            encoding="utf-8",
+        )
         JsonlReplaySampleSink(replays / "samples.jsonl").emit(
             ReplaySample.from_object(
                 {
@@ -59,6 +83,7 @@ class MonitoringServerTest(unittest.TestCase):
                 port=0,
                 metrics_root=metrics,
                 replay_root=replays,
+                manifest_roots=[root],
             )
         except PermissionError as error:
             self.temporary_directory.cleanup()
@@ -78,6 +103,7 @@ class MonitoringServerTest(unittest.TestCase):
         pico_css, pico_headers = self._get("/pico.min.css")
         theme_script, theme_headers = self._get("/theme.js")
         runs, _ = self._get_json("/api/runs")
+        test_launcher, _ = self._get_json("/api/test-launcher")
         summary, _ = self._get_json("/api/runs/training.jsonl/summary")
         records, _ = self._get_json("/api/runs/training.jsonl/records?after=0&limit=10")
 
@@ -96,11 +122,28 @@ class MonitoringServerTest(unittest.TestCase):
         self.assertIn('role="tablist"', dashboard_text)
         self.assertIn('data-tab="metrics"', dashboard_text)
         self.assertIn('data-tab="replay"', dashboard_text)
+        self.assertIn('data-tab="architecture"', dashboard_text)
+        self.assertIn('id="test-launcher-dialog"', dashboard_text)
+        self.assertLess(
+            dashboard_text.index('id="test-launcher-open"'),
+            dashboard_text.index('id="theme-select"'),
+        )
         self.assertNotIn("Reads JSONL files", dashboard_text)
         self.assertNotIn('id="run-context"', dashboard_text)
+        self.assertEqual(
+            {
+                "active_run": None,
+                "enabled": False,
+                "recent_runs": [],
+                "tests": [],
+            },
+            test_launcher,
+        )
         self.assertEqual("training.jsonl", runs["runs"][0]["id"])
         self.assertEqual(0.75, summary["latest_metrics"]["loss"])
         self.assertEqual("cpu", summary["device"]["type"])
+        self.assertEqual(3_253, summary["architecture"]["metrics"]["parameter_count"])
+        self.assertEqual(1, summary["architecture"]["config"]["residual_blocks"])
         self.assertEqual("training", summary["run_key"])
         self.assertEqual("training", records["records"][0]["run_id"])
         self.assertEqual(4, records["records"][0]["step"])

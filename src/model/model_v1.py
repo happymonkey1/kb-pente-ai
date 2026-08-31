@@ -44,7 +44,10 @@ class CheckpointTrainingState:
 def positions_to_tensor(positions: Sequence[PenteBoard], device: torch.device) -> torch.Tensor:
     if not positions:
         raise ValueError("At least one position is required")
-    features = np.stack([position.feature_planes() for position in positions], axis=0)
+    board_shape = positions[0].board.shape
+    features = np.empty((len(positions), 4, *board_shape), dtype=np.float32)
+    for index, position in enumerate(positions):
+        position.write_feature_planes(features[index])
     return torch.from_numpy(features).to(device=device, dtype=torch.float32)
 
 

@@ -18,12 +18,21 @@ const state = {
   replay: null,
   replayMove: 0,
   replayTimer: null,
+  testLauncher: {
+    enabled: false,
+    tests: [],
+    active_run: null,
+    recent_runs: [],
+  },
+  selectedTestId: null,
+  launchingTest: false,
 };
 
 const elements = {
   connection: document.querySelector("#connection-state"),
   themeSelect: document.querySelector("#theme-select"),
   refreshToggle: document.querySelector("#refresh-toggle"),
+  testLauncherOpen: document.querySelector("#test-launcher-open"),
   runCount: document.querySelector("#run-count"),
   runList: document.querySelector("#run-list"),
   emptyState: document.querySelector("#empty-state"),
@@ -34,9 +43,11 @@ const elements = {
   latestStep: document.querySelector("#latest-step"),
   runTabs: document.querySelector("#run-tabs"),
   overviewTab: document.querySelector("#tab-overview"),
+  architectureTab: document.querySelector("#tab-architecture"),
   metricsTab: document.querySelector("#tab-metrics"),
   replayTab: document.querySelector("#tab-replay"),
   overviewPanel: document.querySelector("#panel-overview"),
+  architecturePanel: document.querySelector("#panel-architecture"),
   metricsPanel: document.querySelector("#panel-metrics"),
   replayPanel: document.querySelector("#panel-replay"),
   signalLoss: document.querySelector("#signal-loss"),
@@ -56,6 +67,21 @@ const elements = {
   deviceMetricsTable: document.querySelector("#device-metrics-table"),
   deviceMetricsHead: document.querySelector("#device-metrics-head"),
   deviceMetricsBody: document.querySelector("#device-metrics-body"),
+  architectureSource: document.querySelector("#architecture-source"),
+  architectureEmpty: document.querySelector("#architecture-empty"),
+  architectureView: document.querySelector("#architecture-view"),
+  architectureParameters: document.querySelector("#architecture-parameters"),
+  architectureFlops: document.querySelector("#architecture-flops"),
+  architectureSize: document.querySelector("#architecture-size"),
+  architectureLayers: document.querySelector("#architecture-layers"),
+  architectureDevice: document.querySelector("#architecture-device"),
+  architectureInputShape: document.querySelector("#architecture-input-shape"),
+  architectureStemShape: document.querySelector("#architecture-stem-shape"),
+  architectureTowerShape: document.querySelector("#architecture-tower-shape"),
+  architecturePolicyShape: document.querySelector("#architecture-policy-shape"),
+  architectureValueShape: document.querySelector("#architecture-value-shape"),
+  architectureParameterBars: document.querySelector("#architecture-parameter-bars"),
+  architectureConfig: document.querySelector("#architecture-config"),
   metricSelect: document.querySelector("#metric-select"),
   metricChart: document.querySelector("#metric-chart"),
   chartDescription: document.querySelector("#chart-description"),
@@ -79,6 +105,23 @@ const elements = {
   replayPlay: document.querySelector("#replay-play"),
   replayNext: document.querySelector("#replay-next"),
   replaySpeed: document.querySelector("#replay-speed"),
+  testLauncherDialog: document.querySelector("#test-launcher-dialog"),
+  testLauncherCloseIcon: document.querySelector("#test-launcher-close-icon"),
+  testLauncherClose: document.querySelector("#test-launcher-close"),
+  testLauncherMessage: document.querySelector("#test-launcher-message"),
+  testLauncherControls: document.querySelector("#test-launcher-controls"),
+  testSelect: document.querySelector("#test-select"),
+  testDescription: document.querySelector("#test-description"),
+  testCommand: document.querySelector("#test-command"),
+  testActiveRun: document.querySelector("#test-active-run"),
+  testRecentRuns: document.querySelector("#test-recent-runs"),
+  testRecentRunsBody: document.querySelector("#test-recent-runs-body"),
+  testLauncherConfirmOpen: document.querySelector("#test-launcher-confirm-open"),
+  testConfirmDialog: document.querySelector("#test-confirm-dialog"),
+  testConfirmDescription: document.querySelector("#test-confirm-description"),
+  testConfirmCommand: document.querySelector("#test-confirm-command"),
+  testConfirmCancel: document.querySelector("#test-confirm-cancel"),
+  testConfirmLaunch: document.querySelector("#test-confirm-launch"),
   toast: document.querySelector("#toast"),
 };
 
@@ -93,6 +136,7 @@ function assertElements() {
 function tabEntries() {
   return [
     ["overview", elements.overviewTab, elements.overviewPanel],
+    ["architecture", elements.architectureTab, elements.architecturePanel],
     ["metrics", elements.metricsTab, elements.metricsPanel],
     ["replay", elements.replayTab, elements.replayPanel],
   ];
@@ -148,9 +192,10 @@ function setTheme(preference) {
   renderChart();
 }
 
-async function fetchJson(path) {
+async function fetchJson(path, options = {}) {
   const response = await fetch(path, {
-    headers: { Accept: "application/json" },
+    ...options,
+    headers: { Accept: "application/json", ...(options.headers ?? {}) },
     cache: "no-store",
   });
   const payload = await response.json().catch(() => ({}));
@@ -166,14 +211,19 @@ async function refresh() {
   }
   state.polling = true;
   try {
-    const payload = await fetchJson("/api/runs");
+    const [payload, testLauncher] = await Promise.all([
+      fetchJson("/api/runs"),
+      fetchJson("/api/test-launcher"),
+    ]);
     state.runs = payload.runs;
+    state.testLauncher = testLauncher;
     if (!state.runs.some((run) => run.id === state.selectedRunId)) {
       state.selectedRunId = state.runs[0]?.id ?? null;
       state.selectedReplayId = null;
       state.replay = null;
     }
     renderRunList();
+    renderTestLauncher();
     setConnection("online", "Live");
     if (state.selectedRunId) {
       await refreshSelectedRun(state.selectedRunId);
@@ -185,6 +235,116 @@ async function refresh() {
     showToast(error.message);
   } finally {
     state.polling = false;
+  }
+}
+
+async function refreshTestLauncher() {
+  try {
+    state.testLauncher = await fetchJson("/api/test-launcher");
+    renderTestLauncher();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function selectedTest() {
+  const tests = Array.isArray(state.testLauncher.tests) ? state.testLauncher.tests : [];
+  return tests.find((test) => test.id === state.selectedTestId) ?? null;
+}
+
+function renderTestLauncher() {
+  const launcher = state.testLauncher;
+  const tests = Array.isArray(launcher.tests) ? launcher.tests : [];
+  if (!tests.some((test) => test.id === state.selectedTestId)) {
+    state.selectedTestId = tests[0]?.id ?? null;
+  }
+
+  const options = document.createDocumentFragment();
+  for (const test of tests) {
+    const option = document.createElement("option");
+    option.value = test.id;
+    option.textContent = test.name;
+    option.selected = test.id === state.selectedTestId;
+    options.append(option);
+  }
+  elements.testSelect.replaceChildren(options);
+
+  const test = selectedTest();
+  elements.testLauncherControls.hidden = !launcher.enabled;
+  elements.testLauncherMessage.textContent = launcher.enabled
+    ? "Choose one configured test. Only one test can run at a time."
+    : "Test launching is off. Start the server with --test-config to enable it.";
+  elements.testDescription.textContent = test?.description || "No description.";
+  elements.testCommand.textContent = test?.command || "";
+
+  const activeRun = launcher.active_run;
+  elements.testActiveRun.textContent = activeRun
+    ? `${activeRun.name} is ${activeRun.status}. Started ${relativeTime(activeRun.started_at_unix)}.`
+    : "No test is running.";
+
+  const recentRuns = (launcher.recent_runs ?? []).filter((run) => run.status !== "running");
+  const rows = document.createDocumentFragment();
+  for (const run of recentRuns) {
+    const row = document.createElement("tr");
+    const name = document.createElement("td");
+    const result = document.createElement("td");
+    const started = document.createElement("td");
+    name.textContent = run.name;
+    result.textContent = run.exit_code === null
+      ? humanize(run.status)
+      : `${humanize(run.status)} (${run.exit_code})`;
+    started.textContent = relativeTime(run.started_at_unix);
+    row.append(name, result, started);
+    rows.append(row);
+  }
+  elements.testRecentRunsBody.replaceChildren(rows);
+  elements.testRecentRuns.hidden = recentRuns.length === 0;
+
+  const cannotLaunch = !launcher.enabled || !test || activeRun !== null || state.launchingTest;
+  elements.testLauncherConfirmOpen.disabled = cannotLaunch;
+  elements.testLauncherConfirmOpen.textContent = state.launchingTest ? "Starting" : "Launch";
+  elements.testLauncherOpen.setAttribute(
+    "aria-label",
+    activeRun ? `Test running: ${activeRun.name}` : "Run test",
+  );
+}
+
+function openTestConfirmation() {
+  const test = selectedTest();
+  if (!test || elements.testLauncherConfirmOpen.disabled) {
+    return;
+  }
+  elements.testConfirmDescription.textContent = test.name;
+  elements.testConfirmCommand.textContent = test.command;
+  elements.testLauncherDialog.close();
+  elements.testConfirmDialog.showModal();
+}
+
+async function launchSelectedTest() {
+  const test = selectedTest();
+  if (!test || state.launchingTest) {
+    return;
+  }
+
+  state.launchingTest = true;
+  elements.testConfirmLaunch.disabled = true;
+  renderTestLauncher();
+  try {
+    await fetchJson("/api/test-runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ test_id: test.id }),
+    });
+    elements.testConfirmDialog.close();
+    showToast(`${test.name} started.`);
+    await refreshTestLauncher();
+    elements.testLauncherDialog.showModal();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    state.launchingTest = false;
+    elements.testConfirmLaunch.disabled = false;
+    renderTestLauncher();
   }
 }
 
@@ -279,10 +439,123 @@ function renderRun() {
 
   renderSignals(summary.latest_metrics);
   renderDevice(summary.device);
+  renderArchitecture(summary.architecture);
   renderMetricSelector(summary.numeric_metrics);
   renderChart();
   renderEvents();
   renderMetricInventory();
+}
+
+function renderArchitecture(architecture) {
+  if (!architecture?.available) {
+    elements.architectureSource.textContent = "Not available";
+    elements.architectureEmpty.textContent = architecture?.reason
+      || "No architecture data for this run.";
+    elements.architectureEmpty.hidden = false;
+    elements.architectureView.hidden = true;
+    return;
+  }
+
+  const config = architecture.config;
+  const metrics = architecture.metrics;
+  const runtime = architecture.runtime ?? {};
+  const manifestStep = architecture.manifest?.start_iteration;
+  elements.architectureSource.textContent = Number.isInteger(manifestStep)
+    ? `Run manifest, step ${formatInteger(manifestStep)}`
+    : "Run manifest";
+  elements.architectureEmpty.hidden = true;
+  elements.architectureView.hidden = false;
+
+  elements.architectureParameters.textContent = compactNumber(metrics.parameter_count);
+  elements.architectureParameters.title = formatInteger(metrics.parameter_count);
+  elements.architectureFlops.textContent = `${compactNumber(
+    metrics.multiply_accumulates_per_position,
+  )} MACs`;
+  elements.architectureFlops.title = formatInteger(
+    metrics.multiply_accumulates_per_position,
+  );
+  elements.architectureSize.textContent = formatBytes(metrics.estimated_fp32_bytes);
+  elements.architectureLayers.textContent = formatInteger(metrics.parameterized_layer_count);
+  elements.architectureDevice.textContent = architectureRuntimeLabel(runtime);
+
+  elements.architectureInputShape.textContent = [
+    config.input_planes,
+    config.board_size,
+    config.board_size,
+  ].join(" x ");
+  elements.architectureStemShape.textContent = `${formatInteger(config.channels)} channels`;
+  elements.architectureTowerShape.textContent = `${formatInteger(config.residual_blocks)} blocks`;
+  elements.architecturePolicyShape.textContent = `${formatInteger(config.action_size)} actions`;
+  elements.architectureValueShape.textContent = `${formatInteger(
+    config.value_hidden_size,
+  )} hidden -> 1`;
+
+  const stageLabels = {
+    stem: "Stem",
+    residual_tower: "Residual tower",
+    policy_head: "Policy head",
+    value_head: "Value head",
+  };
+  const parameterRows = document.createDocumentFragment();
+  for (const [name, value] of Object.entries(metrics.parameters_by_stage)) {
+    const row = document.createElement("div");
+    row.className = "parameter-row";
+    const label = document.createElement("span");
+    const progress = document.createElement("progress");
+    const amount = document.createElement("strong");
+    label.textContent = stageLabels[name] ?? humanize(name);
+    progress.max = metrics.parameter_count;
+    progress.value = value;
+    progress.setAttribute(
+      "aria-label",
+      `${label.textContent}: ${formatInteger(value)} parameters`,
+    );
+    amount.textContent = `${formatPercent(value / metrics.parameter_count)} · ${compactNumber(value)}`;
+    row.append(label, progress, amount);
+    parameterRows.append(row);
+  }
+  elements.architectureParameterBars.replaceChildren(parameterRows);
+
+  const configuration = [
+    ["Board", `${config.board_size} x ${config.board_size}`],
+    ["Input planes", formatInteger(config.input_planes)],
+    ["Trunk channels", formatInteger(config.channels)],
+    ["Residual blocks", formatInteger(config.residual_blocks)],
+    ["Value hidden size", formatInteger(config.value_hidden_size)],
+    ["Policy outputs", formatInteger(config.action_size)],
+    ["Estimated FLOPs", formatInteger(metrics.estimated_flops_per_position)],
+    ["Trunk activation values", formatInteger(metrics.trunk_activation_values_per_position)],
+    ["Ruleset", architecture.ruleset ? humanize(architecture.ruleset) : "Not reported"],
+    ["Compiled", architectureCompiledLabel(runtime.compiled)],
+    ["Device", runtime.device_name || runtime.device || "Not reported"],
+    ["Torch", runtime.torch || "Not reported"],
+  ];
+  const details = document.createDocumentFragment();
+  for (const [name, value] of configuration) {
+    const row = document.createElement("div");
+    const term = document.createElement("dt");
+    const description = document.createElement("dd");
+    term.textContent = name;
+    description.textContent = value;
+    row.append(term, description);
+    details.append(row);
+  }
+  elements.architectureConfig.replaceChildren(details);
+}
+
+function architectureRuntimeLabel(runtime) {
+  const device = typeof runtime.device === "string" ? runtime.device.toUpperCase() : "Unknown";
+  return runtime.compiled === true ? `${device}, compiled` : device;
+}
+
+function architectureCompiledLabel(compiled) {
+  if (compiled === true) {
+    return "Yes";
+  }
+  if (compiled === false) {
+    return "No";
+  }
+  return "Not reported";
 }
 
 function renderSignals(metrics) {
@@ -914,6 +1187,29 @@ function bindEvents() {
   elements.themeSelect.addEventListener("change", () => {
     setTheme(elements.themeSelect.value);
   });
+  elements.testLauncherOpen.addEventListener("click", () => {
+    renderTestLauncher();
+    elements.testLauncherDialog.showModal();
+    void refreshTestLauncher();
+  });
+  elements.testLauncherCloseIcon.addEventListener("click", () => {
+    elements.testLauncherDialog.close();
+  });
+  elements.testLauncherClose.addEventListener("click", () => {
+    elements.testLauncherDialog.close();
+  });
+  elements.testSelect.addEventListener("change", () => {
+    state.selectedTestId = elements.testSelect.value || null;
+    renderTestLauncher();
+  });
+  elements.testLauncherConfirmOpen.addEventListener("click", openTestConfirmation);
+  elements.testConfirmCancel.addEventListener("click", () => {
+    elements.testConfirmDialog.close();
+    elements.testLauncherDialog.showModal();
+  });
+  elements.testConfirmLaunch.addEventListener("click", () => {
+    void launchSelectedTest();
+  });
   elements.runTabs.addEventListener("click", (event) => {
     if (!(event.target instanceof Element)) {
       return;
@@ -997,5 +1293,11 @@ assertElements();
 elements.themeSelect.value = themePreference();
 bindEvents();
 selectTab(state.selectedTab);
+renderTestLauncher();
 void refresh();
 window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
+window.setInterval(() => {
+  if (elements.testLauncherDialog.open || elements.testConfirmDialog.open) {
+    void refreshTestLauncher();
+  }
+}, POLL_INTERVAL_MS);

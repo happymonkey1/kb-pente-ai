@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import logging
 from pathlib import Path
@@ -12,11 +14,17 @@ import time
 from typing import cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from src.monitoring.architecture import RunManifestStore
 from src.monitoring.store import (
     ArtifactIdentifierError,
     ArtifactNotFoundError,
     ReplayStore,
     TelemetryStore,
+)
+from src.monitoring.test_launcher import (
+    TestAlreadyRunningError,
+    TestLauncher,
+    UnknownTestError,
 )
 
 
@@ -91,7 +99,9 @@ class ServerMetrics:
 class MonitoringApplication:
     telemetry: TelemetryStore
     replays: ReplayStore
+    manifests: RunManifestStore
     metrics: ServerMetrics
+    test_launcher: TestLauncher | None
 
 
 class MonitoringHTTPServer(ThreadingHTTPServer):
@@ -122,11 +132,17 @@ class MonitoringRequestHandler(BaseHTTPRequestHandler):
         return server.application
 
     def do_GET(self) -> None:
+        self._handle_request(self._dispatch_get)
+
+    def do_POST(self) -> None:
+        self._handle_request(self._dispatch_post)
+
+    def _handle_request(self, dispatch: Callable[[], tuple[str, HTTPStatus]]) -> None:
         started = time.perf_counter()
         route = "unknown"
         status: int = int(HTTPStatus.INTERNAL_SERVER_ERROR)
         try:
-            route, status = self._dispatch_get()
+            route, status = dispatch()
         except ApiError as error:
             status = int(error.status)
             self._send_json(status, {"error": error.message})
@@ -181,9 +197,15 @@ class MonitoringRequestHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/runs/") and path.endswith("/summary"):
             run_id = _path_identifier(path, "/api/runs/", "/summary")
+            summary = self.application.telemetry.summary(run_id)
+            training_run_id = summary.get("training_run_id")
+            summary["architecture"] = self.application.manifests.architecture_for(
+                self.application.telemetry.root / run_id,
+                training_run_id if isinstance(training_run_id, str) else None,
+            )
             self._send_json(
                 HTTPStatus.OK,
-                self.application.telemetry.summary(run_id),
+                summary,
             )
             return "run_summary", HTTPStatus.OK
 
@@ -219,6 +241,21 @@ class MonitoringRequestHandler(BaseHTTPRequestHandler):
                 self.application.replays.replay(replay_id),
             )
             return "replay", HTTPStatus.OK
+
+        if path == "/api/test-launcher":
+            launcher = self.application.test_launcher
+            payload = (
+                launcher.snapshot()
+                if launcher is not None
+                else {
+                    "enabled": False,
+                    "tests": [],
+                    "active_run": None,
+                    "recent_runs": [],
+                }
+            )
+            self._send_json(HTTPStatus.OK, payload)
+            return "test_launcher", HTTPStatus.OK
 
         if path == "/metrics":
             metrics_body = self.application.metrics.render(
@@ -259,6 +296,65 @@ class MonitoringRequestHandler(BaseHTTPRequestHandler):
             return "static", HTTPStatus.OK
 
         raise ApiError(HTTPStatus.NOT_FOUND, "Route not found")
+
+    def _dispatch_post(self) -> tuple[str, HTTPStatus]:
+        request = urlsplit(self.path)
+        if request.path != "/api/test-runs":
+            raise ApiError(HTTPStatus.NOT_FOUND, "Route not found")
+
+        launcher = self.application.test_launcher
+        if launcher is None:
+            raise ApiError(HTTPStatus.FORBIDDEN, "Test launching is not enabled")
+        payload = self._read_json_object()
+        if set(payload) != {"test_id"} or not isinstance(payload["test_id"], str):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Request body must contain one string test_id",
+            )
+        try:
+            run = launcher.launch(payload["test_id"])
+        except UnknownTestError as error:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(error)) from error
+        except TestAlreadyRunningError as error:
+            raise ApiError(HTTPStatus.CONFLICT, str(error)) from error
+        self._send_json(HTTPStatus.ACCEPTED, {"run": run})
+        return "test_run_create", HTTPStatus.ACCEPTED
+
+    def _read_json_object(self) -> dict[str, object]:
+        content_type = self.headers.get_content_type()
+        if content_type != "application/json":
+            raise ApiError(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                "Content-Type must be application/json",
+            )
+
+        raw_length = self.headers.get("Content-Length")
+        try:
+            content_length = int(raw_length) if raw_length is not None else -1
+        except ValueError as error:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Content-Length must be an integer",
+            ) from error
+        if not 1 <= content_length <= 16 * 1024:
+            raise ApiError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "Request body must contain 1 to 16384 bytes",
+            )
+
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Request body must be valid JSON",
+            ) from error
+        if not isinstance(payload, dict):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Request body must be a JSON object",
+            )
+        return cast(dict[str, object], payload)
 
     def _send_json(self, status: HTTPStatus | int, payload: object) -> None:
         body = json.dumps(
@@ -303,9 +399,18 @@ def build_server(
     replay_root: str | Path = "replays",
     activity_window_seconds: float = 120.0,
     max_file_bytes: int = 64 * 1024 * 1024,
+    test_launcher: TestLauncher | None = None,
+    manifest_roots: Sequence[str | Path] | None = None,
 ) -> MonitoringHTTPServer:
     if not 0 <= port <= 65_535:
         raise ValueError("port must be between 0 and 65535")
+    if test_launcher is not None and not _is_loopback_host(host):
+        raise ValueError("Test launching is available only on a loopback address")
+    selected_manifest_roots: list[str | Path] = [metrics_root]
+    if manifest_roots is None:
+        selected_manifest_roots.append(Path.cwd())
+    else:
+        selected_manifest_roots.extend(manifest_roots)
     application = MonitoringApplication(
         telemetry=TelemetryStore(
             metrics_root,
@@ -313,7 +418,9 @@ def build_server(
             max_file_bytes=max_file_bytes,
         ),
         replays=ReplayStore(replay_root, max_file_bytes=max_file_bytes),
+        manifests=RunManifestStore(selected_manifest_roots),
         metrics=ServerMetrics(),
+        test_launcher=test_launcher,
     )
     return MonitoringHTTPServer((host, port), application)
 
@@ -351,3 +458,12 @@ def _query_integer(
 
 def _prometheus_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False

@@ -22,6 +22,16 @@
         <ul>
           <li><small id="connection-state" class="connection-state">Connecting</small></li>
           <li>
+            <button id="refresh-toggle" class="secondary outline compact" type="button" aria-pressed="false">
+              Pause
+            </button>
+          </li>
+          <li>
+            <button id="test-launcher-open" class="secondary outline compact" type="button">
+              Run test
+            </button>
+          </li>
+          <li>
             <label class="theme-control">
               <span class="theme-label">Theme</span>
               <select id="theme-select" aria-label="Theme">
@@ -30,11 +40,6 @@
                 <option value="dark">Dark</option>
               </select>
             </label>
-          </li>
-          <li>
-            <button id="refresh-toggle" class="secondary outline compact" type="button" aria-pressed="false">
-              Pause
-            </button>
           </li>
         </ul>
       </nav>
@@ -73,6 +78,7 @@
 
           <div id="run-tabs" class="run-tabs" role="tablist" aria-label="Run views">
             <button id="tab-overview" class="run-tab" type="button" role="tab" aria-controls="panel-overview" aria-selected="true" data-tab="overview">Overview</button>
+            <button id="tab-architecture" class="run-tab" type="button" role="tab" aria-controls="panel-architecture" aria-selected="false" tabindex="-1" data-tab="architecture">NN architecture</button>
             <button id="tab-metrics" class="run-tab" type="button" role="tab" aria-controls="panel-metrics" aria-selected="false" tabindex="-1" data-tab="metrics">Latest metrics</button>
             <button id="tab-replay" class="run-tab" type="button" role="tab" aria-controls="panel-replay" aria-selected="false" tabindex="-1" data-tab="replay">Replay</button>
           </div>
@@ -165,6 +171,70 @@
             </article>
           </section>
 
+          <section id="panel-architecture" class="tab-panel" role="tabpanel" aria-labelledby="tab-architecture" hidden>
+            <article class="panel architecture-panel">
+              <header class="panel-header">
+                <h3>Neural network</h3>
+                <small id="architecture-source">Run manifest</small>
+              </header>
+              <p id="architecture-empty" class="empty-message">No architecture data for this run.</p>
+              <div id="architecture-view" hidden>
+                <section class="architecture-summary" aria-label="Neural network summary">
+                  <div><small>Parameters</small><strong id="architecture-parameters">--</strong></div>
+                  <div><small>Compute</small><strong id="architecture-flops">--</strong></div>
+                  <div><small>FP32 weights</small><strong id="architecture-size">--</strong></div>
+                  <div><small>Layers</small><strong id="architecture-layers">--</strong></div>
+                  <div><small>Runtime</small><strong id="architecture-device">--</strong></div>
+                </section>
+
+                <section class="network-diagram" aria-label="PenteNet data flow">
+                  <div class="network-stage input-stage">
+                    <small>Input</small>
+                    <strong id="architecture-input-shape">--</strong>
+                    <span>Board features</span>
+                  </div>
+                  <span class="network-connector" aria-hidden="true">&rarr;</span>
+                  <div class="network-stage">
+                    <small>Stem</small>
+                    <strong id="architecture-stem-shape">--</strong>
+                    <span>3x3 conv + batch norm</span>
+                  </div>
+                  <span class="network-connector" aria-hidden="true">&rarr;</span>
+                  <div class="network-stage tower-stage">
+                    <small>Residual tower</small>
+                    <strong id="architecture-tower-shape">--</strong>
+                    <span>Two 3x3 conv layers per block</span>
+                  </div>
+                  <span class="network-connector branch-connector" aria-hidden="true">&rarr;</span>
+                  <div class="network-heads">
+                    <div class="network-stage policy-stage">
+                      <small>Policy head</small>
+                      <strong id="architecture-policy-shape">--</strong>
+                      <span>Move probabilities</span>
+                    </div>
+                    <div class="network-stage value-stage">
+                      <small>Value head</small>
+                      <strong id="architecture-value-shape">--</strong>
+                      <span>Position score</span>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="architecture-details">
+                  <div>
+                    <h4>Parameter distribution</h4>
+                    <div id="architecture-parameter-bars" class="parameter-bars"></div>
+                  </div>
+                  <div>
+                    <h4>Configuration</h4>
+                    <dl id="architecture-config" class="architecture-config"></dl>
+                  </div>
+                </section>
+                <p class="architecture-note">Compute is an estimate for one position. It counts convolution and dense multiply-accumulate operations. Layers count trainable convolution, batch norm, and dense modules.</p>
+              </div>
+            </article>
+          </section>
+
           <section id="panel-metrics" class="tab-panel" role="tabpanel" aria-labelledby="tab-metrics" hidden>
             <article class="panel metrics-panel">
               <header class="panel-header">
@@ -229,6 +299,57 @@
         </div>
       </main>
     </div>
+
+    <dialog id="test-launcher-dialog" aria-labelledby="test-launcher-title">
+      <article class="test-launcher-dialog">
+        <header>
+          <button id="test-launcher-close-icon" aria-label="Close" rel="prev" type="button"></button>
+          <h2 id="test-launcher-title">Run test</h2>
+        </header>
+        <p id="test-launcher-message">Loading test catalog.</p>
+        <div id="test-launcher-controls">
+          <label>
+            Test
+            <select id="test-select"></select>
+          </label>
+          <p id="test-description" class="test-description"></p>
+          <pre class="test-command"><code id="test-command"></code></pre>
+        </div>
+        <section class="test-run-status" aria-labelledby="test-run-status-title">
+          <h3 id="test-run-status-title">Status</h3>
+          <p id="test-active-run">No test is running.</p>
+          <div id="test-recent-runs" class="table-scroll" hidden>
+            <table class="striped">
+              <thead>
+                <tr>
+                  <th scope="col">Test</th>
+                  <th scope="col">Result</th>
+                  <th scope="col">Started</th>
+                </tr>
+              </thead>
+              <tbody id="test-recent-runs-body"></tbody>
+            </table>
+          </div>
+        </section>
+        <footer>
+          <button id="test-launcher-close" class="secondary" type="button">Close</button>
+          <button id="test-launcher-confirm-open" type="button">Launch</button>
+        </footer>
+      </article>
+    </dialog>
+
+    <dialog id="test-confirm-dialog" aria-labelledby="test-confirm-title">
+      <article class="test-confirm-dialog">
+        <header><h2 id="test-confirm-title">Launch this test?</h2></header>
+        <p id="test-confirm-description"></p>
+        <pre class="test-command"><code id="test-confirm-command"></code></pre>
+        <p>This uses local CPU or GPU resources. Only launch it when compute is available.</p>
+        <footer>
+          <button id="test-confirm-cancel" class="secondary" type="button">Cancel</button>
+          <button id="test-confirm-launch" type="button">Launch test</button>
+        </footer>
+      </article>
+    </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/app.js" defer></script>

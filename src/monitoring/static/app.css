@@ -476,6 +476,7 @@ main.container-fluid {
 }
 
 .device-panel,
+.architecture-panel,
 .metrics-panel,
 .replay-panel {
   margin-bottom: 1rem;
@@ -528,6 +529,167 @@ main.container-fluid {
 .metric-row strong {
   font-size: 0.875rem;
   font-variant-numeric: tabular-nums;
+}
+
+.architecture-summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  border-bottom: 1px solid var(--app-border);
+}
+
+.architecture-summary > div {
+  min-width: 0;
+  padding: 1rem;
+  border-right: 1px solid var(--app-border);
+}
+
+.architecture-summary > div:last-child {
+  border-right: 0;
+}
+
+.architecture-summary small,
+.architecture-summary strong,
+.network-stage small,
+.network-stage strong,
+.network-stage span {
+  display: block;
+}
+
+.architecture-summary small,
+.network-stage small,
+.network-stage span,
+.architecture-note {
+  color: var(--pico-muted-color);
+}
+
+.architecture-summary strong {
+  overflow: hidden;
+  margin-top: 0.2rem;
+  font-size: 1.1rem;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-diagram {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.8fr) auto minmax(9rem, 1fr) auto minmax(12rem, 1.2fr) auto minmax(12rem, 1.2fr);
+  gap: 0.65rem;
+  align-items: center;
+  padding: clamp(1rem, 3vw, 2rem);
+  border-bottom: 1px solid var(--app-border);
+}
+
+.network-stage {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--pico-primary-border);
+  border-radius: var(--pico-border-radius);
+  background: var(--pico-card-sectioning-background-color);
+}
+
+.network-stage small {
+  margin-bottom: 0.4rem;
+}
+
+.network-stage strong {
+  overflow: hidden;
+  margin-bottom: 0.2rem;
+  font-size: 1rem;
+  text-overflow: ellipsis;
+}
+
+.network-stage span {
+  font-size: 0.72rem;
+}
+
+.tower-stage {
+  border-width: 2px;
+}
+
+.network-heads {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.policy-stage {
+  border-color: var(--pico-primary-border);
+}
+
+.value-stage {
+  border-color: var(--pico-secondary-border);
+}
+
+.network-connector {
+  color: var(--pico-muted-color);
+  font-size: 1.2rem;
+  text-align: center;
+}
+
+.architecture-details {
+  display: grid;
+  grid-template-columns: minmax(18rem, 1.2fr) minmax(18rem, 0.8fr);
+  gap: 2rem;
+  padding: clamp(1rem, 3vw, 2rem);
+}
+
+.architecture-details h4 {
+  margin: 0 0 1rem;
+  font-size: 0.95rem;
+}
+
+.parameter-bars {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.parameter-row {
+  display: grid;
+  grid-template-columns: minmax(7rem, 0.45fr) minmax(8rem, 1fr) auto;
+  gap: 0.75rem;
+  align-items: center;
+  font-size: 0.8rem;
+}
+
+.parameter-row progress {
+  height: 0.55rem;
+  margin: 0;
+}
+
+.parameter-row strong {
+  min-width: 4.5rem;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.architecture-config {
+  margin: 0;
+}
+
+.architecture-config > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.architecture-config dt,
+.architecture-config dd {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.architecture-config dd {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.architecture-note {
+  margin: 0;
+  padding: 0 2rem 1.5rem;
+  font-size: 0.75rem;
 }
 
 .replay-picker select {
@@ -661,6 +823,68 @@ main.container-fluid {
   margin-bottom: 0;
 }
 
+.test-launcher-dialog {
+  width: min(44rem, calc(100vw - 2rem));
+}
+
+.test-confirm-dialog {
+  width: min(36rem, calc(100vw - 2rem));
+}
+
+.test-launcher-dialog > header h2,
+.test-confirm-dialog > header h2,
+.test-run-status h3 {
+  margin: 0;
+}
+
+.test-launcher-dialog label {
+  margin-bottom: 0.75rem;
+}
+
+.test-description {
+  min-height: 1.5rem;
+  margin-bottom: 0.75rem;
+  color: var(--pico-muted-color);
+}
+
+.test-command {
+  max-height: 9rem;
+  margin-bottom: 1rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.test-run-status {
+  padding-top: 1rem;
+  border-top: 1px solid var(--app-border);
+}
+
+.test-run-status h3 {
+  font-size: 1rem;
+}
+
+.test-run-status > p {
+  color: var(--pico-muted-color);
+}
+
+.test-run-status .table-scroll {
+  max-height: 12rem;
+  border: 1px solid var(--app-border);
+}
+
+.test-launcher-dialog footer,
+.test-confirm-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.test-launcher-dialog footer button,
+.test-confirm-dialog footer button {
+  width: auto;
+  margin-bottom: 0;
+}
+
 .toast {
   position: fixed;
   right: 1rem;
@@ -719,6 +943,30 @@ main.container-fluid {
   .metric-row:nth-child(3n) {
     border-right: 0;
   }
+
+  .architecture-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .architecture-summary > div:nth-child(3) {
+    border-right: 0;
+  }
+
+  .architecture-summary > div:nth-child(-n + 3) {
+    border-bottom: 1px solid var(--app-border);
+  }
+
+  .network-diagram {
+    grid-template-columns: 1fr;
+  }
+
+  .network-connector {
+    transform: rotate(90deg);
+  }
+
+  .architecture-details {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 50rem) {
@@ -760,8 +1008,23 @@ main.container-fluid {
   }
 
   .summary-grid,
-  .metric-inventory {
+  .metric-inventory,
+  .architecture-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .architecture-summary > div,
+  .architecture-summary > div:nth-child(3) {
+    border-right: 1px solid var(--app-border);
+    border-bottom: 1px solid var(--app-border);
+  }
+
+  .architecture-summary > div:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .architecture-summary > div:last-child {
+    border-bottom: 0;
   }
 
   .metric-row:nth-child(3n) {
@@ -789,8 +1052,28 @@ main.container-fluid {
   }
 
   .summary-grid,
-  .metric-inventory {
+  .metric-inventory,
+  .architecture-summary {
     grid-template-columns: 1fr;
+  }
+
+  .architecture-summary > div,
+  .architecture-summary > div:nth-child(2n),
+  .architecture-summary > div:nth-child(3) {
+    border-right: 0;
+  }
+
+  .architecture-details {
+    padding: 1rem;
+  }
+
+  .parameter-row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .parameter-row progress {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 
   .metric-row,

@@ -7,7 +7,12 @@ import numpy as np
 from src.game.game import TerminalResult
 from src.game.pente.pente_board import PenteBoard
 from src.game.pente.pente_game import PenteGame
-from src.mcts.batched import BatchedSearchTelemetry, run_batched_search
+from src.mcts.batched import (
+    BatchedSearchAccumulator,
+    BatchedSearchTelemetry,
+    SearchSession,
+    evaluate_search_wave,
+)
 from src.mcts.mcts_v2 import MCTS, MCTSArgs, PolicyValueEvaluator, SearchTelemetry
 from src.train.training_example import TrainingExample
 
@@ -25,6 +30,7 @@ class PlayedGame:
 class ActiveSelfPlayGame:
     position: PenteBoard
     mcts: MCTS
+    search_session: SearchSession
     pending: list[tuple[PenteBoard, np.ndarray]]
     actions: list[int]
     root_telemetry: list[SearchTelemetry]
@@ -62,24 +68,16 @@ class SelfPlayGenerator:
         launched_games = min(game_count, active_limit)
         active = [self._new_active_game() for _ in range(launched_games)]
         completed: list[PlayedGame] = []
-        batch_telemetry: list[BatchedSearchTelemetry] = []
+        batch_accumulators: dict[int, BatchedSearchAccumulator] = {}
 
         while active:
-            roots = [game.position for game in active]
-            temperatures = []
-            for root in roots:
-                assert root.ply is not None
-                temperatures.append(1.0 if root.ply < self.temp_threshold else 0.0)
-            search_result = run_batched_search(
-                [game.mcts for game in active],
-                roots,
-                temperatures,
-                add_root_noise=True,
-            )
-            batch_telemetry.append(search_result.telemetry)
-
             remaining: list[ActiveSelfPlayGame] = []
-            for game, policy in zip(active, search_result.policies):
+            for game in active:
+                if not game.search_session.is_complete:
+                    remaining.append(game)
+                    continue
+
+                policy = game.search_session.policy()
                 game.pending.append((game.position, policy))
                 game.root_telemetry.append(game.mcts.telemetry(game.position))
                 action = int(self.rng.choice(len(policy), p=policy))
@@ -101,27 +99,63 @@ class SelfPlayGenerator:
                         )
                     )
                 else:
+                    game.search_session = self._new_search_session(game)
                     remaining.append(game)
             while launched_games < game_count and len(remaining) < active_limit:
                 remaining.append(self._new_active_game())
                 launched_games += 1
             active = remaining
 
-        return completed, batch_telemetry
+            if active:
+                root_count = len(active)
+                accumulator = batch_accumulators.get(root_count)
+                if accumulator is None:
+                    accumulator = BatchedSearchAccumulator(root_count)
+                    batch_accumulators[root_count] = accumulator
+                evaluate_search_wave(
+                    [game.search_session for game in active],
+                    accumulator,
+                )
+
+        return completed, [
+            accumulator.telemetry()
+            for accumulator in batch_accumulators.values()
+        ]
 
     def _new_active_game(self) -> ActiveSelfPlayGame:
-        return ActiveSelfPlayGame(
-            position=self.game.init_board(),
-            mcts=MCTS(
-                self.game,
-                self.evaluator,
-                self.mcts_args,
-                np.random.default_rng(int(self.rng.integers(0, 2**63))),
+        position = self.game.init_board()
+        search = MCTS(
+            self.game,
+            self.evaluator,
+            self.mcts_args,
+            np.random.default_rng(int(self.rng.integers(0, 2**63))),
+        )
+        active = ActiveSelfPlayGame(
+            position=position,
+            mcts=search,
+            search_session=SearchSession(
+                search,
+                position,
+                self._temperature(position),
+                add_root_noise=True,
             ),
             pending=[],
             actions=[],
             root_telemetry=[],
         )
+        return active
+
+    def _new_search_session(self, active: ActiveSelfPlayGame) -> SearchSession:
+        return SearchSession(
+            active.mcts,
+            active.position,
+            self._temperature(active.position),
+            add_root_noise=True,
+        )
+
+    def _temperature(self, position: PenteBoard) -> float:
+        assert position.ply is not None
+        return 1.0 if position.ply < self.temp_threshold else 0.0
 
 
 def finalize_training_examples(

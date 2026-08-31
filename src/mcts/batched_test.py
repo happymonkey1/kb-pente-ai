@@ -6,7 +6,12 @@ import numpy as np
 from src.game.pente.pente_board import PenteBoard
 from src.game.pente.pente_game import PenteGame
 from src.game.pente.rules import PenteRuleset
-from src.mcts.batched import run_batched_search
+from src.mcts.batched import (
+    BatchedSearchAccumulator,
+    SearchSession,
+    evaluate_search_wave,
+    run_batched_search,
+)
 from src.mcts.mcts_v2 import MCTS, MCTSArgs
 
 
@@ -95,6 +100,42 @@ class BatchedSearchTest(unittest.TestCase):
         for first, second in zip(first_policies, second_policies):
             np.testing.assert_allclose(first, second)
         self.assertEqual(first_batches, second_batches)
+
+    def test_completed_session_can_be_replaced_while_peer_search_continues(self) -> None:
+        evaluator = RecordingEvaluator(self.game.get_action_size())
+        first_root = self.game.init_board()
+        second_root, _ = self.game.apply_action(first_root, first_root.current_player, 0)
+        replacement_root, _ = self.game.apply_action(first_root, first_root.current_player, 1)
+        short = SearchSession(
+            MCTS(self.game, evaluator, MCTSArgs(num_simulations=1)),
+            first_root,
+            1.0,
+            False,
+        )
+        long = SearchSession(
+            MCTS(self.game, evaluator, MCTSArgs(num_simulations=2)),
+            second_root,
+            1.0,
+            False,
+        )
+        accumulator = BatchedSearchAccumulator(2)
+
+        evaluate_search_wave([short, long], accumulator)
+
+        self.assertTrue(short.is_complete)
+        self.assertFalse(long.is_complete)
+        replacement = SearchSession(
+            MCTS(self.game, evaluator, MCTSArgs(num_simulations=1)),
+            replacement_root,
+            1.0,
+            False,
+        )
+        evaluate_search_wave([replacement, long], accumulator)
+
+        self.assertTrue(replacement.is_complete)
+        self.assertTrue(long.is_complete)
+        self.assertEqual([2, 2], evaluator.batch_sizes)
+        self.assertEqual((2, 2), accumulator.telemetry().inference_batch_sizes)
 
 
 if __name__ == "__main__":

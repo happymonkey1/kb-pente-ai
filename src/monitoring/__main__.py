@@ -5,6 +5,7 @@ import ipaddress
 import logging
 
 from src.monitoring.server import build_server
+from src.monitoring.test_launcher import TestCatalogError, TestLauncher, load_test_catalog
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,8 +16,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--metrics-root", default="metrics")
     parser.add_argument("--replay-root", default="replays")
+    parser.add_argument(
+        "--manifest-root",
+        action="append",
+        help="Directory containing run manifests or model directories; repeat as needed",
+    )
     parser.add_argument("--activity-seconds", type=float, default=120.0)
     parser.add_argument("--max-file-mib", type=int, default=64)
+    parser.add_argument(
+        "--test-config",
+        help="Enable test launching with an allowlisted JSON catalog",
+    )
+    parser.add_argument(
+        "--test-root",
+        default=".",
+        help="Working directory for launched tests",
+    )
+    parser.add_argument(
+        "--test-log-root",
+        default=".monitoring/test-runs",
+        help="Directory for launched test output",
+    )
     parser.add_argument(
         "--allow-remote",
         action="store_true",
@@ -34,6 +54,19 @@ def main() -> int:
         )
     if args.max_file_mib < 1:
         raise SystemExit("--max-file-mib must be positive")
+    if args.test_config and not _is_loopback(args.host):
+        raise SystemExit("Test launching is available only on a loopback address")
+
+    test_launcher = None
+    if args.test_config:
+        try:
+            test_launcher = TestLauncher(
+                load_test_catalog(args.test_config),
+                working_root=args.test_root,
+                log_root=args.test_log_root,
+            )
+        except TestCatalogError as error:
+            raise SystemExit(str(error)) from error
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     server = build_server(
@@ -43,6 +76,8 @@ def main() -> int:
         replay_root=args.replay_root,
         activity_window_seconds=args.activity_seconds,
         max_file_bytes=args.max_file_mib * 1024 * 1024,
+        test_launcher=test_launcher,
+        manifest_roots=args.manifest_root,
     )
     print(
         f"kb-pente-ai monitor listening on http://{args.host}:{server.server_port}",

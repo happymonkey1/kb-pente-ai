@@ -4,7 +4,7 @@ import numpy as np
 
 from src.game.game import Game, TerminalResult
 from src.game.pente.pente_board import CAPTURES_TO_WIN, PenteBoard
-from src.game.pente.rules import PenteRuleset, legal_action_mask
+from src.game.pente.rules import PenteRuleset, is_legal_action, legal_action_mask
 
 
 class PenteGame(Game):
@@ -44,11 +44,18 @@ class PenteGame(Game):
         Game.validate_player(player)
         if player != board.current_player:
             raise ValueError(f"Expected Player {board.current_player} to move, received Player {player}")
-        if not self.is_valid_move(board, player, action):
+        assert board.ply is not None
+        if not is_legal_action(
+            board.board,
+            board.current_player,
+            board.ply,
+            self.ruleset,
+            action,
+        ):
             raise ValueError(f"Invalid action: {action}")
 
         row, column = divmod(action, self.board_size)
-        next_board = board.apply_move(player, (row, column))
+        next_board = board._apply_validated_move(player, row, column)
         return next_board, next_board.current_player
 
     def get_next_player(self, player: int) -> int:
@@ -63,9 +70,18 @@ class PenteGame(Game):
         return legal_action_mask(board.board, board.current_player, board.ply, self.ruleset).astype(np.int8)
 
     def is_valid_move(self, board: PenteBoard, player: int, action: int) -> bool:
-        if not 0 <= action < self.get_action_size():
-            return False
-        return bool(self.get_valid_moves(board, player)[action])
+        self._validate_position(board)
+        Game.validate_player(player)
+        if player != board.current_player:
+            raise ValueError(f"Expected Player {board.current_player}, received Player {player}")
+        assert board.ply is not None
+        return is_legal_action(
+            board.board,
+            board.current_player,
+            board.ply,
+            self.ruleset,
+            action,
+        )
 
     def would_form_line(self, board: PenteBoard, player: int, action: int) -> bool:
         """Return whether an empty-point placement would form five for either player."""
@@ -82,15 +98,17 @@ class PenteGame(Game):
 
     def check_game_end(self, board: PenteBoard) -> TerminalResult:
         self._validate_position(board)
-        capture_winners = [
-            player
-            for player in (Game.PLAYER_ONE, Game.PLAYER_TWO)
-            if board.get_capture_count(player) >= self.CAPTURES_TO_WIN
-        ]
-        if len(capture_winners) > 1:
+        player_one_captures = int(board.captures[Game.player_index(Game.PLAYER_ONE)])
+        player_two_captures = int(board.captures[Game.player_index(Game.PLAYER_TWO)])
+        if (
+            player_one_captures >= self.CAPTURES_TO_WIN
+            and player_two_captures >= self.CAPTURES_TO_WIN
+        ):
             raise ValueError("Position has multiple capture winners")
-        if capture_winners:
-            return TerminalResult.win(capture_winners[0], "capture")
+        if player_one_captures >= self.CAPTURES_TO_WIN:
+            return TerminalResult.win(Game.PLAYER_ONE, "capture")
+        if player_two_captures >= self.CAPTURES_TO_WIN:
+            return TerminalResult.win(Game.PLAYER_TWO, "capture")
 
         if board.last_action is not None:
             previous_player = Game.opponent(board.current_player)
@@ -107,7 +125,11 @@ class PenteGame(Game):
             if line_winners:
                 return TerminalResult.win(line_winners[0], "line")
 
-        if not np.any(board.board == 0):
+        assert board.ply is not None
+        stones_on_board = board.ply - 2 * (
+            player_one_captures + player_two_captures
+        )
+        if stones_on_board == board.board.size:
             return TerminalResult.draw()
         return TerminalResult.in_progress()
 

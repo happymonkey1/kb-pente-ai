@@ -196,3 +196,6 @@ Training writes JSONL records with a stable schema. Current metrics include:
 Passing `--gpu` is strict. Training exits with a diagnostic if Torch cannot access CUDA; it never silently falls back to CPU. WSL GPU access may need to be granted outside a restricted execution sandbox even when `nvidia-smi` works in an ordinary WSL terminal.
 
 The implementation journal and original diagnosis are stored in the kb-pente-ai Codex vault.
+
+The local browser dashboard and its opt-in test launcher are documented in
+[`docs/monitoring.md`](docs/monitoring.md).

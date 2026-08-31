@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+from src.telemetry import MetricSink
+
 
 @dataclass(frozen=True, slots=True)
 class SelfPlayHealthThresholds:
@@ -65,6 +67,29 @@ def validate_self_play_health(
     _require_at_most(metrics, "self_play_cpu_sampling_errors", 0, failures)
     if failures:
         raise RuntimeError("Self-play health gate failed: " + "; ".join(failures))
+
+
+def validate_and_emit_self_play_health(
+    metric_sink: MetricSink,
+    step: int,
+    device_type: str,
+    cpu_logical_core_count: int,
+    generation_seconds: float,
+    metrics: Mapping[str, int | float],
+    thresholds: SelfPlayHealthThresholds,
+) -> None:
+    try:
+        validate_self_play_health(metrics, thresholds)
+    except RuntimeError as error:
+        failure_metrics: dict[str, int | float | str] = {
+            "device_type": device_type,
+            "cpu_logical_core_count": cpu_logical_core_count,
+            "generation_seconds": generation_seconds,
+            "error": str(error),
+        }
+        failure_metrics.update(metrics)
+        metric_sink.emit("self_play_health_failure", step, failure_metrics)
+        raise
 
 
 def _require_at_least(
