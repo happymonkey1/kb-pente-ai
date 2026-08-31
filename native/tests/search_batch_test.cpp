@@ -1153,6 +1153,195 @@ void test_multiwave_token_lifecycle() {
         "backup without a pending request is rejected");
 }
 
+void expect_finite_timing_stage(
+    const kb_pente::SearchBatchStageTelemetry& stage,
+    const char* message) {
+    expect(std::isfinite(stage.wall_seconds) &&
+               std::isfinite(stage.worker.wall_seconds) &&
+               std::isfinite(stage.worker.callback_busy_seconds) &&
+               std::isfinite(stage.worker.busy_fraction),
+           message);
+    expect(stage.wall_seconds >= 0.0 && stage.worker.wall_seconds >= 0.0 &&
+               stage.worker.callback_busy_seconds >= 0.0 &&
+               stage.worker.busy_fraction >= 0.0 &&
+               stage.worker.busy_fraction <= 1.0,
+           message);
+}
+
+void test_search_batch_timing_telemetry() {
+    kb_pente::SearchBatch batch(batch_config(2U, 101U), 1U, 2U);
+    (void)batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+
+    const auto initial = batch.timing_telemetry();
+    expect(initial.cumulative.token == kb_pente::kInvalidBatchToken &&
+               initial.latest_generation.token == kb_pente::kInvalidBatchToken,
+           "timing telemetry starts without a generation");
+    expect(initial.cumulative.select.successful_operations == 0U &&
+               initial.cumulative.dedup.successful_operations == 0U &&
+               initial.cumulative.features.successful_operations == 0U &&
+               initial.cumulative.backup.successful_operations == 0U,
+           "timing telemetry starts with zero successful operations");
+
+    const auto first = batch.select();
+    const auto after_select = batch.timing_telemetry();
+    expect(after_select.latest_generation.token == first.token &&
+               after_select.cumulative.token == first.token,
+           "selection publishes the generation token");
+    expect(after_select.latest_generation.select.successful_operations == 1U &&
+               after_select.latest_generation.dedup.successful_operations == 1U &&
+               after_select.latest_generation.features.successful_operations ==
+                   0U &&
+               after_select.latest_generation.backup.successful_operations ==
+                   0U,
+           "selection publishes select and dedup timing only");
+    expect(after_select.latest_generation.select.worker.items == 1U &&
+               after_select.latest_generation.select.worker.workers == 2U &&
+               after_select.latest_generation.dedup.worker.items == 0U &&
+               after_select.latest_generation.dedup.worker.workers == 0U,
+           "select and serial dedup worker metrics are separated");
+    expect_finite_timing_stage(
+        after_select.latest_generation.select,
+        "select timing is finite and bounded");
+    expect_finite_timing_stage(
+        after_select.latest_generation.dedup,
+        "dedup timing is finite and bounded");
+
+    std::vector<float> features(4U * 25U, 0.0F);
+    const auto before_rejected_feature = batch.timing_telemetry();
+    expect_throws<std::invalid_argument>(
+        [&batch, &first, &features] {
+            batch.write_features(
+                first.token,
+                features.data(),
+                2U,
+                4U,
+                5U,
+                5U);
+        },
+        "rejected feature timing call throws");
+    expect(batch.timing_telemetry() == before_rejected_feature,
+           "rejected feature calls preserve timing telemetry");
+
+    batch.write_features(
+        first.token,
+        features.data(),
+        1U,
+        4U,
+        5U,
+        5U);
+    const auto after_first_feature = batch.timing_telemetry();
+    batch.write_features(
+        first.token,
+        features.data(),
+        1U,
+        4U,
+        5U,
+        5U);
+    const auto after_second_feature = batch.timing_telemetry();
+    expect(after_second_feature.latest_generation.features.successful_operations ==
+               2U &&
+               after_second_feature.cumulative.features.successful_operations ==
+                   2U &&
+               after_second_feature.latest_generation.features.worker.items ==
+                   2U,
+           "repeated feature writes accumulate in the generation");
+    expect(after_second_feature.latest_generation.select ==
+               after_first_feature.latest_generation.select &&
+               after_second_feature.latest_generation.dedup ==
+                   after_first_feature.latest_generation.dedup,
+           "feature timing does not rewrite select or dedup snapshots");
+    expect_finite_timing_stage(
+        after_second_feature.latest_generation.features,
+        "feature timing is finite and bounded");
+
+    std::vector<float> policies = uniform_policies(first.size());
+    std::vector<float> values(first.size(), 0.0F);
+    const auto before_rejected_backup = batch.timing_telemetry();
+    expect_throws<std::invalid_argument>(
+        [&batch, &first, &values] {
+            batch.backup(
+                first.token,
+                nullptr,
+                first.size(),
+                kb_pente::kMaxActions,
+                values.data(),
+                values.size());
+        },
+        "rejected backup timing call throws");
+    expect(batch.timing_telemetry() == before_rejected_backup,
+           "rejected backup calls preserve timing telemetry");
+
+    batch.backup(
+        first.token,
+        policies.data(),
+        first.size(),
+        kb_pente::kMaxActions,
+        values.data(),
+        values.size());
+    const auto after_backup = batch.timing_telemetry();
+    expect(after_backup.latest_generation.backup.successful_operations == 1U &&
+               after_backup.latest_generation.backup.worker.items == 1U &&
+               after_backup.cumulative.select.successful_operations == 1U &&
+               after_backup.cumulative.dedup.successful_operations == 1U &&
+               after_backup.cumulative.features.successful_operations == 2U &&
+               after_backup.cumulative.backup.successful_operations == 1U,
+           "successful backup publishes and accumulates timing");
+    expect_finite_timing_stage(
+        after_backup.latest_generation.backup,
+        "backup timing is finite and bounded");
+
+    const auto second = batch.select();
+    const auto after_second_select = batch.timing_telemetry();
+    expect(second.token > first.token &&
+               after_second_select.latest_generation.token == second.token &&
+               after_second_select.latest_generation.select.successful_operations ==
+                   1U &&
+               after_second_select.latest_generation.dedup.successful_operations ==
+                   1U &&
+               after_second_select.latest_generation.features.successful_operations ==
+                   0U &&
+               after_second_select.latest_generation.backup.successful_operations ==
+                   0U,
+           "a new generation resets latest stage counters");
+    expect(after_second_select.cumulative.select.successful_operations == 2U &&
+               after_second_select.cumulative.dedup.successful_operations == 2U &&
+               after_second_select.cumulative.features.successful_operations ==
+                   2U &&
+               after_second_select.cumulative.backup.successful_operations == 1U,
+           "a new generation preserves cumulative stage counters");
+    expect_finite_timing_stage(
+        after_second_select.latest_generation.select,
+        "second select timing is finite and bounded");
+
+    backup_uniform(batch, second);
+    expect(batch.complete(), "timing fixture completes");
+
+    kb_pente::SearchBatch terminal(batch_config(4U, 103U), 1U, 1U);
+    (void)terminal.add(make_draw_root(), kb_pente::Ruleset::Freestyle);
+    const auto terminal_first = terminal.select();
+    backup_first_one_hot(terminal, terminal_first, 24U);
+    const auto terminal_empty = terminal.select();
+    const auto terminal_timing = terminal.timing_telemetry();
+    expect(terminal_empty.empty() && terminal.complete() &&
+               terminal_timing.latest_generation.token == terminal_empty.token &&
+               terminal_timing.latest_generation.select.successful_operations ==
+                   1U &&
+               terminal_timing.latest_generation.dedup.successful_operations ==
+                   1U &&
+               terminal_timing.latest_generation.features.successful_operations ==
+                   0U &&
+               terminal_timing.latest_generation.backup.successful_operations ==
+                   0U,
+           "terminal-only generation publishes select and dedup timing");
+    expect_finite_timing_stage(
+        terminal_timing.latest_generation.select,
+        "terminal-only select timing is finite and bounded");
+    expect_finite_timing_stage(
+        terminal_timing.latest_generation.dedup,
+        "terminal-only dedup timing is finite and bounded");
+}
+
 }  // namespace
 
 int main() {
@@ -1174,6 +1363,7 @@ int main() {
         test_lifecycle_rejection_and_lowest_free_reuse();
         test_strong_replacement_and_seed_progression();
         test_worker_equivalence_after_lifecycle_changes();
+        test_search_batch_timing_telemetry();
     } catch (const std::exception& failure) {
         std::cerr << "FAIL: " << failure.what() << '\n';
         return 1;

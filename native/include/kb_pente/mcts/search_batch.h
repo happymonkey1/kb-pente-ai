@@ -88,6 +88,76 @@ struct DeduplicationTelemetry final {
     return !(left == right);
 }
 
+// SearchBatchStageTelemetry is a detached report for one class of native
+// batch operation. Worker metrics are zero for the serial deduplication
+// stage and aggregate every successful operation represented by the report.
+struct SearchBatchStageTelemetry final {
+    std::uint64_t successful_operations = 0U;
+    BatchToken token = kInvalidBatchToken;
+    double wall_seconds = 0.0;
+    WorkerPoolWaveTelemetry worker{};
+};
+
+[[nodiscard]] inline bool operator==(
+    const SearchBatchStageTelemetry& left,
+    const SearchBatchStageTelemetry& right) noexcept {
+    return left.successful_operations == right.successful_operations &&
+           left.token == right.token &&
+           left.wall_seconds == right.wall_seconds &&
+           left.worker == right.worker;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const SearchBatchStageTelemetry& left,
+    const SearchBatchStageTelemetry& right) noexcept {
+    return !(left == right);
+}
+
+// SearchBatchGenerationTelemetry contains timing for one generation. A
+// generation starts with select and deduplication; feature and backup stages
+// can then accumulate repeated successful calls for that same token.
+struct SearchBatchGenerationTelemetry final {
+    BatchToken token = kInvalidBatchToken;
+    SearchBatchStageTelemetry select{};
+    SearchBatchStageTelemetry dedup{};
+    SearchBatchStageTelemetry features{};
+    SearchBatchStageTelemetry backup{};
+};
+
+[[nodiscard]] inline bool operator==(
+    const SearchBatchGenerationTelemetry& left,
+    const SearchBatchGenerationTelemetry& right) noexcept {
+    return left.token == right.token && left.select == right.select &&
+           left.dedup == right.dedup && left.features == right.features &&
+           left.backup == right.backup;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const SearchBatchGenerationTelemetry& left,
+    const SearchBatchGenerationTelemetry& right) noexcept {
+    return !(left == right);
+}
+
+// SearchBatchTimingTelemetry keeps the latest generation separate from the
+// cumulative run totals so callers can inspect both one wave and the run.
+struct SearchBatchTimingTelemetry final {
+    SearchBatchGenerationTelemetry cumulative{};
+    SearchBatchGenerationTelemetry latest_generation{};
+};
+
+[[nodiscard]] inline bool operator==(
+    const SearchBatchTimingTelemetry& left,
+    const SearchBatchTimingTelemetry& right) noexcept {
+    return left.cumulative == right.cumulative &&
+           left.latest_generation == right.latest_generation;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const SearchBatchTimingTelemetry& left,
+    const SearchBatchTimingTelemetry& right) noexcept {
+    return !(left == right);
+}
+
 // Selection is a non-owning, slot-ordered view returned by SearchBatch::select.
 // It is invalidated by the next mutating SearchBatch operation.
 struct Selection final {
@@ -218,6 +288,12 @@ public:
     [[nodiscard]] DeduplicationTelemetry deduplication_telemetry() const noexcept {
         return deduplication_telemetry_;
     }
+    [[nodiscard]] SearchBatchTimingTelemetry timing_telemetry() const noexcept {
+        return timing_telemetry_;
+    }
+    [[nodiscard]] SearchBatchTimingTelemetry timing() const noexcept {
+        return timing_telemetry();
+    }
     [[nodiscard]] std::size_t thread_count() const noexcept {
         return worker_pool_.thread_count();
     }
@@ -287,6 +363,7 @@ private:
     BatchToken last_token_ = kInvalidBatchToken;
     BatchToken pending_token_ = kInvalidBatchToken;
     DeduplicationTelemetry deduplication_telemetry_{};
+    SearchBatchTimingTelemetry timing_telemetry_{};
     bool poisoned_ = false;
     WorkerPool worker_pool_;
 };

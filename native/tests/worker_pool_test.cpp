@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <iostream>
@@ -300,6 +301,17 @@ void test_exception_cancellation_and_reuse() {
            "exception waves drain in-flight callbacks");
     expect(calls.load(std::memory_order_relaxed) < count,
            "exception cancellation leaves unclaimed work uncalled");
+    const auto failed_telemetry = pool.telemetry();
+    expect(failed_telemetry.last_wave.items == count &&
+               std::isfinite(failed_telemetry.last_wave.wall_seconds) &&
+               std::isfinite(
+                   failed_telemetry.last_wave.callback_busy_seconds) &&
+               std::isfinite(failed_telemetry.last_wave.busy_fraction) &&
+               failed_telemetry.last_wave.wall_seconds >= 0.0 &&
+               failed_telemetry.last_wave.callback_busy_seconds >= 0.0 &&
+               failed_telemetry.last_wave.busy_fraction >= 0.0 &&
+               failed_telemetry.last_wave.busy_fraction <= 1.0,
+           "cancelled worker waves publish bounded telemetry");
 
     constexpr std::size_t reuse_count = 47U;
     std::vector<std::atomic<std::size_t>> reuse_calls(reuse_count);
@@ -315,6 +327,59 @@ void test_exception_cancellation_and_reuse() {
     }
 }
 
+void expect_finite_wave_telemetry(
+    const kb_pente::WorkerPoolWaveTelemetry& telemetry,
+    const char* message) {
+    expect(std::isfinite(telemetry.wall_seconds) &&
+               std::isfinite(telemetry.callback_busy_seconds) &&
+               std::isfinite(telemetry.busy_fraction),
+           message);
+    expect(telemetry.wall_seconds >= 0.0 &&
+               telemetry.callback_busy_seconds >= 0.0 &&
+               telemetry.busy_fraction >= 0.0 &&
+               telemetry.busy_fraction <= 1.0,
+           message);
+}
+
+void test_worker_telemetry() {
+    kb_pente::WorkerPool pool(3U);
+    const auto initial = pool.telemetry();
+    expect(initial.last_wave.items == 0U && initial.cumulative.items == 0U,
+           "worker telemetry starts with zero items");
+    expect(initial.last_wave.workers == 3U && initial.cumulative.workers == 3U,
+           "worker telemetry records configured worker count");
+    expect_finite_wave_telemetry(initial.last_wave,
+                                 "initial worker telemetry is finite");
+
+    pool.parallel_for(0U, [](std::size_t) {});
+    expect(pool.telemetry() == initial,
+           "zero-work waves do not perturb worker telemetry");
+
+    pool.parallel_for(11U, [](std::size_t) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    });
+    const auto first = pool.telemetry();
+    expect(first.last_wave.items == 11U && first.cumulative.items == 11U,
+           "successful worker wave records requested items");
+    expect_finite_wave_telemetry(first.last_wave,
+                                 "successful worker wave telemetry is finite");
+    expect(first.last_wave.workers == 3U,
+           "successful worker wave records configured workers");
+
+    pool.parallel_for(5U, [](std::size_t) {});
+    const auto second = pool.telemetry();
+    expect(second.last_wave.items == 5U && second.cumulative.items == 16U,
+           "worker telemetry separates last and cumulative item counts");
+    expect(second.cumulative.wall_seconds >= first.cumulative.wall_seconds &&
+               second.cumulative.callback_busy_seconds >=
+                   first.cumulative.callback_busy_seconds,
+           "worker telemetry durations are monotonic");
+    expect_finite_wave_telemetry(second.last_wave,
+                                 "reused worker wave telemetry is finite");
+    expect_finite_wave_telemetry(second.cumulative,
+                                 "cumulative worker telemetry is finite");
+}
+
 }  // namespace
 
 int main() {
@@ -327,6 +392,7 @@ int main() {
         test_nested_call_rejection();
         test_completed_wave_releases_callable();
         test_exception_cancellation_and_reuse();
+        test_worker_telemetry();
     } catch (const TestFailure& failure) {
         std::cerr << "worker pool test failure: " << failure.what() << '\n';
         return 1;

@@ -1,5 +1,6 @@
 #include "kb_pente/mcts/search_batch.h"
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -10,6 +11,114 @@
 namespace kb_pente {
 
 namespace {
+
+using TimingPoint = std::chrono::steady_clock::time_point;
+
+[[nodiscard]] double elapsed_seconds(
+    TimingPoint started,
+    TimingPoint finished) noexcept {
+    const double seconds =
+        std::chrono::duration<double>(finished - started).count();
+    if (!std::isfinite(seconds) || seconds < 0.0) {
+        return 0.0;
+    }
+    return seconds;
+}
+
+[[nodiscard]] std::uint64_t saturating_add(
+    std::uint64_t left,
+    std::uint64_t right) noexcept {
+    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return left + right;
+}
+
+[[nodiscard]] double add_finite_seconds(
+    double total,
+    double increment) noexcept {
+    if (!std::isfinite(total) || total < 0.0) {
+        total = 0.0;
+    }
+    if (!std::isfinite(increment) || increment < 0.0) {
+        increment = 0.0;
+    }
+    if (increment > std::numeric_limits<double>::max() - total) {
+        return std::numeric_limits<double>::max();
+    }
+    return total + increment;
+}
+
+[[nodiscard]] double bounded_busy_fraction(
+    double wall_seconds,
+    std::size_t workers,
+    double callback_busy_seconds) noexcept {
+    if (!std::isfinite(wall_seconds) || wall_seconds <= 0.0 ||
+        workers == 0U || !std::isfinite(callback_busy_seconds) ||
+        callback_busy_seconds <= 0.0) {
+        return 0.0;
+    }
+
+    const double capacity = wall_seconds * static_cast<double>(workers);
+    if (!std::isfinite(capacity) || capacity <= 0.0) {
+        return 1.0;
+    }
+    const double fraction = callback_busy_seconds / capacity;
+    if (!std::isfinite(fraction) || fraction >= 1.0) {
+        return 1.0;
+    }
+    return fraction <= 0.0 ? 0.0 : fraction;
+}
+
+void accumulate_worker_telemetry(
+    WorkerPoolWaveTelemetry& destination,
+    const WorkerPoolWaveTelemetry& source) noexcept {
+    destination.items = saturating_add(destination.items, source.items);
+    destination.workers = source.workers;
+    destination.wall_seconds =
+        add_finite_seconds(destination.wall_seconds, source.wall_seconds);
+    destination.callback_busy_seconds = add_finite_seconds(
+        destination.callback_busy_seconds,
+        source.callback_busy_seconds);
+    destination.busy_fraction = bounded_busy_fraction(
+        destination.wall_seconds,
+        destination.workers,
+        destination.callback_busy_seconds);
+}
+
+void accumulate_stage_telemetry(
+    SearchBatchStageTelemetry& destination,
+    BatchToken token,
+    double wall_seconds,
+    const WorkerPoolWaveTelemetry& worker) noexcept {
+    destination.successful_operations = saturating_add(
+        destination.successful_operations,
+        1U);
+    destination.token = token;
+    destination.wall_seconds =
+        add_finite_seconds(destination.wall_seconds, wall_seconds);
+    accumulate_worker_telemetry(destination.worker, worker);
+}
+
+void publish_stage_timing(
+    SearchBatchTimingTelemetry& telemetry,
+    SearchBatchStageTelemetry SearchBatchGenerationTelemetry::* stage,
+    BatchToken token,
+    double wall_seconds,
+    const WorkerPoolWaveTelemetry& worker) noexcept {
+    telemetry.latest_generation.token = token;
+    telemetry.cumulative.token = token;
+    accumulate_stage_telemetry(
+        telemetry.latest_generation.*stage,
+        token,
+        wall_seconds,
+        worker);
+    accumulate_stage_telemetry(
+        telemetry.cumulative.*stage,
+        token,
+        wall_seconds,
+        worker);
+}
 
 [[nodiscard]] bool multiplication_fits(
     std::size_t left,
@@ -113,6 +222,11 @@ Selection SearchBatch::select() {
         scratch.leaf = kInvalidNode;
     }
 
+    const TimingPoint select_started = std::chrono::steady_clock::now();
+    double select_seconds = 0.0;
+    double dedup_seconds = 0.0;
+    WorkerPoolWaveTelemetry select_worker{};
+    WorkerPoolWaveTelemetry dedup_worker{};
     try {
         worker_pool_.parallel_for(
             slots_.size(), [this](std::size_t slot_index) {
@@ -126,7 +240,11 @@ Selection SearchBatch::select() {
                     selection_scratch_[slot_index].leaf = *leaf;
                 }
             });
+        const TimingPoint select_finished = std::chrono::steady_clock::now();
+        select_seconds = elapsed_seconds(select_started, select_finished);
+        select_worker = worker_pool_.telemetry().last_wave;
 
+        const TimingPoint dedup_started = std::chrono::steady_clock::now();
         for (SlotId slot = 0U; slot < slots_.size(); ++slot) {
             const SelectionScratch& scratch = selection_scratch_[slot];
             if (!scratch.has_request) {
@@ -162,6 +280,9 @@ Selection SearchBatch::select() {
             });
         }
         update_deduplication_telemetry();
+        dedup_seconds = elapsed_seconds(
+            dedup_started,
+            std::chrono::steady_clock::now());
     } catch (...) {
         poison();
         throw;
@@ -171,6 +292,19 @@ Selection SearchBatch::select() {
     if (!requests_.empty()) {
         pending_token_ = last_token_;
     }
+    timing_telemetry_.latest_generation = SearchBatchGenerationTelemetry{};
+    publish_stage_timing(
+        timing_telemetry_,
+        &SearchBatchGenerationTelemetry::select,
+        last_token_,
+        select_seconds,
+        select_worker);
+    publish_stage_timing(
+        timing_telemetry_,
+        &SearchBatchGenerationTelemetry::dedup,
+        last_token_,
+        dedup_seconds,
+        dedup_worker);
     return Selection{
         last_token_,
         requests_.data(),
@@ -243,6 +377,7 @@ void SearchBatch::write_features(
         candidate.position->validate();
     }
 
+    const TimingPoint feature_started = std::chrono::steady_clock::now();
     worker_pool_.parallel_for(
         unique_rows,
         [this, output](std::size_t index) {
@@ -254,6 +389,12 @@ void SearchBatch::write_features(
                 *candidate.position,
                 output + index * row_elements);
         });
+    publish_stage_timing(
+        timing_telemetry_,
+        &SearchBatchGenerationTelemetry::features,
+        token,
+        elapsed_seconds(feature_started, std::chrono::steady_clock::now()),
+        worker_pool_.telemetry().last_wave);
 }
 
 void SearchBatch::backup(
@@ -298,6 +439,7 @@ void SearchBatch::backup(
         }
     }
 
+    const TimingPoint backup_started = std::chrono::steady_clock::now();
     try {
         worker_pool_.parallel_for(
             inference_workspace_.raw_count(),
@@ -329,6 +471,12 @@ void SearchBatch::backup(
     pending_token_ = kInvalidBatchToken;
     requests_.clear();
     inference_workspace_.clear();
+    publish_stage_timing(
+        timing_telemetry_,
+        &SearchBatchGenerationTelemetry::backup,
+        token,
+        elapsed_seconds(backup_started, std::chrono::steady_clock::now()),
+        worker_pool_.telemetry().last_wave);
 }
 
 bool SearchBatch::complete() const noexcept {
