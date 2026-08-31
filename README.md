@@ -195,7 +195,31 @@ Training writes JSONL records with a stable schema. Current metrics include:
 
 Passing `--gpu` is strict. Training exits with a diagnostic if Torch cannot access CUDA; it never silently falls back to CPU. WSL GPU access may need to be granted outside a restricted execution sandbox even when `nvidia-smi` works in an ordinary WSL terminal.
 
-The implementation journal and original diagnosis are stored in the kb-pente-ai Codex vault.
+## Monitoring dashboard
 
-The local browser dashboard and its opt-in test launcher are documented in
-[`docs/monitoring.md`](docs/monitoring.md).
+Start the local monitoring server from the repository root:
+
+~~~bash
+./script/run-venv.sh python -m src.monitoring \
+  --metrics-root metrics \
+  --replay-root replays
+~~~
+
+Open `http://127.0.0.1:8765`. The server watches JSONL telemetry beneath `metrics` and refreshes the dashboard every two seconds. It also finds run manifests in the current directory and immediate child directories for the NN architecture view. Add other model locations by repeating `--manifest-root PATH`.
+
+Test launching is disabled by default. To enable the reviewed sample catalog:
+
+~~~bash
+./script/run-venv.sh python -m src.monitoring \
+  --metrics-root metrics \
+  --replay-root replays \
+  --test-config docs/monitoring-tests.example.json \
+  --test-root . \
+  --test-log-root .monitoring/test-runs
+~~~
+
+The Replay tab reads safe JSONL samples beneath `--replay-root`. Training does not currently emit these browser samples automatically; replay-buffer `.pkl` checkpoints are not browser replay files.
+
+See [`docs/monitoring.md`](docs/monitoring.md) for manifest fields, CPU and CUDA metrics, replay sample format, APIs, security limits, and test catalog configuration.
+
+The implementation journal and original diagnosis are stored in the kb-pente-ai Codex vault.
