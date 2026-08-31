@@ -38,12 +38,23 @@ namespace {
 
 using kb_pente::Action;
 using kb_pente::BatchToken;
+using kb_pente::DeduplicationStats;
+using kb_pente::DeduplicationTelemetry;
+using kb_pente::GameStatus;
 using kb_pente::Position;
+using kb_pente::RootAdvanceStats;
 using kb_pente::Ruleset;
 using kb_pente::SearchBatch;
 using kb_pente::SearchConfig;
+using kb_pente::SearchBatchGenerationTelemetry;
+using kb_pente::SearchBatchStageTelemetry;
+using kb_pente::SearchBatchTimingTelemetry;
 using kb_pente::SearchSessionConfig;
+using kb_pente::SearchTelemetry;
 using kb_pente::SlotId;
+using kb_pente::TerminalResult;
+using kb_pente::WinReason;
+using kb_pente::WorkerPoolWaveTelemetry;
 
 constexpr std::size_t kConstructorOptionCount = 10U;
 
@@ -102,6 +113,16 @@ constexpr std::size_t kConstructorOptionCount = 10U;
         throw py::value_error(std::string(name) + " is out of range");
     }
     return static_cast<std::uint32_t>(parsed);
+}
+
+[[nodiscard]] Action parse_action(
+    const py::handle& value,
+    const char* name) {
+    const std::uint64_t parsed = parse_unsigned(value, name);
+    if (parsed > std::numeric_limits<Action>::max()) {
+        throw py::value_error(std::string(name) + " is out of range");
+    }
+    return static_cast<Action>(parsed);
 }
 
 [[nodiscard]] float parse_float(
@@ -392,6 +413,137 @@ void validate_staging_tensor(
     }
 }
 
+[[nodiscard]] const char* terminal_status_name(GameStatus status) {
+    switch (status) {
+        case GameStatus::InProgress:
+            return "in_progress";
+        case GameStatus::Draw:
+            return "draw";
+        case GameStatus::Win:
+            return "win";
+    }
+    throw std::logic_error("TerminalResult has an unknown status");
+}
+
+[[nodiscard]] const char* terminal_reason_name(WinReason reason) {
+    switch (reason) {
+        case WinReason::None:
+            return "none";
+        case WinReason::Line:
+            return "line";
+        case WinReason::Capture:
+            return "capture";
+    }
+    throw std::logic_error("TerminalResult has an unknown reason");
+}
+
+[[nodiscard]] py::dict terminal_result_to_dict(
+    const TerminalResult& terminal) {
+    py::dict result;
+    result["status"] = terminal_status_name(terminal.status);
+    result["reason"] = terminal_reason_name(terminal.reason);
+    if (terminal.winner.has_value()) {
+        result["winner"] = static_cast<int>(*terminal.winner);
+    } else {
+        result["winner"] = py::none();
+    }
+    return result;
+}
+
+[[nodiscard]] py::dict root_advance_stats_to_dict(
+    const RootAdvanceStats& stats) {
+    py::dict result;
+    result["reused_subtree"] = stats.reused_subtree;
+    result["previous_node_count"] = stats.previous_node_count;
+    result["retained_node_count"] = stats.retained_node_count;
+    result["discarded_node_count"] = stats.discarded_node_count;
+    result["previous_owned_bytes"] = stats.previous_owned_bytes;
+    result["new_owned_bytes"] = stats.new_owned_bytes;
+    return result;
+}
+
+[[nodiscard]] py::dict search_telemetry_to_dict(
+    const SearchTelemetry& telemetry) {
+    py::dict result;
+    result["completed_simulations"] = telemetry.completed_simulations;
+    result["evaluator_completions"] = telemetry.evaluator_completions;
+    result["terminal_simulations"] = telemetry.terminal_simulations;
+    result["selected_leaves"] = telemetry.selected_leaves;
+    result["max_selected_path_depth"] = telemetry.max_selected_path_depth;
+    result["root_legal_actions"] = telemetry.root_legal_actions;
+    result["root_edge_visits"] = telemetry.root_edge_visits;
+    result["root_children_visited"] = telemetry.root_children_visited;
+    result["root_visit_entropy"] = telemetry.root_visit_entropy;
+    result["root_max_visit_share"] = telemetry.root_max_visit_share;
+    result["root_collapse_eligible"] = telemetry.root_collapse_eligible;
+    result["root_search_collapsed"] = telemetry.root_search_collapsed;
+    result["invalid_policy_fallbacks"] = telemetry.invalid_policy_fallbacks;
+    result["zero_visit_fallbacks"] = telemetry.zero_visit_fallbacks;
+    return result;
+}
+
+[[nodiscard]] py::dict deduplication_stats_to_dict(
+    const DeduplicationStats& stats) {
+    py::dict result;
+    result["selection_waves"] = stats.selection_waves;
+    result["raw_evaluation_requests"] = stats.raw_evaluation_requests;
+    result["unique_evaluations"] = stats.unique_evaluations;
+    result["eliminated_duplicate_evaluations"] =
+        stats.eliminated_duplicate_evaluations;
+    result["duplicate_leaf_rate"] = stats.duplicate_leaf_rate;
+    return result;
+}
+
+[[nodiscard]] py::dict deduplication_telemetry_to_dict(
+    const DeduplicationTelemetry& telemetry) {
+    py::dict result;
+    result["cumulative"] = deduplication_stats_to_dict(telemetry.cumulative);
+    result["last_wave"] = deduplication_stats_to_dict(telemetry.last_wave);
+    return result;
+}
+
+[[nodiscard]] py::dict worker_telemetry_to_dict(
+    const WorkerPoolWaveTelemetry& telemetry) {
+    py::dict result;
+    result["items"] = telemetry.items;
+    result["workers"] = telemetry.workers;
+    result["wall_seconds"] = telemetry.wall_seconds;
+    result["callback_busy_seconds"] = telemetry.callback_busy_seconds;
+    result["busy_fraction"] = telemetry.busy_fraction;
+    return result;
+}
+
+[[nodiscard]] py::dict stage_telemetry_to_dict(
+    const SearchBatchStageTelemetry& telemetry) {
+    py::dict result;
+    result["successful_operations"] = telemetry.successful_operations;
+    result["token"] = telemetry.token;
+    result["wall_seconds"] = telemetry.wall_seconds;
+    result["worker"] = worker_telemetry_to_dict(telemetry.worker);
+    return result;
+}
+
+[[nodiscard]] py::dict generation_telemetry_to_dict(
+    const SearchBatchGenerationTelemetry& telemetry) {
+    py::dict result;
+    result["token"] = telemetry.token;
+    result["select"] = stage_telemetry_to_dict(telemetry.select);
+    result["dedup"] = stage_telemetry_to_dict(telemetry.dedup);
+    result["features"] = stage_telemetry_to_dict(telemetry.features);
+    result["backup"] = stage_telemetry_to_dict(telemetry.backup);
+    return result;
+}
+
+[[nodiscard]] py::dict timing_telemetry_to_dict(
+    const SearchBatchTimingTelemetry& telemetry) {
+    py::dict result;
+    result["cumulative"] =
+        generation_telemetry_to_dict(telemetry.cumulative);
+    result["latest_generation"] =
+        generation_telemetry_to_dict(telemetry.latest_generation);
+    return result;
+}
+
 class SelectionBatch final {
 public:
     SelectionBatch(
@@ -587,23 +739,130 @@ public:
 
     [[nodiscard]] torch::Tensor root_policy(const py::object& slot) {
         const SlotId parsed_slot = parse_size(slot, "slot");
-        const auto options = torch::TensorOptions()
-                                 .dtype(torch::kFloat32)
-                                 .device(torch::kCPU);
-        torch::Tensor result = torch::empty(
-            {static_cast<std::int64_t>(kb_pente::board_area(board_size_))},
-            options);
         std::array<float, kb_pente::kMaxActions> policy{};
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> lock(mutex_);
             policy = batch_.root_policy(parsed_slot);
         }
+
+        const auto options = torch::TensorOptions()
+                                 .dtype(torch::kFloat32)
+                                 .device(torch::kCPU);
+        torch::Tensor result = torch::empty(
+            {static_cast<std::int64_t>(kb_pente::board_area(board_size_))},
+            options);
         std::copy_n(
             policy.data(),
             kb_pente::board_area(board_size_),
             result.data_ptr<float>());
         return result;
+    }
+
+    [[nodiscard]] py::dict advance_root(
+        const py::object& slot,
+        const py::object& action,
+        const py::object& temperature,
+        const py::object& add_root_noise) {
+        const SlotId parsed_slot = parse_size(slot, "slot");
+        const Action parsed_action = parse_action(action, "action");
+        const SearchSessionConfig session_config(
+            parse_float(temperature, "temperature"),
+            parse_bool(add_root_noise, "add_root_noise"));
+
+        RootAdvanceStats stats{};
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats = batch_.advance_root(
+                parsed_slot,
+                parsed_action,
+                session_config);
+        }
+        return root_advance_stats_to_dict(stats);
+    }
+
+    void remove(const py::object& slot) {
+        const SlotId parsed_slot = parse_size(slot, "slot");
+        py::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(mutex_);
+        batch_.remove(parsed_slot);
+    }
+
+    void replace_root(
+        const py::object& slot,
+        const torch::Tensor& stones,
+        const torch::Tensor& captures,
+        const py::object& current_player,
+        const py::object& ply,
+        const py::object& last_action,
+        const py::object& temperature,
+        const py::object& add_root_noise) {
+        const SlotId parsed_slot = parse_size(slot, "slot");
+        const std::int64_t parsed_current_player =
+            parse_signed(current_player, "current_player");
+        const std::int64_t parsed_ply = parse_signed(ply, "ply");
+        const SearchSessionConfig session_config(
+            parse_float(temperature, "temperature"),
+            parse_bool(add_root_noise, "add_root_noise"));
+        Position position = import_position(
+            stones,
+            captures,
+            parsed_current_player,
+            parsed_ply,
+            last_action,
+            board_size_,
+            ruleset_);
+
+        py::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(mutex_);
+        batch_.replace_root(
+            parsed_slot,
+            std::move(position),
+            ruleset_,
+            session_config);
+    }
+
+    [[nodiscard]] py::dict root_terminal(const py::object& slot) const {
+        const SlotId parsed_slot = parse_size(slot, "slot");
+        TerminalResult terminal{};
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            terminal = batch_.root_terminal(parsed_slot);
+        }
+        return terminal_result_to_dict(terminal);
+    }
+
+    [[nodiscard]] py::dict slot_telemetry(const py::object& slot) const {
+        const SlotId parsed_slot = parse_size(slot, "slot");
+        SearchTelemetry telemetry{};
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            telemetry = batch_.slot_telemetry(parsed_slot);
+        }
+        return search_telemetry_to_dict(telemetry);
+    }
+
+    [[nodiscard]] py::dict deduplication_telemetry() const {
+        DeduplicationTelemetry telemetry{};
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            telemetry = batch_.deduplication_telemetry();
+        }
+        return deduplication_telemetry_to_dict(telemetry);
+    }
+
+    [[nodiscard]] py::dict timing_telemetry() const {
+        SearchBatchTimingTelemetry telemetry{};
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            telemetry = batch_.timing_telemetry();
+        }
+        return timing_telemetry_to_dict(telemetry);
     }
 
     [[nodiscard]] bool complete() const {
@@ -631,6 +890,7 @@ public:
         std::size_t active_count_value = 0U;
         std::size_t capacity_value = 0U;
         bool pending_value = false;
+        bool poisoned_value = false;
         BatchToken pending_token_value = kb_pente::kInvalidBatchToken;
         std::size_t pending_rows_value = 0U;
         std::size_t pending_raw_rows_value = 0U;
@@ -638,6 +898,7 @@ public:
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> lock(mutex_);
             complete_value = batch_.complete();
+            poisoned_value = batch_.poisoned();
             active_count_value = batch_.active_count();
             capacity_value = batch_.capacity();
             pending_value = batch_.has_pending();
@@ -647,6 +908,7 @@ public:
         }
         py::dict result;
         result["complete"] = complete_value;
+        result["poisoned"] = poisoned_value;
         result["active_count"] = active_count_value;
         result["capacity"] = capacity_value;
         result["pending"] = pending_value;
@@ -783,6 +1045,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
             py::arg("token"),
             py::arg("rows"))
         .def("root_policy", &SearchBatchBinding::root_policy, py::arg("slot"))
+        .def(
+            "advance_root",
+            &SearchBatchBinding::advance_root,
+            py::arg("slot"),
+            py::arg("action"),
+            py::arg("temperature") = 1.0F,
+            py::arg("add_root_noise") = false)
+        .def(
+            "remove",
+            &SearchBatchBinding::remove,
+            py::arg("slot"))
+        .def(
+            "replace_root",
+            &SearchBatchBinding::replace_root,
+            py::arg("slot"),
+            py::arg("stones"),
+            py::arg("captures"),
+            py::arg("current_player"),
+            py::arg("ply"),
+            py::arg("last_action") = py::none(),
+            py::arg("temperature") = 1.0F,
+            py::arg("add_root_noise") = false)
+        .def(
+            "root_terminal",
+            &SearchBatchBinding::root_terminal,
+            py::arg("slot"))
+        .def(
+            "slot_telemetry",
+            &SearchBatchBinding::slot_telemetry,
+            py::arg("slot"))
+        .def(
+            "deduplication_telemetry",
+            &SearchBatchBinding::deduplication_telemetry)
+        .def("timing_telemetry", &SearchBatchBinding::timing_telemetry)
         .def("complete", &SearchBatchBinding::complete)
         .def("slot_active", &SearchBatchBinding::slot_active, py::arg("slot"))
         .def(

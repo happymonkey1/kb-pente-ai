@@ -14,6 +14,48 @@ def _initial_root(board_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+def _draw_root() -> tuple[torch.Tensor, torch.Tensor]:
+    stones = torch.tensor(
+        [
+            [1, 1, -1, -1, 1],
+            [-1, -1, 1, 1, -1],
+            [1, 1, -1, -1, 1],
+            [-1, -1, 1, 1, -1],
+            [1, -1, 1, -1, 0],
+        ],
+        dtype=torch.int8,
+    )
+    return stones, torch.zeros(2, dtype=torch.int16)
+
+
+def _terminal_draw_root() -> tuple[torch.Tensor, torch.Tensor]:
+    stones, captures = _draw_root()
+    stones[-1, -1] = 1
+    return stones, captures
+
+
+def _capture_win_root() -> tuple[torch.Tensor, torch.Tensor]:
+    stones, _ = _initial_root(5)
+    stones[0, 1] = -1
+    stones[0, 2] = -1
+    stones[0, 3] = 1
+    stones[0, 4] = -1
+    return stones, torch.tensor([4, 0], dtype=torch.int16)
+
+
+def _backup_one_hot(batch, selected, action: int = 0) -> None:
+    batch.policies[: selected.size].zero_()
+    batch.policies[: selected.size, action] = 1.0
+    batch.values[: selected.size].zero_()
+    batch.backup(selected.token, selected.size)
+
+
+def _run_to_completion(batch) -> None:
+    while not batch.complete():
+        selected = batch.select()
+        _backup_one_hot(batch, selected)
+
+
 class SearchBatchBindingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -32,6 +74,7 @@ class SearchBatchBindingTests(unittest.TestCase):
 
     def test_staging_shapes_cpu_unpinned_and_shared_feature_storage(self) -> None:
         batch = self.make_batch()
+        self.assertFalse(batch.status()["poisoned"])
         self.assertEqual(tuple(batch.features.shape), (4, 4, 5, 5))
         self.assertEqual(tuple(batch.policies.shape), (4, 361))
         self.assertEqual(tuple(batch.values.shape), (4,))
@@ -261,6 +304,10 @@ while worker.is_alive() and time.monotonic() < deadline:
     _ = batch.has_pending
     _ = batch.pending_token
     _ = batch.last_token
+    batch.root_terminal(0)
+    batch.slot_telemetry(0)
+    batch.deduplication_telemetry()
+    batch.timing_telemetry()
     time.sleep(0)
 
 worker.join(timeout=2.0)
@@ -325,6 +372,329 @@ if getter_iterations < 2:
         batch.policies[: selected.size, 0] = 1.0
         batch.values[: selected.size].zero_()
         batch.backup(selected.token, selected.size)
+
+    def test_root_advance_returns_detached_stats_and_applies_session_settings(self) -> None:
+        batch = self.make_batch(simulations=1)
+        stones, captures = _initial_root(5)
+        slot = batch.add(stones, captures, 1, 0)
+        selected = batch.select()
+        _backup_one_hot(batch, selected)
+
+        stats = batch.advance_root(
+            slot,
+            0,
+            temperature=0.0,
+            add_root_noise=False,
+        )
+        self.assertEqual(
+            set(stats),
+            {
+                "reused_subtree",
+                "previous_node_count",
+                "retained_node_count",
+                "discarded_node_count",
+                "previous_owned_bytes",
+                "new_owned_bytes",
+            },
+        )
+        self.assertFalse(stats["reused_subtree"])
+        self.assertEqual(stats["retained_node_count"], 1)
+        self.assertTrue(batch.slot_active(slot))
+        self.assertFalse(batch.slot_complete(slot))
+
+        _run_to_completion(batch)
+        policy = batch.root_policy(slot)
+        self.assertEqual(float(policy.sum()), 1.0)
+        self.assertEqual(float(policy[1]), 1.0)
+
+    def test_terminal_mapping_remove_and_lowest_free_reuse(self) -> None:
+        batch = self.extension.SearchBatch(
+            board_size=5,
+            ruleset="freestyle",
+            simulations=1,
+            active_games=2,
+            threads=2,
+            seed=103,
+            pin_memory=False,
+        )
+        stones, captures = _draw_root()
+        terminal_slot = batch.add(stones, captures, 1, 24)
+        self.assertEqual(
+            batch.root_terminal(terminal_slot),
+            {"status": "in_progress", "reason": "none", "winner": None},
+        )
+        selected = batch.select()
+        _backup_one_hot(batch, selected, 24)
+        batch.advance_root(terminal_slot, 24)
+
+        self.assertEqual(
+            batch.root_terminal(terminal_slot),
+            {"status": "draw", "reason": "none", "winner": None},
+        )
+        self.assertTrue(batch.slot_complete(terminal_slot))
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.slot_telemetry(terminal_slot)
+
+        peer = batch.add(*_initial_root(5), current_player=1, ply=0)
+        self.assertEqual(peer, 1)
+        _run_to_completion(batch)
+        batch.remove(terminal_slot)
+        self.assertFalse(batch.slot_active(terminal_slot))
+        reused = batch.add(*_initial_root(5), current_player=1, ply=0)
+        self.assertEqual(reused, terminal_slot)
+
+        line_batch = self.extension.SearchBatch(
+            board_size=5,
+            ruleset="freestyle",
+            simulations=1,
+            active_games=1,
+            threads=1,
+            seed=103,
+            pin_memory=False,
+        )
+        line_stones, line_captures = _initial_root(5)
+        line_stones[0, :4] = 1
+        line_slot = line_batch.add(line_stones, line_captures, 1, 4)
+        line_selection = line_batch.select()
+        _backup_one_hot(line_batch, line_selection, 4)
+        line_batch.advance_root(line_slot, 4)
+        self.assertEqual(
+            line_batch.root_terminal(line_slot),
+            {"status": "win", "reason": "line", "winner": 1},
+        )
+
+        capture_batch = self.extension.SearchBatch(
+            board_size=5,
+            ruleset="freestyle",
+            simulations=1,
+            active_games=1,
+            threads=1,
+            seed=103,
+            pin_memory=False,
+        )
+        capture_stones, capture_counts = _capture_win_root()
+        capture_slot = capture_batch.add(
+            capture_stones,
+            capture_counts,
+            1,
+            12,
+        )
+        capture_selection = capture_batch.select()
+        _backup_one_hot(capture_batch, capture_selection, 0)
+        capture_batch.advance_root(capture_slot, 0)
+        self.assertEqual(
+            capture_batch.root_terminal(capture_slot),
+            {"status": "win", "reason": "capture", "winner": 1},
+        )
+
+    def test_advance_rejection_is_retryable(self) -> None:
+        batch = self.make_batch(simulations=1)
+        stones, captures = _initial_root(5)
+        slot = batch.add(stones, captures, 1, 0)
+
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.advance_root(slot, 0)
+        self.assertFalse(batch.slot_complete(slot))
+
+        selected = batch.select()
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.advance_root(slot, 0)
+        self.assertTrue(batch.has_pending)
+        _backup_one_hot(batch, selected)
+
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.advance_root(slot, 25)
+        self.assertTrue(batch.slot_complete(slot))
+        batch.advance_root(slot, 0)
+        self.assertFalse(batch.slot_complete(slot))
+
+    def test_strict_replace_rejection_is_retryable(self) -> None:
+        batch = self.make_batch(simulations=1)
+        stones, captures = _initial_root(5)
+        slot = batch.add(stones, captures, 1, 0)
+        selected = batch.select()
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.remove(slot)
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.replace_root(slot, stones, captures, 1, 0)
+        self.assertTrue(batch.has_pending)
+        _backup_one_hot(batch, selected)
+
+        with self.assertRaises(ValueError):
+            batch.replace_root(slot, *_terminal_draw_root(), -1, 25)
+        self.assertTrue(batch.slot_complete(slot))
+
+        batch.replace_root(
+            slot,
+            stones,
+            captures,
+            1,
+            0,
+            temperature=0.0,
+            add_root_noise=False,
+        )
+        self.assertFalse(batch.slot_complete(slot))
+
+        with self.assertRaises(ValueError):
+            batch.replace_root(
+                slot,
+                torch.zeros((6, 6), dtype=torch.int8),
+                captures,
+                1,
+                0,
+            )
+        self.assertFalse(batch.slot_complete(slot))
+
+    def test_detached_search_dedup_and_timing_schemas(self) -> None:
+        batch = self.make_batch(simulations=2)
+        stones, captures = _initial_root(5)
+        first = batch.add(stones, captures, 1, 0)
+        second = batch.add(stones.clone(), captures.clone(), 1, 0)
+        selected = batch.select()
+
+        search = batch.slot_telemetry(first)
+        self.assertEqual(
+            set(search),
+            {
+                "completed_simulations",
+                "evaluator_completions",
+                "terminal_simulations",
+                "selected_leaves",
+                "max_selected_path_depth",
+                "root_legal_actions",
+                "root_edge_visits",
+                "root_children_visited",
+                "root_visit_entropy",
+                "root_max_visit_share",
+                "root_collapse_eligible",
+                "root_search_collapsed",
+                "invalid_policy_fallbacks",
+                "zero_visit_fallbacks",
+            },
+        )
+        self.assertEqual(search["selected_leaves"], 1)
+        self.assertEqual(search["root_legal_actions"], 25)
+
+        dedup = batch.deduplication_telemetry()
+        self.assertEqual(set(dedup), {"cumulative", "last_wave"})
+        self.assertEqual(
+            dedup["last_wave"],
+            {
+                "selection_waves": 1,
+                "raw_evaluation_requests": 2,
+                "unique_evaluations": 1,
+                "eliminated_duplicate_evaluations": 1,
+                "duplicate_leaf_rate": 0.5,
+            },
+        )
+        self.assertEqual(dedup["cumulative"], dedup["last_wave"])
+        dedup["cumulative"]["raw_evaluation_requests"] = 999
+        self.assertEqual(
+            batch.deduplication_telemetry()["cumulative"][
+                "raw_evaluation_requests"
+            ],
+            2,
+        )
+
+        timing = batch.timing_telemetry()
+        self.assertEqual(set(timing), {"cumulative", "latest_generation"})
+        latest = timing["latest_generation"]
+        self.assertEqual(
+            set(latest), {"token", "select", "dedup", "features", "backup"}
+        )
+        self.assertEqual(latest["token"], selected.token)
+        self.assertEqual(latest["select"]["successful_operations"], 1)
+        self.assertEqual(latest["dedup"]["successful_operations"], 1)
+        self.assertEqual(latest["features"]["successful_operations"], 1)
+        self.assertEqual(latest["backup"]["successful_operations"], 0)
+        self.assertEqual(
+            set(latest["select"]["worker"]),
+            {
+                "items",
+                "workers",
+                "wall_seconds",
+                "callback_busy_seconds",
+                "busy_fraction",
+            },
+        )
+        self.assertEqual(latest["select"]["worker"]["items"], 4)
+        self.assertEqual(latest["select"]["worker"]["workers"], 2)
+        self.assertEqual(latest["dedup"]["worker"]["workers"], 0)
+        expected_stage_keys = {
+            "successful_operations",
+            "token",
+            "wall_seconds",
+            "worker",
+        }
+        expected_worker_keys = {
+            "items",
+            "workers",
+            "wall_seconds",
+            "callback_busy_seconds",
+            "busy_fraction",
+        }
+        for stage_name in ("select", "dedup", "features", "backup"):
+            self.assertEqual(set(latest[stage_name]), expected_stage_keys)
+            self.assertEqual(
+                set(latest[stage_name]["worker"]), expected_worker_keys
+            )
+        latest["select"]["worker"]["items"] = 999
+        self.assertEqual(
+            batch.timing_telemetry()["latest_generation"]["select"]["worker"][
+                "items"
+            ],
+            4,
+        )
+
+        before = batch.timing_telemetry()
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.backup(selected.token + 1, selected.size)
+        self.assertEqual(batch.timing_telemetry(), before)
+
+        _backup_one_hot(batch, selected)
+        self.assertTrue(batch.complete() is False)
+        second_selection = batch.select()
+        _backup_one_hot(batch, second_selection)
+        after = batch.timing_telemetry()
+        self.assertEqual(after["cumulative"]["select"]["successful_operations"], 2)
+        self.assertEqual(
+            after["latest_generation"]["token"], second_selection.token
+        )
+        self.assertEqual(
+            batch.deduplication_telemetry()["cumulative"]["selection_waves"],
+            2,
+        )
+        for generation in (after["cumulative"], after["latest_generation"]):
+            for stage_name in ("select", "dedup", "features", "backup"):
+                self.assertEqual(set(generation[stage_name]), expected_stage_keys)
+                self.assertEqual(
+                    set(generation[stage_name]["worker"]), expected_worker_keys
+                )
+        self.assertEqual(after["latest_generation"]["select"]["token"], 2)
+        self.assertEqual(after["latest_generation"]["dedup"]["token"], 2)
+        self.assertEqual(after["latest_generation"]["features"]["token"], 2)
+        self.assertEqual(after["latest_generation"]["backup"]["token"], 2)
+        self.assertEqual(after["latest_generation"]["backup"]["successful_operations"], 1)
+        self.assertEqual(after["latest_generation"]["backup"]["worker"]["items"], 2)
+        self.assertEqual(after["cumulative"]["backup"]["successful_operations"], 2)
+        self.assertEqual(after["cumulative"]["backup"]["worker"]["items"], 4)
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 1)
+
+        def assert_finite_nonnegative(value) -> None:
+            if isinstance(value, dict):
+                for child in value.values():
+                    assert_finite_nonnegative(child)
+            elif isinstance(value, float):
+                self.assertGreaterEqual(value, 0.0)
+                self.assertTrue(torch.isfinite(torch.tensor(value)))
+
+        assert_finite_nonnegative(after)
+        for generation in (after["cumulative"], after["latest_generation"]):
+            for stage_name in ("select", "dedup", "features", "backup"):
+                worker = generation[stage_name]["worker"]
+                self.assertGreaterEqual(worker["busy_fraction"], 0.0)
+                self.assertLessEqual(worker["busy_fraction"], 1.0)
 
 
 if __name__ == "__main__":
