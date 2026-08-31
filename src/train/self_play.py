@@ -122,6 +122,8 @@ class SelfPlayTrainer:
             self.args.temp_threshold,
             self.rng,
             deduplicate_evaluations=self.device.type != "cuda",
+            search_backend=self.args.search_backend,
+            native_worker_threads=self.args.native_worker_threads,
         )
 
     def _default_resume_replay_path(self, expected_generation: int | None) -> str:

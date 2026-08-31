@@ -41,6 +41,47 @@ def collect_self_play_metrics(
         if batch.root_count == active_game_target
         for batch_size in batch.inference_batch_sizes
     ]
+    native_select_seconds = sum(
+        batch.native_select_seconds for batch in batches
+    )
+    native_deduplication_seconds = sum(
+        batch.native_deduplication_seconds for batch in batches
+    )
+    native_feature_encode_seconds = sum(
+        batch.native_feature_encode_seconds for batch in batches
+    )
+    native_backup_seconds = sum(
+        batch.native_backup_seconds for batch in batches
+    )
+    model_inference_seconds = sum(
+        batch.model_inference_seconds for batch in batches
+    )
+    host_to_device_seconds = sum(
+        batch.host_to_device_seconds for batch in batches
+    )
+    device_to_host_seconds = sum(
+        batch.device_to_host_seconds for batch in batches
+    )
+    inference_wait_seconds = sum(
+        batch.inference_wait_seconds for batch in batches
+    )
+    native_worker_busy_seconds = sum(
+        batch.native_worker_busy_seconds for batch in batches
+    )
+    native_worker_capacity_seconds = sum(
+        batch.native_worker_capacity_seconds for batch in batches
+    )
+    native_worker_busy_percent = (
+        100.0
+        * native_worker_busy_seconds
+        / native_worker_capacity_seconds
+        if native_worker_capacity_seconds > 0.0
+        else 0.0
+    )
+    native_worker_threads = max(
+        (batch.native_worker_threads for batch in batches),
+        default=0,
+    )
     collapse_eligible_roots = sum(root.root_collapse_eligible for root in roots)
     collapsed_roots = sum(root.root_search_collapsed for root in roots)
     return {
@@ -111,4 +152,16 @@ def collect_self_play_metrics(
             if evaluation_requests
             else 0.0
         ),
+        "mcts_select_seconds": native_select_seconds,
+        "mcts_dedup_seconds": native_deduplication_seconds,
+        "mcts_feature_encode_seconds": native_feature_encode_seconds,
+        "mcts_backup_seconds": native_backup_seconds,
+        "model_inference_seconds": model_inference_seconds,
+        "host_to_device_seconds": host_to_device_seconds,
+        "device_to_host_seconds": device_to_host_seconds,
+        "inference_wait_seconds": inference_wait_seconds,
+        "native_worker_threads": native_worker_threads,
+        "native_worker_busy_percent": native_worker_busy_percent,
+        "native_worker_busy_seconds": native_worker_busy_seconds,
+        "native_worker_capacity_seconds": native_worker_capacity_seconds,
     }

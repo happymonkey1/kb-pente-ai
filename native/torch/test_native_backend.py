@@ -11,6 +11,7 @@ from src.game.pente.rules import PenteRuleset
 from src.mcts.mcts_v2 import MCTSArgs
 from src.mcts.native_backend import NativeSearchBackend
 from src.model.model_v1 import PenteNet
+from src.train.self_play_generation import SelfPlayGenerator
 
 
 def _draw_root():
@@ -104,6 +105,184 @@ class NativeBackendExtensionTests(unittest.TestCase):
         self.assertTrue(backend.slot_complete(slot))
         backend.remove(slot)
         self.assertEqual(backend.active_count, 0)
+
+    def test_self_play_matches_python_on_deterministic_freestyle(self) -> None:
+        class DualBoundaryEvaluator:
+            device = torch.device("cpu")
+
+            def __init__(self, game: PenteGame) -> None:
+                self.game = game
+
+            def evaluate(self, position: PenteBoard) -> tuple[np.ndarray, float]:
+                policies, values = self.evaluate_batch([position])
+                return policies[0], float(values[0])
+
+            def evaluate_batch(
+                self,
+                positions: list[PenteBoard],
+            ) -> tuple[np.ndarray, np.ndarray]:
+                action_size = self.game.get_action_size()
+                return (
+                    np.full(
+                        (len(positions), action_size),
+                        1.0 / action_size,
+                        dtype=np.float32,
+                    ),
+                    np.zeros(len(positions), dtype=np.float32),
+                )
+
+            def evaluate_features(
+                self,
+                inputs: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                rows = inputs.shape[0]
+                action_size = self.game.get_action_size()
+                return (
+                    torch.full(
+                        (rows, action_size),
+                        1.0 / action_size,
+                        dtype=torch.float32,
+                    ),
+                    torch.zeros(rows, dtype=torch.float32),
+                )
+
+        game = PenteGame(5, ruleset=PenteRuleset.FREESTYLE)
+        evaluator = DualBoundaryEvaluator(game)
+        args = MCTSArgs(num_simulations=1, root_noise_epsilon=0.0)
+        python_generator = SelfPlayGenerator(
+            game,
+            evaluator,
+            args,
+            temp_threshold=0,
+            rng=np.random.default_rng(71),
+            search_backend="python",
+        )
+
+        def native_factory(*factory_args, **factory_kwargs):
+            return NativeSearchBackend(
+                *factory_args,
+                extension=self.extension,
+                pin_memory=False,
+                **factory_kwargs,
+            )
+
+        native_generator = SelfPlayGenerator(
+            game,
+            evaluator,
+            args,
+            temp_threshold=0,
+            rng=np.random.default_rng(71),
+            search_backend="cpp",
+            native_worker_threads=2,
+            _native_backend_factory=native_factory,
+        )
+        python_games, python_batches = python_generator.play_games(2, 2)
+        native_games, native_batches = native_generator.play_games(2, 2)
+
+        self.assertEqual(
+            [(played.actions, played.winner, played.win_reason) for played in python_games],
+            [(played.actions, played.winner, played.win_reason) for played in native_games],
+        )
+        for python_game, native_game in zip(python_games, native_games):
+            self.assertEqual(len(python_game.examples), len(native_game.examples))
+            for python_example, native_example in zip(
+                python_game.examples,
+                native_game.examples,
+            ):
+                np.testing.assert_array_equal(
+                    python_example.position.board,
+                    native_example.position.board,
+                )
+                np.testing.assert_array_equal(
+                    python_example.position.captures,
+                    native_example.position.captures,
+                )
+                self.assertEqual(
+                    python_example.position.current_player,
+                    native_example.position.current_player,
+                )
+                self.assertEqual(python_example.position.ply, native_example.position.ply)
+                self.assertEqual(
+                    python_example.position.last_action,
+                    native_example.position.last_action,
+                )
+                np.testing.assert_allclose(
+                    python_example.policy,
+                    native_example.policy,
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+                self.assertAlmostEqual(python_example.value, native_example.value)
+
+        self.assertEqual(len(python_batches), len(native_batches))
+        self.assertEqual(
+            sum(batch.evaluation_requests for batch in python_batches),
+            sum(batch.evaluation_requests for batch in native_batches),
+        )
+        self.assertEqual(
+            sum(batch.unique_evaluations for batch in python_batches),
+            sum(batch.unique_evaluations for batch in native_batches),
+        )
+        self.assertEqual(
+            sum(batch.selected_leaves for batch in python_batches),
+            sum(batch.selected_leaves for batch in native_batches),
+        )
+        self.assertEqual(
+            sum(batch.evaluator_calls for batch in python_batches),
+            sum(batch.evaluator_calls for batch in native_batches),
+        )
+        for batch in native_batches:
+            self.assertEqual(batch.native_worker_threads, 2)
+            self.assertGreaterEqual(batch.native_select_seconds, 0.0)
+            self.assertGreaterEqual(batch.native_deduplication_seconds, 0.0)
+            self.assertGreaterEqual(batch.native_feature_encode_seconds, 0.0)
+            self.assertGreaterEqual(batch.native_backup_seconds, 0.0)
+
+    def test_pentenet_self_play_drains_native_slots(self) -> None:
+        game = PenteGame(5, ruleset=PenteRuleset.FREESTYLE)
+        net = PenteNet(
+            torch.device("cpu"),
+            board_size=5,
+            action_size=25,
+            num_res_blocks=1,
+            num_channels=8,
+            hidden_fc_size=16,
+        )
+        net.eval()
+        backends = []
+
+        def native_factory(*factory_args, **factory_kwargs):
+            backend = NativeSearchBackend(
+                *factory_args,
+                extension=self.extension,
+                pin_memory=False,
+                **factory_kwargs,
+            )
+            backends.append(backend)
+            return backend
+
+        generator = SelfPlayGenerator(
+            game,
+            net,
+            MCTSArgs(num_simulations=1, root_noise_epsilon=0.0),
+            temp_threshold=0,
+            rng=np.random.default_rng(79),
+            search_backend="cpp",
+            native_worker_threads=2,
+            _native_backend_factory=native_factory,
+        )
+        games, _ = generator.play_games(1, 1)
+
+        self.assertEqual(1, len(games))
+        self.assertEqual(1, len(backends))
+        self.assertEqual(0, backends[0].active_count)
+        for example in games[0].examples:
+            legal = game.get_valid_moves(
+                example.position,
+                example.position.current_player,
+            )
+            self.assertEqual(1.0, float(example.policy.sum()))
+            self.assertEqual(0.0, float(example.policy[legal == 0].sum()))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda_pinned_transfer_and_wait_timing(self) -> None:

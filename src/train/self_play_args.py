@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import operator
+from typing import Literal
 
 from src.mcts.mcts_v2 import MCTSArgs
 from src.train.self_play_health import SelfPlayHealthThresholds
+
+
+SearchBackend = Literal["python", "cpp"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +44,8 @@ class SelfPlayTrainerArgs:
     professional_value_loss_weight: float = 1.0
     self_play_value_loss_weight: float = 1.0
     search_health: SelfPlayHealthThresholds = SelfPlayHealthThresholds()
+    search_backend: SearchBackend = "python"
+    native_worker_threads: int = 1
 
     def __post_init__(self) -> None:
         if self.start_iteration < 0:
@@ -94,3 +101,14 @@ class SelfPlayTrainerArgs:
             raise ValueError("Value loss weights cannot be negative")
         if self.seed < 0:
             raise ValueError("Training seed cannot be negative")
+        if self.search_backend not in ("python", "cpp"):
+            raise ValueError("Search backend must be 'python' or 'cpp'")
+        if isinstance(self.native_worker_threads, bool):
+            raise TypeError("Native worker threads must be an integer")
+        try:
+            native_worker_threads = operator.index(self.native_worker_threads)
+        except TypeError as error:
+            raise TypeError("Native worker threads must be an integer") from error
+        if native_worker_threads < 1:
+            raise ValueError("Native worker threads must be positive")
+        object.__setattr__(self, "native_worker_threads", native_worker_threads)
