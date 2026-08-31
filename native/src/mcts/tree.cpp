@@ -24,6 +24,40 @@ namespace {
     return false;
 }
 
+[[nodiscard]] std::size_t checked_search_capacity(
+    std::size_t retained_nodes,
+    std::uint32_t simulation_budget) {
+    const std::size_t budget = static_cast<std::size_t>(simulation_budget);
+    if (retained_nodes > std::numeric_limits<std::size_t>::max() - budget) {
+        throw std::overflow_error("Tree search reserve size overflow");
+    }
+    const std::size_t with_budget = retained_nodes + budget;
+    if (with_budget >
+        std::numeric_limits<std::size_t>::max() - Tree::kSearchReserveMargin) {
+        throw std::overflow_error("Tree search reserve size overflow");
+    }
+    return with_budget + Tree::kSearchReserveMargin;
+}
+
+[[nodiscard]] NodeMeta transition_meta(
+    const Transition& transition,
+    Ruleset ruleset) {
+    if (!transition.terminal.is_valid()) {
+        throw std::logic_error("Native transition returned invalid terminal state");
+    }
+
+    NodeMeta result{};
+    result.position = transition.position;
+    result.terminal = transition.terminal;
+    if (!result.terminal.is_terminal()) {
+        result.legal = legal_action_mask(result.position, ruleset);
+        if (result.legal.count() == 0U) {
+            throw std::logic_error("Non-terminal transition has no legal action");
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 Tree::Tree(
@@ -130,6 +164,13 @@ NodeId Tree::select_leaf(
         root_policy_length != root_position().action_count()) {
         throw std::invalid_argument(
             "Root prior override length must equal the active action count");
+    }
+    const NodeMeta& root_meta = arena_.node(root_);
+    if (!root_meta.terminal.is_valid()) {
+        throw std::logic_error("Tree root has an invalid terminal result");
+    }
+    if (root_meta.terminal.is_terminal()) {
+        throw std::logic_error("Cannot select from a terminal root");
     }
 
     pending_path_.clear();
@@ -352,6 +393,149 @@ void Tree::resolve_terminal_impl(NodeId leaf) {
     finish_pending();
 }
 
+void Tree::reserve_for_search() {
+    arena_.reserve(
+        checked_search_capacity(arena_.node_count(), config_.simulation_budget));
+}
+
+RootAdvanceStats Tree::advance_root(Action action) {
+    if (session_owner_ != nullptr) {
+        throw std::logic_error(
+            "Cannot advance a Tree with a live search session");
+    }
+    if (pending_active_) {
+        throw std::logic_error(
+            "Cannot advance a Tree while an evaluation is pending");
+    }
+
+    const NodeMeta& old_root = arena_.node(root_);
+    if (!old_root.terminal.is_valid()) {
+        throw std::logic_error("Tree root has an invalid terminal result");
+    }
+    if (old_root.terminal.is_terminal()) {
+        throw std::logic_error("Cannot advance a terminal root");
+    }
+    if (!is_legal_action(old_root.position, ruleset_, action) ||
+        !old_root.legal.contains(action)) {
+        throw std::invalid_argument("Root advance action is not legal");
+    }
+
+    const std::size_t previous_node_count = arena_.node_count();
+    const std::size_t previous_owned_bytes = arena_.owned_bytes();
+    const NodeId selected_child = arena_.child(root_, action);
+
+    RootAdvanceStats stats{};
+    stats.previous_node_count = previous_node_count;
+    stats.previous_owned_bytes = previous_owned_bytes;
+
+    if (selected_child == kInvalidNode) {
+        const Transition transition =
+            apply_action(old_root.position, action, ruleset_);
+        NodeMeta new_root = transition_meta(transition, ruleset_);
+
+        TreeArena replacement;
+        replacement.reserve(1U);
+        const NodeId new_root_id = replacement.allocate(std::move(new_root));
+        if (new_root_id != 0U) {
+            throw std::logic_error("Compacted root ID is not zero");
+        }
+
+        stats.reused_subtree = false;
+        stats.retained_node_count = 1U;
+        stats.discarded_node_count = previous_node_count;
+        stats.new_owned_bytes = replacement.owned_bytes();
+        arena_ = std::move(replacement);
+        root_ = 0U;
+        pending_path_.clear();
+        pending_leaf_ = kInvalidNode;
+        pending_active_ = false;
+        return stats;
+    }
+
+    if (selected_child >= previous_node_count) {
+        throw std::logic_error("Root advance child ID is out of range");
+    }
+
+    std::vector<NodeId> remap(previous_node_count, kInvalidNode);
+    std::vector<NodeId> reachable;
+    reachable.reserve(previous_node_count);
+    const TreeArena& old_arena = arena_;
+    remap[selected_child] = 0U;
+    reachable.push_back(selected_child);
+
+    for (std::size_t cursor = 0U; cursor < reachable.size(); ++cursor) {
+        const NodeId old_node_id = reachable[cursor];
+        const ConstEdgeRowView row = old_arena.edge_row(old_node_id);
+        for (std::size_t index = 0U; index < TreeArena::edge_stride();
+             ++index) {
+            const NodeId child = row.child(static_cast<Action>(index));
+            if (child == kInvalidNode) {
+                continue;
+            }
+            if (child >= previous_node_count) {
+                throw std::logic_error(
+                    "Reachable child ID is out of range");
+            }
+            if (remap[child] != kInvalidNode) {
+                throw std::logic_error(
+                    "Reachable subtree contains a cycle or shared child");
+            }
+            if (reachable.size() >=
+                static_cast<std::size_t>(kInvalidNode)) {
+                throw std::length_error(
+                    "Compacted subtree exceeds NodeId range");
+            }
+            remap[child] = static_cast<NodeId>(reachable.size());
+            reachable.push_back(child);
+        }
+    }
+
+    const std::size_t retained_node_count = reachable.size();
+    TreeArena replacement;
+    replacement.reserve(retained_node_count);
+    for (const NodeId old_node_id : reachable) {
+        const NodeId new_node_id = replacement.allocate(arena_.node(old_node_id));
+        if (new_node_id != remap[old_node_id]) {
+            throw std::logic_error("Compacted node IDs are not contiguous");
+        }
+    }
+
+    for (const NodeId old_node_id : reachable) {
+        const NodeId new_node_id = remap[old_node_id];
+        const ConstEdgeRowView old_row = old_arena.edge_row(old_node_id);
+        EdgeRowView new_row = replacement.edge_row(new_node_id);
+        for (std::size_t index = 0U; index < TreeArena::edge_stride();
+             ++index) {
+            const Action edge_action = static_cast<Action>(index);
+            new_row.prior(edge_action) = old_row.prior(edge_action);
+            new_row.value_sum(edge_action) = old_row.value_sum(edge_action);
+            new_row.visit_count(edge_action) = old_row.visit_count(edge_action);
+            const NodeId old_child = old_row.child(edge_action);
+            if (old_child == kInvalidNode) {
+                new_row.child(edge_action) = kInvalidNode;
+                continue;
+            }
+            if (old_child >= previous_node_count ||
+                remap[old_child] == kInvalidNode) {
+                throw std::logic_error(
+                    "Compacted edge points outside the retained subtree");
+            }
+            new_row.child(edge_action) = remap[old_child];
+        }
+    }
+
+    stats.reused_subtree = true;
+    stats.retained_node_count = retained_node_count;
+    stats.discarded_node_count = previous_node_count - retained_node_count;
+    stats.new_owned_bytes = replacement.owned_bytes();
+    arena_ = std::move(replacement);
+    root_ = 0U;
+    pending_path_.clear();
+    pending_leaf_ = kInvalidNode;
+    pending_active_ = false;
+    return stats;
+}
+
 std::size_t Tree::legal_action_count(const NodeMeta& node) const noexcept {
     return node.legal.count();
 }
@@ -420,20 +604,7 @@ NodeId Tree::create_child(
     const Position parent_position = arena_.node(parent).position;
     const Transition transition =
         apply_action(parent_position, action, ruleset_);
-    if (!transition.terminal.is_valid()) {
-        throw std::logic_error("Native transition returned invalid terminal state");
-    }
-
-    NodeMeta child{};
-    child.position = transition.position;
-    child.terminal = transition.terminal;
-    if (!child.terminal.is_terminal()) {
-        child.legal = legal_action_mask(child.position, ruleset_);
-        if (legal_action_count(child) == 0U) {
-            throw std::logic_error("Non-terminal node has no legal action");
-        }
-    }
-    return arena_.allocate(std::move(child));
+    return arena_.allocate(transition_meta(transition, ruleset_));
 }
 
 void Tree::validate_pending_leaf(NodeId leaf) const {

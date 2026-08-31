@@ -32,7 +32,16 @@ SearchSession::SearchSession(Tree& tree, SearchSessionConfig config)
     }
 
     const NodeMeta& root = tree_.arena().node(tree_.root_id());
-    if (root.expanded) {
+    if (!root.terminal.is_valid()) {
+        throw std::logic_error("Tree root has an invalid terminal result");
+    }
+    if (root.terminal.is_terminal()) {
+        throw std::invalid_argument(
+            "Cannot create a search session for a terminal root");
+    }
+    const bool root_expanded = root.expanded;
+    tree_.reserve_for_search();
+    if (root_expanded) {
         initialize_root_priors();
     }
     tree_.session_owner_ = this;

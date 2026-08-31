@@ -33,12 +33,41 @@ struct PathEdge final {
     return !(left == right);
 }
 
+// RootAdvanceStats records the deterministic storage effect of one root
+// transition, including whether the selected child subtree was reused.
+struct RootAdvanceStats final {
+    bool reused_subtree = false;
+    std::size_t previous_node_count = 0U;
+    std::size_t retained_node_count = 0U;
+    std::size_t discarded_node_count = 0U;
+    std::size_t previous_owned_bytes = 0U;
+    std::size_t new_owned_bytes = 0U;
+};
+
+[[nodiscard]] inline bool operator==(
+    const RootAdvanceStats& left,
+    const RootAdvanceStats& right) noexcept {
+    return left.reused_subtree == right.reused_subtree &&
+           left.previous_node_count == right.previous_node_count &&
+           left.retained_node_count == right.retained_node_count &&
+           left.discarded_node_count == right.discarded_node_count &&
+           left.previous_owned_bytes == right.previous_owned_bytes &&
+           left.new_owned_bytes == right.new_owned_bytes;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const RootAdvanceStats& left,
+    const RootAdvanceStats& right) noexcept {
+    return !(left == right);
+}
+
 // Tree owns one Pente root and the deterministic single-tree search state.
 // Evaluation is supplied by callers through accept_evaluation or resolved
 // internally for terminal leaves.
 class Tree final {
 public:
     static constexpr std::size_t kInitialPathCapacity = 64;
+    static constexpr std::size_t kSearchReserveMargin = 16;
 
     explicit Tree(
         Position root_position,
@@ -76,6 +105,10 @@ public:
 
     // Resolve a pending terminal leaf without invoking an evaluator.
     void resolve_terminal(NodeId leaf);
+
+    // Advance the root by one legal action and compact to its reachable child
+    // subtree. The operation requires no live session or pending evaluation.
+    [[nodiscard]] RootAdvanceStats advance_root(Action action);
 
     [[nodiscard]] bool has_pending_evaluation() const noexcept {
         return pending_active_;
@@ -136,6 +169,8 @@ private:
         float value);
 
     void resolve_terminal_impl(NodeId leaf);
+
+    void reserve_for_search();
 
     [[nodiscard]] std::size_t legal_action_count(
         const NodeMeta& node) const noexcept;
