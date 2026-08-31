@@ -484,6 +484,24 @@ void test_temperature_and_fallbacks() {
             uniform_root_policy[index], 1.0F / 25.0F, 1.0e-7F,
             "uniform fallback stays legal and normalized");
     }
+
+    kb_pente::Tree zero_temperature_tree(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle,
+        tree_config(1U));
+    kb_pente::SearchSession zero_temperature_session(
+        zero_temperature_tree, kb_pente::SearchSessionConfig(0.0F, false));
+    const auto zero_temperature_leaf =
+        zero_temperature_session.select_evaluation_leaf();
+    zero_temperature_session.accept_evaluation(
+        *zero_temperature_leaf, zero_policy.data(), 25U, 0.0F);
+    const auto zero_temperature_policy =
+        zero_temperature_session.root_policy();
+    expect(zero_temperature_policy[0] == 1.0F,
+           "temperature zero chooses the first legal fallback action");
+    for (std::size_t index = 1U; index < 25U; ++index) {
+        expect(zero_temperature_policy[index] == 0.0F,
+               "temperature zero fallback stays one-hot");
+    }
 }
 
 void test_invalid_lifecycle_and_retry() {

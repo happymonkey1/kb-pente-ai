@@ -227,6 +227,26 @@ std::array<float, kMaxActions> SearchSession::root_policy() {
 
     if (!has_visit) {
         fill_zero_visit_fallback(policy);
+        if (config_.temperature == 0.0F) {
+            Action best_fallback_action = kInvalidAction;
+            float best_fallback_probability = 0.0F;
+            for (std::size_t index = 0U; index < active_actions; ++index) {
+                const Action action = static_cast<Action>(index);
+                if (!root.legal.contains(action) ||
+                    (best_fallback_action != kInvalidAction &&
+                     policy[index] <= best_fallback_probability)) {
+                    continue;
+                }
+                best_fallback_action = action;
+                best_fallback_probability = policy[index];
+            }
+            if (best_fallback_action == kInvalidAction) {
+                throw std::logic_error(
+                    "Root fallback has no legal action for temperature zero");
+            }
+            policy.fill(0.0F);
+            policy[best_fallback_action] = 1.0F;
+        }
         return policy;
     }
 
