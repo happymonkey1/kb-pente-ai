@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(KB_PENTE_ENABLE_SANITIZERS "Build native targets with ASan and UBSan" OFF)
 option(KB_PENTE_ENABLE_TSAN
     "Build the standalone worker-pool target with ThreadSanitizer" OFF)
+option(KB_PENTE_ENABLE_BENCHMARKS
+    "Build opt-in native CPU scaling benchmarks" OFF)
 
 if(KB_PENTE_ENABLE_TSAN AND KB_PENTE_ENABLE_SANITIZERS)
     message(FATAL_ERROR "KB_PENTE_ENABLE_TSAN cannot be combined with KB_PENTE_ENABLE_SANITIZERS")
@@ -96,6 +98,50 @@ if(MSVC)
     target_compile_options(kb_pente_mcts PRIVATE /W4 /permissive-)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(kb_pente_mcts PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(KB_PENTE_ENABLE_BENCHMARKS)
+    add_executable(kb_pente_native_worker_benchmark
+        bench/worker_pool_mcts_benchmark.cpp
+    )
+    target_link_libraries(kb_pente_native_worker_benchmark
+        PRIVATE
+            kb_pente_mcts
+            kb_pente_parallel
+    )
+    target_compile_features(kb_pente_native_worker_benchmark PUBLIC cxx_std_17)
+    target_include_directories(kb_pente_native_worker_benchmark
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    if(MSVC)
+        target_compile_options(kb_pente_native_worker_benchmark PRIVATE /W4 /permissive-)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_worker_benchmark PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_worker_benchmark PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_worker_benchmark PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    if(KB_PENTE_ENABLE_TSAN AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_worker_benchmark PRIVATE
+            -fsanitize=thread
+            -fno-omit-frame-pointer
+            -fno-pie
+        )
+        target_link_options(kb_pente_native_worker_benchmark PRIVATE
+            -fsanitize=thread
+            -no-pie
+        )
+    endif()
 endif()
 
 if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -323,6 +369,53 @@ if(BUILD_TESTING)
     add_test(NAME kb_pente_native_telemetry COMMAND kb_pente_native_telemetry_tests)
     add_test(NAME kb_pente_native_worker_pool COMMAND kb_pente_native_worker_pool_tests)
     set_tests_properties(kb_pente_native_worker_pool PROPERTIES TIMEOUT 60)
+
+    if(KB_PENTE_ENABLE_BENCHMARKS)
+        add_test(
+            NAME kb_pente_native_worker_benchmark_smoke
+            COMMAND kb_pente_native_worker_benchmark
+                --trees 2
+                --simulations 2
+                --board-size 5
+                --repetitions 1
+                --warmups 0
+                --workers 1,2
+        )
+        set_tests_properties(
+            kb_pente_native_worker_benchmark_smoke
+            PROPERTIES TIMEOUT 30
+        )
+        add_test(
+            NAME kb_pente_native_worker_benchmark_invalid_configuration
+            COMMAND kb_pente_native_worker_benchmark --trees 0
+        )
+        set_tests_properties(
+            kb_pente_native_worker_benchmark_invalid_configuration
+            PROPERTIES
+                TIMEOUT 30
+                WILL_FAIL TRUE
+        )
+        add_test(
+            NAME kb_pente_native_worker_benchmark_invalid_workers
+            COMMAND kb_pente_native_worker_benchmark --workers 2,4
+        )
+        set_tests_properties(
+            kb_pente_native_worker_benchmark_invalid_workers
+            PROPERTIES
+                TIMEOUT 30
+                WILL_FAIL TRUE
+        )
+        add_test(
+            NAME kb_pente_native_worker_benchmark_invalid_board_size
+            COMMAND kb_pente_native_worker_benchmark --board-size 4
+        )
+        set_tests_properties(
+            kb_pente_native_worker_benchmark_invalid_board_size
+            PROPERTIES
+                TIMEOUT 30
+                WILL_FAIL TRUE
+        )
+    endif()
 
     set(KB_PENTE_DIFFERENTIAL_PYTHON "" CACHE FILEPATH
         "Python interpreter with the project dependencies for differential tests")
