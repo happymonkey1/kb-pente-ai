@@ -11,7 +11,22 @@ Position Position::initial(std::uint8_t requested_board_size) {
 
     Position position{};
     position.board_size = requested_board_size;
+    position.refresh_hash();
     return position;
+}
+
+PositionHash Position::recompute_hash() const noexcept {
+    return position_hash_detail::recompute(*this);
+}
+
+void Position::refresh_hash() noexcept {
+    const PositionHash computed = recompute_hash();
+    hash_lo = computed.lo;
+    hash_hi = computed.hi;
+}
+
+bool Position::has_consistent_hash() const noexcept {
+    return hash() == recompute_hash();
 }
 
 bool Position::is_valid() const noexcept {

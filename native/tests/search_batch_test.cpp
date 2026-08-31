@@ -69,6 +69,7 @@ kb_pente::Position make_draw_root() {
     position.current_player = kb_pente::Player::One;
     position.last_action = kb_pente::kInvalidAction;
     position.validate();
+    position.refresh_hash();
     expect(!kb_pente::check_terminal(position).is_terminal(),
            "draw root is nonterminal before its final move");
     return position;

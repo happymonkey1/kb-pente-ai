@@ -5,6 +5,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "kb_pente/position_hash.h"
+
 namespace kb_pente {
 
 namespace {
@@ -133,6 +135,9 @@ Transition apply_action(
     Action action,
     Ruleset ruleset) {
     parent.validate();
+    if (!parent.has_consistent_hash()) {
+        throw std::invalid_argument("Pente position has a stale hash cache");
+    }
     if (!is_valid_ruleset_configuration(parent.board_size, ruleset)) {
         throw std::invalid_argument("Invalid board size for Pente ruleset");
     }
@@ -141,9 +146,14 @@ Transition apply_action(
     }
 
     Position child = parent;
+    PositionHash child_hash = parent.hash();
     const Player moving_player = parent.current_player;
     const Player opposing_player = opponent(moving_player);
     child.stones[action] = static_cast<std::int8_t>(moving_player);
+    position_hash_detail::toggle_stone(
+        child_hash,
+        action,
+        static_cast<std::int8_t>(moving_player));
 
     const int row = action / parent.board_size;
     const int column = action % parent.board_size;
@@ -174,20 +184,59 @@ Transition apply_action(
                     static_cast<std::int8_t>(moving_player)) {
                 child.stones[first] = 0;
                 child.stones[second] = 0;
+                position_hash_detail::toggle_stone(
+                    child_hash,
+                    first,
+                    static_cast<std::int8_t>(opposing_player));
+                position_hash_detail::toggle_stone(
+                    child_hash,
+                    second,
+                    static_cast<std::int8_t>(opposing_player));
                 ++captured_pairs;
             }
         }
     }
 
-    auto& captures = child.captures[player_index(moving_player)];
+    const std::size_t moving_player_index = player_index(moving_player);
+    const std::uint8_t previous_captures =
+        parent.captures[moving_player_index];
+    auto& captures = child.captures[moving_player_index];
     if (captured_pairs >
         std::numeric_limits<std::uint8_t>::max() - captures) {
         throw std::overflow_error("Pente capture count overflow");
     }
     captures = static_cast<std::uint8_t>(captures + captured_pairs);
+    if (captures != previous_captures) {
+        position_hash_detail::toggle_capture_count(
+            child_hash,
+            moving_player,
+            previous_captures);
+        position_hash_detail::toggle_capture_count(
+            child_hash,
+            moving_player,
+            captures);
+    }
+
     child.ply = static_cast<std::uint16_t>(parent.ply + 1U);
+    position_hash_detail::toggle_ply(child_hash, parent.ply);
+    position_hash_detail::toggle_ply(child_hash, child.ply);
+    position_hash_detail::toggle_opening(child_hash, parent.ply == 0U);
+    position_hash_detail::toggle_opening(child_hash, child.ply == 0U);
+
     child.last_action = action;
+    position_hash_detail::toggle_last_action(child_hash, parent.last_action);
+    position_hash_detail::toggle_last_action(child_hash, child.last_action);
+
     child.current_player = opposing_player;
+    position_hash_detail::toggle_current_player(
+        child_hash,
+        parent.current_player);
+    position_hash_detail::toggle_current_player(
+        child_hash,
+        child.current_player);
+
+    child.hash_lo = child_hash.lo;
+    child.hash_hi = child_hash.hi;
 
     return Transition{child, check_terminal(child)};
 }

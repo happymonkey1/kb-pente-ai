@@ -357,6 +357,7 @@ void test_captures_in_all_eight_directions() {
         position.ply = 4;
         position.current_player = Player::One;
         expect(position.is_valid(), "directional capture fixture is valid");
+        position.refresh_hash();
 
         const auto moved = kb_pente::apply_action(
             position, action_at(9, center, center), Ruleset::Freestyle);
@@ -366,6 +367,8 @@ void test_captures_in_all_eight_directions() {
                "directional capture removes first stone");
         expect(moved.position.stones[second] == 0,
                "directional capture removes second stone");
+        expect(moved.position.hash() == moved.position.recompute_hash(),
+               "directional capture keeps the hash cache consistent");
     }
 }
 
@@ -386,6 +389,7 @@ void test_multiple_captures_and_capture_wins() {
     multiple.ply = 14;
     multiple.current_player = Player::One;
     expect(multiple.is_valid(), "multiple-capture fixture is valid");
+    multiple.refresh_hash();
 
     Position expected = multiple;
     expected.stones[action_at(9, 4, 2)] = 0;
@@ -402,6 +406,8 @@ void test_multiple_captures_and_capture_wins() {
         multiple, action_at(9, 4, 4), Ruleset::Freestyle);
     expect(transition.position == expected,
            "simultaneous captures produce the complete expected position");
+    expect(transition.position.hash() == transition.position.recompute_hash(),
+           "simultaneous captures keep the hash cache consistent");
     expect(transition.terminal ==
                kb_pente::TerminalResult::win(Player::One, WinReason::Capture),
            "capture victory is reported after multiple captures");
@@ -417,6 +423,7 @@ void test_multiple_captures_and_capture_wins() {
     player_one_win.captures[kb_pente::player_index(Player::One)] = 4;
     player_one_win.ply = 12;
     player_one_win.current_player = Player::One;
+    player_one_win.refresh_hash();
     const auto player_one_transition = kb_pente::apply_action(
         player_one_win, action_at(9, 4, 1), Ruleset::Freestyle);
     expect(player_one_transition.terminal ==
@@ -433,6 +440,7 @@ void test_multiple_captures_and_capture_wins() {
     player_two_win.captures[kb_pente::player_index(Player::Two)] = 4;
     player_two_win.ply = 11;
     player_two_win.current_player = Player::Two;
+    player_two_win.refresh_hash();
     const auto player_two_transition = kb_pente::apply_action(
         player_two_win, action_at(9, 4, 5), Ruleset::Freestyle);
     expect(player_two_transition.terminal ==
@@ -457,6 +465,7 @@ void test_multiple_captures_and_capture_wins() {
     capture_and_line.current_player = Player::One;
     expect(capture_and_line.is_valid(),
            "capture-and-line precedence fixture is valid");
+    capture_and_line.refresh_hash();
     const auto capture_and_line_transition = kb_pente::apply_action(
         capture_and_line, action_at(9, 4, 4), Ruleset::Freestyle);
     expect(capture_and_line_transition.terminal ==
@@ -562,6 +571,7 @@ void test_terminal_precedence_and_imported_positions() {
               final_cell.stones.begin());
     final_cell.ply = 24;
     final_cell.current_player = Player::One;
+    final_cell.refresh_hash();
     const auto final_transition =
         kb_pente::apply_action(final_cell, 4, Ruleset::Freestyle);
     expect(final_transition.terminal ==

@@ -155,6 +155,7 @@ struct WirePosition final {
     position.board_size = wire.board_size;
     position.current_player =
         static_cast<kb_pente::Player>(wire.current_player);
+    position.refresh_hash();
     return position;
 }
 

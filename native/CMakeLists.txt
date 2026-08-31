@@ -33,6 +33,7 @@ endif()
 
 add_library(kb_pente_core STATIC
     src/position.cpp
+    src/position_hash.cpp
     src/rules.cpp
     src/game.cpp
 )
@@ -159,6 +160,14 @@ if(BUILD_TESTING)
     )
     target_link_libraries(kb_pente_native_tests PRIVATE kb_pente_core)
 
+    add_executable(kb_pente_native_position_hash_tests
+        tests/position_hash_test.cpp
+    )
+    target_link_libraries(
+        kb_pente_native_position_hash_tests
+        PRIVATE kb_pente_mcts
+    )
+
     add_executable(kb_pente_native_diff_runner
         tests/differential_runner.cpp
     )
@@ -210,12 +219,34 @@ if(BUILD_TESTING)
         target_compile_options(kb_pente_native_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    if(MSVC)
+        target_compile_options(
+            kb_pente_native_position_hash_tests
+            PRIVATE /W4 /permissive-
+        )
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            kb_pente_native_position_hash_tests
+            PRIVATE -Wall -Wextra -Wpedantic
+        )
+    endif()
+
     if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_tests PRIVATE
             -fsanitize=address,undefined
             -fno-omit-frame-pointer
         )
         target_link_options(kb_pente_native_tests PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_position_hash_tests PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_position_hash_tests PRIVATE
             -fsanitize=address,undefined
         )
     endif()
@@ -365,6 +396,10 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME kb_pente_native_core COMMAND kb_pente_native_tests)
+    add_test(
+        NAME kb_pente_native_position_hash
+        COMMAND kb_pente_native_position_hash_tests
+    )
     add_test(NAME kb_pente_native_arena COMMAND kb_pente_native_mcts_tests)
     add_test(NAME kb_pente_native_search COMMAND kb_pente_native_search_tests)
     add_test(

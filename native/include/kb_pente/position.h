@@ -6,6 +6,7 @@
 
 #include "kb_pente/constants.h"
 #include "kb_pente/player.h"
+#include "kb_pente/position_hash.h"
 
 namespace kb_pente {
 
@@ -19,6 +20,8 @@ struct Position final {
     Action last_action = kInvalidAction;
     std::uint8_t board_size = kDefaultBoardSize;
     Player current_player = Player::One;
+    std::uint64_t hash_lo = 0U;
+    std::uint64_t hash_hi = 0U;
 
     [[nodiscard]] static Position initial(
         std::uint8_t board_size = kDefaultBoardSize);
@@ -35,6 +38,16 @@ struct Position final {
     [[nodiscard]] std::uint8_t capture_count(Player player) const noexcept {
         return captures[player_index(player)];
     }
+
+    // hash() returns the cached value without recomputing it. Imported or
+    // manually assembled positions can use refresh_hash() to canonicalize it.
+    [[nodiscard]] PositionHash hash() const noexcept {
+        return PositionHash{hash_lo, hash_hi};
+    }
+
+    [[nodiscard]] PositionHash recompute_hash() const noexcept;
+    void refresh_hash() noexcept;
+    [[nodiscard]] bool has_consistent_hash() const noexcept;
 
     // Returns false without allocating or throwing. validate() is available
     // for callers that want an exception when importing an invalid position.

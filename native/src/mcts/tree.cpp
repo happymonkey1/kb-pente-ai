@@ -67,6 +67,7 @@ Tree::Tree(
     : ruleset_(ruleset), config_(config), rng_(config_.seed) {
     config_.validate();
     root_position.validate();
+    root_position.refresh_hash();
     if (!is_valid_ruleset_configuration(root_position.board_size, ruleset_)) {
         throw std::invalid_argument("Invalid board size for Pente ruleset");
     }

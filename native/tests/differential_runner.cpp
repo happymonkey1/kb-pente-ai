@@ -141,6 +141,7 @@ void write_wire_position(const kb_pente::Position& position) {
     position.board_size = wire.board_size;
     position.current_player =
         static_cast<kb_pente::Player>(wire.current_player);
+    position.refresh_hash();
     return position;
 }
 
