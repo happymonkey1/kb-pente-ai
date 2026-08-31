@@ -320,6 +320,14 @@ public:
         Action action,
         SearchSessionConfig session_config = SearchSessionConfig{});
 
+    // Observe an externally selected action on a pristine nonterminal
+    // session. The retained subtree is compacted by Tree, and a nonterminal
+    // resulting root receives a fresh session with the supplied settings.
+    [[nodiscard]] RootAdvanceStats observe_action(
+        SlotId slot,
+        Action action,
+        SearchSessionConfig session_config = SearchSessionConfig{});
+
     // Remove a completed active slot. Slot IDs become available to add().
     void remove(SlotId slot);
 
@@ -350,6 +358,12 @@ private:
     void ensure_no_pending() const;
     [[nodiscard]] const Slot& checked_slot(SlotId slot) const;
     [[nodiscard]] Slot& checked_slot(SlotId slot);
+    // Complete a root transition after the caller has validated every
+    // lifecycle, configuration, terminal, and action precondition.
+    [[nodiscard]] RootAdvanceStats advance_root_after_validation(
+        SlotId slot,
+        Action action,
+        SearchSessionConfig session_config);
     void update_deduplication_telemetry();
     void poison() noexcept;
 

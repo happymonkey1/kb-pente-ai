@@ -782,6 +782,29 @@ public:
         return root_advance_stats_to_dict(stats);
     }
 
+    [[nodiscard]] py::dict observe_action(
+        const py::object& slot,
+        const py::object& action,
+        const py::object& temperature,
+        const py::object& add_root_noise) {
+        const SlotId parsed_slot = parse_size(slot, "slot");
+        const Action parsed_action = parse_action(action, "action");
+        const SearchSessionConfig session_config(
+            parse_float(temperature, "temperature"),
+            parse_bool(add_root_noise, "add_root_noise"));
+
+        RootAdvanceStats stats{};
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats = batch_.observe_action(
+                parsed_slot,
+                parsed_action,
+                session_config);
+        }
+        return root_advance_stats_to_dict(stats);
+    }
+
     void remove(const py::object& slot) {
         const SlotId parsed_slot = parse_size(slot, "slot");
         py::gil_scoped_release release;
@@ -1048,6 +1071,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def(
             "advance_root",
             &SearchBatchBinding::advance_root,
+            py::arg("slot"),
+            py::arg("action"),
+            py::arg("temperature") = 1.0F,
+            py::arg("add_root_noise") = false)
+        .def(
+            "observe_action",
+            &SearchBatchBinding::observe_action,
             py::arg("slot"),
             py::arg("action"),
             py::arg("temperature") = 1.0F,

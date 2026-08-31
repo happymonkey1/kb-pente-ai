@@ -106,6 +106,29 @@ class NativeBackendExtensionTests(unittest.TestCase):
         backend.remove(slot)
         self.assertEqual(backend.active_count, 0)
 
+    def test_observe_action_updates_root_mirror_and_continues_search(self) -> None:
+        backend = self.make_backend(simulations=1, capacity=1)
+        root = self.game.init_board()
+        slot = backend.add_root(root, temperature=0.0)
+        expected, _ = self.game.apply_action(root, root.current_player, 0)
+
+        stats = backend.observe_action(
+            slot,
+            0,
+            temperature=0.0,
+            add_root_noise=False,
+        )
+        self.assertFalse(stats["reused_subtree"])
+        self.assertEqual(backend._roots[slot].state_key(), expected.state_key())
+        self.assertEqual(backend._batch_sizes[slot], [])
+        self.assertFalse(backend.slot_complete(slot))
+
+        backend.evaluate_wave()
+        self.assertTrue(backend.slot_complete(slot))
+        policy = backend.root_policy(slot)
+        self.assertAlmostEqual(float(policy.sum()), 1.0)
+        self.assertEqual(float(policy[0]), 0.0)
+
     def test_self_play_matches_python_on_deterministic_freestyle(self) -> None:
         class DualBoundaryEvaluator:
             device = torch.device("cpu")

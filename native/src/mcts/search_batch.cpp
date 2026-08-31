@@ -595,23 +595,51 @@ RootAdvanceStats SearchBatch::advance_root(
         throw std::invalid_argument("SearchBatch root advance action is not legal");
     }
 
-    checked.session.reset();
+    return advance_root_after_validation(slot, action, session_config);
+}
 
-    try {
-        const RootAdvanceStats stats = checked.tree->advance_root(action);
-        const TerminalResult terminal = root_terminal(slot);
-        if (!terminal.is_terminal()) {
-            auto session = std::make_unique<SearchSession>(
-                *checked.tree, session_config);
-            checked.session = std::move(session);
-        }
-        requests_.clear();
-        inference_workspace_.clear();
-        return stats;
-    } catch (...) {
-        poison();
-        throw;
+RootAdvanceStats SearchBatch::observe_action(
+    SlotId slot,
+    Action action,
+    SearchSessionConfig session_config) {
+    ensure_usable();
+    ensure_no_pending();
+
+    Slot& checked = checked_slot(slot);
+    if (!checked.tree) {
+        throw std::out_of_range("SearchBatch slot is not active");
     }
+
+    const Tree& tree = *checked.tree;
+    const NodeMeta& root = tree.arena().node(tree.root_id());
+    if (!root.terminal.is_valid()) {
+        throw std::logic_error("SearchBatch root has an invalid terminal result");
+    }
+    if (root.terminal.is_terminal()) {
+        throw std::logic_error(
+            "Cannot observe an action on a terminal SearchBatch root");
+    }
+    if (!checked.session) {
+        throw std::logic_error(
+            "SearchBatch observed action requires a live pristine session");
+    }
+    if (checked.session->complete()) {
+        throw std::logic_error(
+            "SearchBatch observed action requires an incomplete session");
+    }
+    if (!checked.session->pristine()) {
+        throw std::logic_error(
+            "SearchBatch observed action requires a pristine session");
+    }
+    session_config.validate();
+
+    if (!is_legal_action(root.position, tree.ruleset(), action) ||
+        !root.legal.contains(action)) {
+        throw std::invalid_argument(
+            "SearchBatch observed action is not legal");
+    }
+
+    return advance_root_after_validation(slot, action, session_config);
 }
 
 void SearchBatch::remove(SlotId slot) {
@@ -766,6 +794,30 @@ SearchBatch::Slot& SearchBatch::checked_slot(SlotId slot) {
         throw std::out_of_range("SearchBatch slot is out of range");
     }
     return slots_[slot];
+}
+
+RootAdvanceStats SearchBatch::advance_root_after_validation(
+    SlotId slot,
+    Action action,
+    SearchSessionConfig session_config) {
+    Slot& checked = checked_slot(slot);
+
+    try {
+        checked.session.reset();
+        const RootAdvanceStats stats = checked.tree->advance_root(action);
+        const TerminalResult terminal = root_terminal(slot);
+        if (!terminal.is_terminal()) {
+            auto session = std::make_unique<SearchSession>(
+                *checked.tree, session_config);
+            checked.session = std::move(session);
+        }
+        requests_.clear();
+        inference_workspace_.clear();
+        return stats;
+    } catch (...) {
+        poison();
+        throw;
+    }
 }
 
 void SearchBatch::poison() noexcept {

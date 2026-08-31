@@ -252,6 +252,34 @@ class NativeSearchBackend:
         self._batch_sizes[parsed_slot] = []
         return dict(result)
 
+    def observe_action(
+        self,
+        slot: int,
+        action: int,
+        temperature: float = 1.0,
+        add_root_noise: bool = False,
+    ) -> dict[str, Any]:
+        parsed_slot = _nonnegative_int(slot, "slot")
+        parsed_action = _nonnegative_int(action, "action")
+        try:
+            root = self._roots[parsed_slot]
+        except KeyError as error:
+            raise ValueError(f"Unknown native root slot: {parsed_slot}") from error
+        next_position, _ = self.game.apply_action(
+            root,
+            root.current_player,
+            parsed_action,
+        )
+        result = self._batch.observe_action(
+            parsed_slot,
+            parsed_action,
+            temperature=temperature,
+            add_root_noise=add_root_noise,
+        )
+        self._roots[parsed_slot] = next_position
+        self._batch_sizes[parsed_slot] = []
+        return dict(result)
+
     def remove(self, slot: int) -> None:
         parsed_slot = _nonnegative_int(slot, "slot")
         self._batch.remove(parsed_slot)

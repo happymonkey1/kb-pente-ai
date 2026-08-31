@@ -407,6 +407,68 @@ if getter_iterations < 2:
         self.assertEqual(float(policy.sum()), 1.0)
         self.assertEqual(float(policy[1]), 1.0)
 
+    def test_observe_action_reuses_pristine_session_and_handles_terminal(self) -> None:
+        batch = self.make_batch(simulations=1)
+        stones, captures = _initial_root(5)
+        slot = batch.add(stones, captures, 1, 0)
+        stats = batch.observe_action(
+            slot,
+            0,
+            temperature=0.0,
+            add_root_noise=False,
+        )
+        self.assertEqual(
+            set(stats),
+            {
+                "reused_subtree",
+                "previous_node_count",
+                "retained_node_count",
+                "discarded_node_count",
+                "previous_owned_bytes",
+                "new_owned_bytes",
+            },
+        )
+        self.assertFalse(stats["reused_subtree"])
+        self.assertEqual(batch.root_terminal(slot)["status"], "in_progress")
+        self.assertFalse(batch.slot_complete(slot))
+        _run_to_completion(batch)
+        policy = batch.root_policy(slot)
+        self.assertEqual(float(policy[1]), 1.0)
+
+        terminal_batch = self.make_batch(simulations=1)
+        terminal_slot = terminal_batch.add(*_draw_root(), current_player=1, ply=24)
+        terminal_stats = terminal_batch.observe_action(terminal_slot, 24)
+        self.assertFalse(terminal_stats["reused_subtree"])
+        self.assertEqual(
+            terminal_batch.root_terminal(terminal_slot),
+            {"status": "draw", "reason": "none", "winner": None},
+        )
+        self.assertTrue(terminal_batch.slot_complete(terminal_slot))
+
+    def test_observe_action_rejections_preserve_pristine_and_pending_state(self) -> None:
+        batch = self.make_batch(simulations=2)
+        stones, captures = _initial_root(5)
+        slot = batch.add(stones, captures, 1, 0)
+        before = batch.status()
+
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.observe_action(slot, 25)
+        self.assertEqual(batch.status(), before)
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.observe_action(slot, 0, temperature=-1.0)
+        self.assertEqual(batch.status(), before)
+
+        selected = batch.select()
+        pending = batch.status()
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.observe_action(slot, 0)
+        self.assertEqual(batch.status(), pending)
+        _backup_one_hot(batch, selected)
+        progressed = batch.status()
+        with self.assertRaises((RuntimeError, ValueError)):
+            batch.observe_action(slot, 0)
+        self.assertEqual(batch.status(), progressed)
+
     def test_terminal_mapping_remove_and_lowest_free_reuse(self) -> None:
         batch = self.extension.SearchBatch(
             board_size=5,

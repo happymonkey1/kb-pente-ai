@@ -173,6 +173,13 @@ class _FakeBatch:
         state["completions"] = 0
         return {"reused_subtree": True}
 
+    def observe_action(self, slot: int, _action: int, **_kwargs: object) -> dict[str, Any]:
+        state = self._slots[slot]
+        assert state is not None
+        state["simulations"] = 0
+        state["completions"] = 0
+        return {"reused_subtree": True}
+
     def remove(self, slot: int) -> None:
         self._slots[slot] = None
 
@@ -206,6 +213,22 @@ class _FailingBackupBatch(_FakeBatch):
 
 class _FailingBackupExtension:
     SearchBatch = _FailingBackupBatch
+
+
+class _FailingObserveBatch(_FakeBatch):
+    def __init__(self, **options: Any) -> None:
+        super().__init__(**options)
+        self._fail_observe = True
+
+    def observe_action(self, slot: int, _action: int, **kwargs: object) -> dict[str, Any]:
+        if self._fail_observe:
+            self._fail_observe = False
+            raise RuntimeError("transient fake observed-action failure")
+        return super().observe_action(slot, _action, **kwargs)
+
+
+class _FailingObserveExtension:
+    SearchBatch = _FailingObserveBatch
 
 
 class _FakeEvaluator:
@@ -313,6 +336,48 @@ class NativeBackendTests(TestCase):
         self.assertFalse(backend.complete())
         backend.evaluate_wave()
         self.assertTrue(backend.complete())
+
+    def test_observe_action_updates_root_and_resets_batch_sizes_after_success(self) -> None:
+        backend = self.make_backend(capacity=1)
+        root = self.game.init_board()
+        slot = backend.add_root(root)
+        backend._batch_sizes[slot] = [7]
+        expected, _ = self.game.apply_action(root, root.current_player, 0)
+
+        result = backend.observe_action(
+            slot,
+            0,
+            temperature=0.0,
+            add_root_noise=False,
+        )
+
+        self.assertTrue(result["reused_subtree"])
+        self.assertEqual(backend._roots[slot].state_key(), expected.state_key())
+        self.assertEqual(backend._batch_sizes[slot], [])
+
+    def test_failed_observed_action_does_not_update_python_mirrors(self) -> None:
+        backend = NativeSearchBackend(
+            self.game,
+            _FakeEvaluator(),
+            self.args,
+            max_active_games=1,
+            worker_threads=1,
+            pin_memory=False,
+            extension=_FailingObserveExtension,
+        )
+        root = self.game.init_board()
+        slot = backend.add_root(root)
+        backend._batch_sizes[slot] = [11]
+        root_key = backend._roots[slot].state_key()
+
+        with self.assertRaisesRegex(RuntimeError, "observed-action"):
+            backend.observe_action(slot, 0)
+        self.assertEqual(backend._roots[slot].state_key(), root_key)
+        self.assertEqual(backend._batch_sizes[slot], [11])
+
+        backend.observe_action(slot, 0)
+        self.assertNotEqual(backend._roots[slot].state_key(), root_key)
+        self.assertEqual(backend._batch_sizes[slot], [])
 
     def test_root_validation_terminal_conversion_and_lifecycle(self) -> None:
         backend = self.make_backend(capacity=1)

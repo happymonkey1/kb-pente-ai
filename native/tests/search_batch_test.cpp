@@ -241,6 +241,177 @@ void test_root_policy_and_advancement() {
     backup_uniform(pending_other, pending_selection);
 }
 
+void test_observed_action_pristine_lifecycle() {
+    const kb_pente::Position original_root =
+        kb_pente::Position::initial(5);
+    kb_pente::SearchBatch batch(batch_config(2U, 47U), 2U, 1U);
+    const auto slot = batch.add(
+        original_root,
+        kb_pente::Ruleset::Freestyle,
+        kb_pente::SearchSessionConfig(0.0F, false));
+
+    const auto original_telemetry = batch.slot_telemetry(slot);
+    const auto original_token = batch.last_token();
+    const auto expected = kb_pente::apply_action(
+        original_root, 0U, kb_pente::Ruleset::Freestyle);
+
+    expect_throws<std::out_of_range>(
+        [&batch] { (void)batch.observe_action(1U, 0U); },
+        "observed action rejects an inactive slot");
+    expect_throws<std::invalid_argument>(
+        [&batch] { (void)batch.observe_action(0U, kb_pente::kInvalidAction); },
+        "observed action rejects an invalid action");
+
+    kb_pente::SearchSessionConfig invalid_config;
+    invalid_config.temperature = -1.0F;
+    expect_throws<std::invalid_argument>(
+        [&batch, slot, &invalid_config] {
+            (void)batch.observe_action(slot, 0U, invalid_config);
+        },
+        "observed action rejects an invalid next-session config");
+    expect(batch.root_position(slot) == original_root &&
+               batch.slot_telemetry(slot) == original_telemetry &&
+               batch.last_token() == original_token && !batch.has_pending(),
+           "rejected pristine observations preserve the session");
+
+    const auto pending = batch.select();
+    const auto pending_telemetry = batch.slot_telemetry(slot);
+    const auto pending_token = batch.pending_token();
+    expect_throws<std::logic_error>(
+        [&batch, slot] { (void)batch.observe_action(slot, 0U); },
+        "observed action rejects a pending evaluation wave");
+    expect(batch.root_position(slot) == original_root &&
+               batch.slot_telemetry(slot) == pending_telemetry &&
+               batch.has_pending() && batch.pending_token() == pending_token,
+           "pending observation rejection is retryable");
+    backup_uniform(batch, pending);
+
+    const auto progressed_telemetry = batch.slot_telemetry(slot);
+    expect(progressed_telemetry.completed_simulations == 1U &&
+               progressed_telemetry.selected_leaves == 1U,
+           "one completed simulation makes the session progressed");
+    expect_throws<std::logic_error>(
+        [&batch, slot] { (void)batch.observe_action(slot, 0U); },
+        "observed action rejects a progressed session");
+    expect(batch.root_position(slot) == original_root &&
+               batch.slot_telemetry(slot) == progressed_telemetry,
+           "progressed observation rejection preserves the session");
+
+    run_to_completion(batch);
+    const auto completed_telemetry = batch.slot_telemetry(slot);
+    expect_throws<std::logic_error>(
+        [&batch, slot] { (void)batch.observe_action(slot, 0U); },
+        "observed action rejects a completed session");
+    expect(batch.root_position(slot) == original_root &&
+               batch.slot_telemetry(slot) == completed_telemetry,
+           "completed observation rejection preserves the session");
+
+    batch.remove(slot);
+    const auto pristine_slot = batch.add(
+        original_root,
+        kb_pente::Ruleset::Freestyle,
+        kb_pente::SearchSessionConfig(0.0F, false));
+    const auto stats = batch.observe_action(
+        pristine_slot, 0U, kb_pente::SearchSessionConfig(0.0F, false));
+    expect(!stats.reused_subtree && stats.retained_node_count == 1U,
+           "pristine observation reports an unallocated child transition");
+    expect(batch.root_position(pristine_slot) == expected.position &&
+               batch.root_terminal(pristine_slot) == expected.terminal &&
+               !batch.slot_complete(pristine_slot),
+           "pristine observation creates the expected nonterminal session");
+
+    run_to_completion(batch);
+    const auto policy = batch.root_policy(pristine_slot);
+    expect(policy[1U] == 1.0F,
+           "ordinary search completes after an observed action");
+}
+
+void test_observed_action_allocated_subtree_and_terminal() {
+    const kb_pente::Position original_root =
+        kb_pente::Position::initial(5);
+    kb_pente::SearchBatch batch(batch_config(3U, 53U), 1U, 1U);
+    const auto slot = batch.add(
+        original_root,
+        kb_pente::Ruleset::Freestyle,
+        kb_pente::SearchSessionConfig(0.0F, false));
+
+    backup_first_one_hot(batch, batch.select(), 0U);
+    backup_first_one_hot(batch, batch.select(), 2U);
+    backup_first_one_hot(batch, batch.select(), 3U);
+    expect(batch.complete(), "allocated observation fixture completes first search");
+    (void)batch.advance_root(slot, 0U);
+    expect(!batch.slot_complete(slot),
+           "completed advancement creates the pristine continuation session");
+    const auto before_observation = batch.slot_telemetry(slot);
+    expect(before_observation.completed_simulations == 0U &&
+               before_observation.selected_leaves == 0U,
+           "continuation session is pristine before observation");
+
+    const auto first_expected = kb_pente::apply_action(
+        original_root, 0U, kb_pente::Ruleset::Freestyle);
+    const auto expected = kb_pente::apply_action(
+        first_expected.position, 2U, kb_pente::Ruleset::Freestyle);
+    const auto stats = batch.observe_action(
+        slot, 2U, kb_pente::SearchSessionConfig(0.0F, false));
+    expect(stats.reused_subtree && stats.retained_node_count >= 1U,
+           "observed action retains an allocated child subtree");
+    expect(batch.root_position(slot) == expected.position &&
+               batch.root_terminal(slot) == expected.terminal &&
+               !batch.slot_complete(slot),
+           "allocated observation preserves the retained child position");
+    run_to_completion(batch);
+
+    kb_pente::SearchBatch terminal(batch_config(1U, 59U), 1U, 1U);
+    const auto terminal_slot = terminal.add(
+        make_draw_root(),
+        kb_pente::Ruleset::Freestyle,
+        kb_pente::SearchSessionConfig(0.0F, false));
+    const auto terminal_expected = kb_pente::apply_action(
+        make_draw_root(), 24U, kb_pente::Ruleset::Freestyle);
+    const auto terminal_stats = terminal.observe_action(terminal_slot, 24U);
+    expect(!terminal_stats.reused_subtree &&
+               terminal.root_position(terminal_slot) == terminal_expected.position &&
+               terminal.root_terminal(terminal_slot) == terminal_expected.terminal &&
+               terminal.slot_complete(terminal_slot),
+           "terminal observation keeps an active completed slot without a session");
+    expect_throws<std::logic_error>(
+        [&terminal, terminal_slot] {
+            (void)terminal.observe_action(terminal_slot, 0U);
+        },
+        "observed action rejects a terminal root");
+}
+
+void test_observed_action_worker_equivalence() {
+    kb_pente::SearchBatch one_worker(batch_config(3U, 61U), 1U, 1U);
+    kb_pente::SearchBatch many_workers(batch_config(3U, 61U), 1U, 4U);
+    const auto root = kb_pente::Position::initial(5);
+    const auto one_slot = one_worker.add(
+        root,
+        kb_pente::Ruleset::Freestyle,
+        kb_pente::SearchSessionConfig(0.0F, false));
+    const auto many_slot = many_workers.add(
+        root,
+        kb_pente::Ruleset::Freestyle,
+        kb_pente::SearchSessionConfig(0.0F, false));
+
+    const auto one_stats = one_worker.observe_action(one_slot, 0U);
+    const auto many_stats = many_workers.observe_action(many_slot, 0U);
+    expect(one_stats == many_stats,
+           "worker counts agree on pristine observed-action stats");
+    expect(one_worker.root_position(one_slot) ==
+               many_workers.root_position(many_slot),
+           "worker counts agree on observed roots");
+
+    run_to_completion(one_worker);
+    run_to_completion(many_workers);
+    expect(one_worker.root_policy(one_slot) ==
+               many_workers.root_policy(many_slot),
+           "worker counts agree on ordinary search after observation");
+    expect(one_worker.slot_telemetry(one_slot) ==
+               many_workers.slot_telemetry(many_slot),
+           "worker counts agree on telemetry after observation");
+}
+
 void test_allocated_root_advancement_and_continuation() {
     const kb_pente::Position original_root =
         kb_pente::Position::initial(5);
@@ -1358,6 +1529,9 @@ int main() {
         test_two_row_backup_validation_is_transactional();
         test_multiwave_token_lifecycle();
         test_root_policy_and_advancement();
+        test_observed_action_pristine_lifecycle();
+        test_observed_action_allocated_subtree_and_terminal();
+        test_observed_action_worker_equivalence();
         test_allocated_root_advancement_and_continuation();
         test_terminal_advancement_and_slot_removal();
         test_lifecycle_rejection_and_lowest_free_reuse();

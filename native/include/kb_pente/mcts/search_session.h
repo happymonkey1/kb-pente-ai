@@ -79,6 +79,11 @@ public:
         return tree_.has_pending_evaluation();
     }
 
+    // A pristine session has not selected or completed any simulation.
+    [[nodiscard]] bool pristine() const noexcept {
+        return completed_simulations_ == 0U && selected_leaves_ == 0U;
+    }
+
     [[nodiscard]] std::uint64_t zero_visit_fallbacks() const noexcept {
         return zero_visit_fallbacks_;
     }
