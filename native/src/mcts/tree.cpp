@@ -30,7 +30,7 @@ Tree::Tree(
     Position root_position,
     Ruleset ruleset,
     SearchConfig config)
-    : ruleset_(ruleset), config_(config) {
+    : ruleset_(ruleset), config_(config), rng_(config_.seed) {
     config_.validate();
     root_position.validate();
     if (!is_valid_ruleset_configuration(root_position.board_size, ruleset_)) {
@@ -57,10 +57,79 @@ Tree::Tree(
     root_ = arena_.allocate(std::move(root_meta));
 }
 
+const Tree& Tree::validate_move_source(const Tree& tree) {
+    if (tree.session_owner_ != nullptr) {
+        throw std::logic_error("Cannot move a Tree with a live search session");
+    }
+    return tree;
+}
+
+Tree::Tree(Tree&& other)
+    : ruleset_(validate_move_source(other).ruleset_),
+      config_(validate_move_source(other).config_),
+      rng_(std::move(other.rng_)),
+      arena_(std::move(other.arena_)),
+      root_(other.root_),
+      pending_path_(std::move(other.pending_path_)),
+      pending_leaf_(other.pending_leaf_),
+      pending_active_(other.pending_active_),
+      invalid_policy_fallbacks_(other.invalid_policy_fallbacks_),
+      session_owner_(nullptr) {
+    other.root_ = kInvalidNode;
+    other.pending_leaf_ = kInvalidNode;
+    other.pending_active_ = false;
+    other.invalid_policy_fallbacks_ = 0U;
+}
+
+Tree& Tree::operator=(Tree&& other) {
+    if (this == &other) {
+        return *this;
+    }
+    if (session_owner_ != nullptr || other.session_owner_ != nullptr) {
+        throw std::logic_error(
+            "Cannot move a Tree with a live search session");
+    }
+
+    ruleset_ = other.ruleset_;
+    config_ = other.config_;
+    rng_ = std::move(other.rng_);
+    arena_ = std::move(other.arena_);
+    root_ = other.root_;
+    pending_path_ = std::move(other.pending_path_);
+    pending_leaf_ = other.pending_leaf_;
+    pending_active_ = other.pending_active_;
+    invalid_policy_fallbacks_ = other.invalid_policy_fallbacks_;
+
+    other.root_ = kInvalidNode;
+    other.pending_leaf_ = kInvalidNode;
+    other.pending_active_ = false;
+    other.invalid_policy_fallbacks_ = 0U;
+    return *this;
+}
+
 NodeId Tree::select_leaf() {
+    if (session_owner_ != nullptr) {
+        throw std::logic_error(
+            "Tree direct selection is unavailable while a session is live");
+    }
+    return select_leaf(nullptr, 0U);
+}
+
+NodeId Tree::select_leaf(
+    const float* root_priors,
+    std::size_t root_policy_length) {
     if (pending_active_) {
         throw std::logic_error(
             "Cannot select a leaf while an evaluation is pending");
+    }
+    if ((root_priors == nullptr) != (root_policy_length == 0U)) {
+        throw std::invalid_argument(
+            "Root prior override must be null or cover the active action area");
+    }
+    if (root_priors != nullptr &&
+        root_policy_length != root_position().action_count()) {
+        throw std::invalid_argument(
+            "Root prior override length must equal the active action count");
     }
 
     pending_path_.clear();
@@ -97,7 +166,10 @@ NodeId Tree::select_leaf() {
                     "Non-terminal node has no legal action");
             }
 
-            const Action action = select_action(current, node);
+            const float* node_root_priors =
+                current == root_ ? root_priors : nullptr;
+            const Action action =
+                select_action(current, node, node_root_priors);
             pending_path_.push_back(PathEdge{current, action});
 
             NodeId child = arena_.edge_row(current).child(action);
@@ -126,6 +198,29 @@ const TerminalResult& Tree::leaf_terminal(NodeId leaf) const {
 }
 
 void Tree::accept_evaluation(
+    NodeId leaf,
+    const float* policy,
+    std::size_t policy_length,  // NOLINT(bugprone-easily-swappable-parameters)
+    float value) {
+    if (session_owner_ != nullptr) {
+        throw std::logic_error(
+            "Tree direct evaluation is unavailable while a session is live");
+    }
+    accept_evaluation_impl(leaf, policy, policy_length, value);
+}
+
+void Tree::accept_evaluation_for_session(
+    NodeId leaf,
+    const float* policy,
+    std::size_t policy_length,  // NOLINT(bugprone-easily-swappable-parameters)
+    float value) {
+    if (session_owner_ == nullptr) {
+        throw std::logic_error("Tree session evaluation requires an owner");
+    }
+    accept_evaluation_impl(leaf, policy, policy_length, value);
+}
+
+void Tree::accept_evaluation_impl(
     NodeId leaf,
     const float* policy,
     std::size_t policy_length,  // NOLINT(bugprone-easily-swappable-parameters)
@@ -225,6 +320,21 @@ void Tree::accept_evaluation(
 }
 
 void Tree::resolve_terminal(NodeId leaf) {
+    if (session_owner_ != nullptr) {
+        throw std::logic_error(
+            "Tree direct terminal resolution is unavailable while a session is live");
+    }
+    resolve_terminal_impl(leaf);
+}
+
+void Tree::resolve_terminal_for_session(NodeId leaf) {
+    if (session_owner_ == nullptr) {
+        throw std::logic_error("Tree session resolution requires an owner");
+    }
+    resolve_terminal_impl(leaf);
+}
+
+void Tree::resolve_terminal_impl(NodeId leaf) {
     validate_pending_leaf(leaf);
     const NodeMeta& node = arena_.node(leaf);
     if (!node.terminal.is_valid()) {
@@ -246,7 +356,10 @@ std::size_t Tree::legal_action_count(const NodeMeta& node) const noexcept {
     return node.legal.count();
 }
 
-Action Tree::select_action(NodeId node_id, const NodeMeta& node) const {
+Action Tree::select_action(
+    NodeId node_id,  // NOLINT(bugprone-easily-swappable-parameters)
+    const NodeMeta& node,
+    const float* root_priors) const {
     const std::size_t active_actions = action_count(node);
     const float sqrt_parent = std::sqrt(
         static_cast<float>(node.total_visits) + kPuctEpsilon);
@@ -263,7 +376,8 @@ Action Tree::select_action(NodeId node_id, const NodeMeta& node) const {
             continue;
         }
 
-        const float prior = row.prior(action);
+        const float prior =
+            root_priors == nullptr ? row.prior(action) : root_priors[index];
         if (!std::isfinite(prior) || prior < 0.0F) {
             throw std::logic_error("PUCT prior is invalid");
         }
