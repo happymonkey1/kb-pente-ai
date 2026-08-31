@@ -30,6 +30,7 @@ SearchSession::SearchSession(Tree& tree, SearchSessionConfig config)
         throw std::logic_error(
             "Cannot create a search session with a pending tree evaluation");
     }
+    invalid_policy_fallback_baseline_ = tree_.invalid_policy_fallbacks();
 
     const NodeMeta& root = tree_.arena().node(tree_.root_id());
     if (!root.terminal.is_valid()) {
@@ -72,9 +73,15 @@ std::optional<NodeId> SearchSession::select_evaluation_leaf() {
                                       root_search_priors_.data(),
                                       root_action_count)
                                 : tree_.select_leaf(nullptr, 0U);
+        ++selected_leaves_;
+        const std::size_t selected_depth = tree_.pending_path_size();
+        if (selected_depth > max_selected_path_depth_) {
+            max_selected_path_depth_ = selected_depth;
+        }
         if (tree_.leaf_terminal(leaf).is_terminal()) {
             tree_.resolve_terminal_for_session(leaf);
             ++completed_simulations_;
+            ++terminal_simulations_;
             continue;
         }
         return leaf;
@@ -99,9 +106,87 @@ void SearchSession::accept_evaluation(
     const bool is_root = leaf == tree_.root_id();
     tree_.accept_evaluation_for_session(leaf, policy, policy_length, value);
     ++completed_simulations_;
+    ++evaluator_completions_;
     if (is_root && !root_priors_initialized_) {
         initialize_root_priors();
     }
+}
+
+SearchTelemetry SearchSession::telemetry() const {
+    SearchTelemetry result{};
+    result.completed_simulations = completed_simulations_;
+    result.evaluator_completions = evaluator_completions_;
+    result.terminal_simulations = terminal_simulations_;
+    result.selected_leaves = selected_leaves_;
+    result.max_selected_path_depth = max_selected_path_depth_;
+    result.zero_visit_fallbacks = zero_visit_fallbacks_;
+
+    const std::uint64_t cumulative_fallbacks =
+        tree_.invalid_policy_fallbacks();
+    if (cumulative_fallbacks < invalid_policy_fallback_baseline_) {
+        throw std::logic_error(
+            "Tree invalid-policy fallback counter moved backwards");
+    }
+    result.invalid_policy_fallbacks =
+        cumulative_fallbacks - invalid_policy_fallback_baseline_;
+
+    const NodeMeta& root = tree_.arena().node(tree_.root_id());
+    const ConstEdgeRowView row = tree_.arena().edge_row(tree_.root_id());
+    const std::size_t active_actions = root.position.action_count();
+    result.root_legal_actions = root.legal.count();
+
+    std::uint64_t total_visit_count = 0U;
+    std::uint32_t maximum_visits = 0U;
+    for (std::size_t index = 0U; index < active_actions; ++index) {
+        const Action action = static_cast<Action>(index);
+        if (!root.legal.contains(action)) {
+            continue;
+        }
+        const std::uint32_t visits = row.visit_count(action);
+        total_visit_count += static_cast<std::uint64_t>(visits);
+        if (visits > 0U) {
+            ++result.root_children_visited;
+            if (visits > maximum_visits) {
+                maximum_visits = visits;
+            }
+        }
+    }
+    const double total_visits = static_cast<double>(total_visit_count);
+    if (!std::isfinite(total_visits)) {
+        throw std::overflow_error("Root visit count is not finite");
+    }
+    result.root_edge_visits = total_visit_count;
+
+    if (total_visits > 0.0) {
+        double entropy = 0.0;
+        for (std::size_t index = 0U; index < active_actions; ++index) {
+            const Action action = static_cast<Action>(index);
+            if (!root.legal.contains(action)) {
+                continue;
+            }
+            const std::uint32_t visits = row.visit_count(action);
+            if (visits == 0U) {
+                continue;
+            }
+            const double probability =
+                static_cast<double>(visits) / total_visits;
+            entropy -= probability * std::log(probability);
+        }
+        const double maximum_share =
+            static_cast<double>(maximum_visits) / total_visits;
+        if (!std::isfinite(entropy) || !std::isfinite(maximum_share)) {
+            throw std::overflow_error("Root visit statistics are not finite");
+        }
+        result.root_visit_entropy = static_cast<float>(entropy);
+        result.root_max_visit_share = static_cast<float>(maximum_share);
+    }
+
+    result.root_collapse_eligible =
+        result.root_legal_actions > 1U &&
+        result.root_edge_visits >= kSearchCollapseMinRootVisits;
+    result.root_search_collapsed =
+        result.root_collapse_eligible && result.root_children_visited <= 1U;
+    return result;
 }
 
 std::array<float, kMaxActions> SearchSession::root_policy() {

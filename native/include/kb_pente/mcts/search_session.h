@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "kb_pente/mcts/telemetry.h"
 #include "kb_pente/mcts/tree.h"
 
 namespace kb_pente {
@@ -82,6 +83,11 @@ public:
         return zero_visit_fallbacks_;
     }
 
+    // Return a value snapshot of session counters and root visit quality.
+    // The snapshot is valid while a session is pending, which makes rejected
+    // evaluator requests observable without changing the search state.
+    [[nodiscard]] SearchTelemetry telemetry() const;
+
     [[nodiscard]] bool root_priors_initialized() const noexcept {
         return root_priors_initialized_;
     }
@@ -111,6 +117,11 @@ private:
     SearchSessionConfig config_;
     std::array<float, kMaxActions> root_search_priors_{};
     std::uint32_t completed_simulations_ = 0U;
+    std::uint64_t evaluator_completions_ = 0U;
+    std::uint64_t terminal_simulations_ = 0U;
+    std::uint64_t selected_leaves_ = 0U;
+    std::size_t max_selected_path_depth_ = 0U;
+    std::uint64_t invalid_policy_fallback_baseline_ = 0U;
     std::uint64_t zero_visit_fallbacks_ = 0U;
     bool root_priors_initialized_ = false;
 };

@@ -95,6 +95,11 @@ if(BUILD_TESTING)
     )
     target_link_libraries(kb_pente_native_advance_tests PRIVATE kb_pente_mcts)
 
+    add_executable(kb_pente_native_telemetry_tests
+        tests/telemetry_test.cpp
+    )
+    target_link_libraries(kb_pente_native_telemetry_tests PRIVATE kb_pente_mcts)
+
     if(MSVC)
         target_compile_options(kb_pente_native_tests PRIVATE /W4 /permissive-)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -151,6 +156,12 @@ if(BUILD_TESTING)
         target_compile_options(kb_pente_native_advance_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
+    if(MSVC)
+        target_compile_options(kb_pente_native_telemetry_tests PRIVATE /W4 /permissive-)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_telemetry_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(kb_pente_native_mcts_tests PRIVATE
             -fsanitize=address,undefined
@@ -191,6 +202,16 @@ if(BUILD_TESTING)
         )
     endif()
 
+    if(KB_PENTE_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kb_pente_native_telemetry_tests PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(kb_pente_native_telemetry_tests PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
     add_test(NAME kb_pente_native_core COMMAND kb_pente_native_tests)
     add_test(NAME kb_pente_native_arena COMMAND kb_pente_native_mcts_tests)
     add_test(NAME kb_pente_native_search COMMAND kb_pente_native_search_tests)
@@ -199,6 +220,7 @@ if(BUILD_TESTING)
         COMMAND kb_pente_native_search_session_tests
     )
     add_test(NAME kb_pente_native_advance COMMAND kb_pente_native_advance_tests)
+    add_test(NAME kb_pente_native_telemetry COMMAND kb_pente_native_telemetry_tests)
 
     set(KB_PENTE_DIFFERENTIAL_PYTHON "" CACHE FILEPATH
         "Python interpreter with the project dependencies for differential tests")
