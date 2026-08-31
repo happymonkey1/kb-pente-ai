@@ -1,36 +1,183 @@
-
 # kb-pente-ai
 
-AlphaZero inspired machine learning applied to the board game Pente.
+AlphaZero-inspired policy/value learning for Pente.
 
-Spiritual successor to my [college thesis' source code](https://github.com/happymonkey1/uci-chc-NNUE-thesis).
+The current implementation is a correctness-first reconstruction of the original project. It uses complete Pente state, tested MCTS, batched self-play inference, versioned artifacts, and structured telemetry.
 
-## Dependencies
+## Requirements
+
+- Python 3.10 through 3.12
 - [uv](https://docs.astral.sh/uv/)
-  - `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- CUDA-capable PyTorch installation for GPU training
 
-## Developer Setup
+## Setup
 
-- `uv sync`
+~~~bash
+uv sync
+~~~
 
-## Usage
+The repository scripts use the local .venv directly so Windows executables cannot be selected accidentally under WSL.
 
-Run training starting from scratch:
-```bash
-uv run python main.py --model-dir=pente-model-v1.9 --batch-games=64 --batch-size=512 --arena --num-arena-games=35 --temp-threshold=5 --mcts-sim=40 --gpu
-```
+## Validation
 
-Run training starting from a checkpoint:
-```bash
-uv run python main.py --model-dir=pente-model-v1.6 --model=pente-model-v1.5/checkpoint-30_19_361_5_128_1.pth.tar --batch-games=96 --batch-size=1024 --arena --num-arena-games=35 --temp-threshold=9 --mcts-sim=15 --gpu
-```
+Run the complete local gate:
 
-Run training starting from scratch and force processing of a raw dataset:
-```bash
-uv run python main.py --model-dir=pente-model-v1.5 --batch-games=1 --arena --raw-dataset=data/pente_dataset.txt --processed-dataset=data/pente-dataset-processed.pkl --force-dataset-processing
-```
+~~~bash
+./script/check.sh
+~~~
 
-Start inference and self-play evaluation
-```bash
-uv run python main.py --model-dir=PATH_TO_MODEL_DIR --model=PATH_TO_MODEL --infer --infer-mcts --batch-games=64 --batch-size=512 --arena --num-arena-games=35 --temp-threshold=5 --mcts-sim=40 --gpu
-```
+Each command is mirrored to the terminal and preserved in a uniquely named temporary log.
+
+The gate covers compilation, mypy, all unit and regression tests, batched-search equivalence, full state contracts, model lifecycle, professional preprocessing, replay persistence, telemetry, tactical fixtures, and the 32-example tiny-learning proof.
+
+Run only the explicit tiny-learning proof:
+
+~~~bash
+./script/run-venv.sh python script/verify-tiny-learning.py
+~~~
+
+The evidence-oriented scripts return a nonzero status when their declared gate fails:
+
+~~~bash
+./script/run-venv.sh python script/verify-professional-learning.py METRICS.jsonl
+./script/run-venv.sh python script/benchmark-batched-search.py
+./script/run-venv.sh python script/verify-random-play.py CHECKPOINT
+./script/run-venv.sh python script/verify-model-improvement.py CANDIDATE BASELINE
+~~~
+
+## Rulesets
+
+standard is the default and matches the checked-in professional dataset: Player 1's first move is the center intersection. The rules follow the [Pente.org game rules](https://www.pente.org/help/helpWindow.jsp?file=playGameRules).
+
+tournament also requires Player 1's second move to be at least three intersections from center.
+
+freestyle permits any empty opening and is useful for small deterministic tests.
+
+The ruleset is stored in processed data and checkpoint metadata. Artifacts from different rulesets cannot be mixed silently.
+
+## Debug training
+
+This small CPU run is useful for exercising self-play, batched MCTS, training, checkpointing, and telemetry:
+
+~~~bash
+./script/run-venv.sh python main.py \
+  --board-size 5 \
+  --ruleset freestyle \
+  --self-play-iterations 1 \
+  --batch-games 8 \
+  --active-games 8 \
+  --batch-size 32 \
+  --mcts-sim 8 \
+  --model-blocks 1 \
+  --model-channels 16 \
+  --model-hidden-size 32 \
+  --telemetry-file metrics/debug.jsonl
+~~~
+
+## Professional data
+
+The raw dataset is processed transactionally. Every accepted target is paired with its legal pre-move state. Games are assigned deterministically to training or validation before positions are aggregated, preventing game-level leakage. Identical complete states aggregate their observed policy and value targets within their split.
+
+To rebuild the versioned cache and run one professional training iteration:
+
+~~~bash
+./script/run-venv.sh python main.py \
+  --professional-iterations 1 \
+  --self-play-iterations 0 \
+  --force-dataset-processing \
+  --processed-dataset data/pente-dataset-v3.pkl
+~~~
+
+The corrected four-plane input and target semantics are incompatible with legacy checkpoints and processed caches. The loader rejects them with an explicit error.
+
+Professional validation is measured before and after the learner update. The verifier's defaults require a 5 percent cross-entropy reduction, top-1 and top-5 accuracy gains, and no material value-MSE regression.
+
+## Replay and resume
+
+Replay entries record whether they came from professional data or self-play. Once both sources exist, `--professional-replay-fraction` controls their learner-batch mix. Sampling uses replacement when necessary so `batch size * learner steps` remains the actual learner budget.
+
+Replay snapshots are versioned and include the training run identifier, generation, ruleset, board size, position schema, and training-example schema. Resuming training never silently creates an empty replay.
+
+Resume in the original model directory:
+
+~~~bash
+./script/run-venv.sh python main.py \
+  --model MODEL_DIR/latest.pth.tar \
+  --model-dir MODEL_DIR
+~~~
+
+When writing continued checkpoints elsewhere, identify the source replay explicitly:
+
+~~~bash
+./script/run-venv.sh python main.py \
+  --model SOURCE/checkpoint-N.pth.tar \
+  --resume-replay SOURCE/replay-latest.pkl \
+  --model-dir DESTINATION
+~~~
+
+If a supervised checkpoint intentionally has no replay, `--seed-replay-from-professional` rebuilds the learner replay from the compatible professional cache. This is explicit because it changes training state.
+
+## First serious 19 by 19 configuration
+
+Use this only after the local gate and a small debug run pass on the target machine:
+
+~~~bash
+./script/run-venv.sh python main.py \
+  --gpu \
+  --compile \
+  --ruleset standard \
+  --board-size 19 \
+  --model-blocks 6 \
+  --model-channels 128 \
+  --model-hidden-size 256 \
+  --mcts-sim 64 \
+  --batch-games 512 \
+  --active-games 128 \
+  --batch-size 512 \
+  --learner-steps 256 \
+  --temp-threshold 16 \
+  --max-training-examples 1000000 \
+  --arena \
+  --eval-interval 5 \
+  --num-arena-games 40 \
+  --arena-opening-plies 4 \
+  --telemetry-file metrics/training-19x19.jsonl
+~~~
+
+Completed games are replenished until all 512 games are generated, keeping approximately 128 active outside the final drain. Arena openings are seeded and paired: each opening is replayed with model colors swapped. Arena results are measurements. They never reject the latest model or stop the learning stream.
+
+## Inference
+
+~~~bash
+./script/run-venv.sh python main.py \
+  --infer \
+  --model PATH_TO_SCHEMA_V2_CHECKPOINT \
+  --infer-mcts \
+  --infer-games 40
+~~~
+
+## Telemetry
+
+Training writes JSONL records with a stable schema. Current metrics include:
+
+- root children visited, visit entropy, and maximum visit share;
+- unique trajectories and positions;
+- leaf evaluations per second;
+- min, mean, median, p95, and maximum inference batch size;
+- sustained batch occupancy outside the final active-game drain;
+- duplicate leaf rate and leaf-evaluation throughput;
+- self-play positions and games per second;
+- policy loss and KL;
+- value MSE, absolute error, and bias;
+- first-player, second-player, draw, and capture-win counts;
+- replay size, source mix, uniqueness, generation lag, and age;
+- arena game and paired-opening results against the prior model and random play;
+- unique paired openings and model-identity wins by color;
+- search-collapse warnings and invalid-policy fallbacks;
+- fixed tactical-suite accuracy;
+- sampled mean, p95, and maximum GPU utilization for self-play and learning;
+- device-wide memory percentage plus peak Torch allocation and reservation.
+
+Passing `--gpu` is strict. Training exits with a diagnostic if Torch cannot access CUDA; it never silently falls back to CPU. WSL GPU access may need to be granted outside a restricted execution sandbox even when `nvidia-smi` works in an ordinary WSL terminal.
+
+The implementation journal and original diagnosis are stored in the kb-pente-ai Codex vault.

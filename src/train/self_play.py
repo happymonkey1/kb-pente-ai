@@ -1,303 +1,462 @@
+from __future__ import annotations
+
 import copy
-import math
-import time
-
-import tqdm
-
-from src.game.pente.pente_game import PenteGame
-from src.mcts.mcts_v2 import MCTS, MCTSArgs
-from src.model.model_v1 import PenteNet
-from src.game.game import Game
-from src.pente_dataloader import PenteDataset
-
 from dataclasses import dataclass
-import torch
-from torch.utils.data import DataLoader
-import numpy as np
-import logging
 import os
+import shutil
+import tempfile
+import time
+import uuid
 
-from src.train.arena import Arena
-from src.train.nnet_player import NNetPlayer
+import numpy as np
+import torch
+
+from src.evaluation.supervised import (
+    evaluate_supervised_examples,
+    supervised_evaluation_metrics,
+)
+from src.game.pente.pente_game import PenteGame
+from src.mcts.batched import BatchedSearchTelemetry
+from src.mcts.mcts_v2 import MCTSArgs
+from src.model.model_v1 import PenteNet
+from src.monitoring.cuda_metrics import measure_cuda_operation
+from src.telemetry import MetricSink, NullMetricSink
+from src.train.iteration_evaluation import evaluate_training_iteration
+from src.train.learner import ModelTrainingStats, train_policy_value_model
 from src.train.profession_game_loader import ProfessionGameLoader
+from src.train.replay_buffer import ReplayBuffer, ReplaySource
+from src.train.self_play_generation import (
+    PlayedGame,
+    SelfPlayGenerator,
+    finalize_training_examples,
+)
+from src.train.self_play_metrics import collect_self_play_metrics
+from src.train.training_example import TrainingExample
 
-logger = logging.getLogger(__name__)
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class SelfPlayTrainerArgs:
     start_iteration: int
     professional_games_training_iterations: int
     self_play_training_iterations: int
-    # Threshold for random exploration
-    temp_threshold: float
+    temp_threshold: int
     mcts_args: MCTSArgs
     watch_training_raw_dataset_filepath: str
     watch_training_processed_dataset_filepath: str
     force_watch_training_raw_dataset_processing: bool
-    eval_iteration_interval: int = 1
-    num_arena_games: int = 100
-    batch_size: int = 8192
+    eval_iteration_interval: int = 5
+    num_arena_games: int = 40
+    batch_size: int = 512
     batch_games: int = 1
-    update_threshold: float = 0.6
+    active_games: int = 128
     checkpoint_dir: str = "checkpoints"
     should_checkpoint: bool = True
-    max_training_examples: int = 65536
-    board_size: int = 19
-    player_count: int = 2
+    max_training_examples: int = 500_000
     debug: bool = False
-    should_use_arena: bool = True
+    should_use_arena: bool = False
+    seed: int = 0
+    augment_training: bool = True
+    replay_checkpoint_interval: int = 5
+    learner_steps_per_iteration: int = 256
+    arena_opening_plies: int = 4
+    resume_replay_filepath: str | None = None
+    seed_replay_from_professional: bool = False
+    training_run_id: str | None = None
+    expected_replay_generation: int | None = None
+    professional_replay_fraction: float = 0.25
 
-@dataclass
-class ModelTrainingStats:
-    total_loss: float
-    total_policy_loss: float
-    total_value_loss: float
-    num_batches: int
+    def __post_init__(self) -> None:
+        if self.start_iteration < 0:
+            raise ValueError("Start iteration cannot be negative")
+        if self.professional_games_training_iterations < 0 or self.self_play_training_iterations < 0:
+            raise ValueError("Training iteration counts cannot be negative")
+        if self.temp_threshold < 0:
+            raise ValueError("Temperature threshold cannot be negative")
+        if self.eval_iteration_interval < 1:
+            raise ValueError("Evaluation interval must be positive")
+        if self.batch_size < 1 or self.batch_games < 1 or self.active_games < 1:
+            raise ValueError("Training batch and game counts must be positive")
+        if self.max_training_examples < 1:
+            raise ValueError("Replay capacity must be positive")
+        if self.replay_checkpoint_interval < 1:
+            raise ValueError("Replay checkpoint interval must be positive")
+        if self.learner_steps_per_iteration < 1:
+            raise ValueError("Learner steps per iteration must be positive")
+        if self.arena_opening_plies < 0:
+            raise ValueError("Arena opening plies cannot be negative")
+        if self.start_iteration == 0 and self.resume_replay_filepath is not None:
+            raise ValueError("A replay snapshot can only resume a nonzero iteration")
+        if self.start_iteration == 0 and self.seed_replay_from_professional:
+            raise ValueError("Professional replay seeding is only valid when resuming")
+        if self.resume_replay_filepath is not None and self.seed_replay_from_professional:
+            raise ValueError("Choose either a replay snapshot or professional replay seeding")
+        if self.start_iteration > 0 and not self.training_run_id:
+            raise ValueError("Resumed training requires a checkpoint training run identifier")
+        if self.start_iteration == 0 and self.expected_replay_generation is not None:
+            raise ValueError("A new run cannot expect an existing replay generation")
+        if (
+            self.expected_replay_generation is not None
+            and not 0 <= self.expected_replay_generation <= self.start_iteration
+        ):
+            raise ValueError("Expected replay generation is outside the checkpoint history")
+        if not 0 <= self.professional_replay_fraction <= 1:
+            raise ValueError("Professional replay fraction must be between zero and one")
+
 
 class SelfPlayTrainer:
-
     def __init__(
         self,
-        game: 'Game',
-        net: 'PenteNet',
-        optimizer,
-        device,
-        args: SelfPlayTrainerArgs
-    ):
-        self.training_examples: list = []
+        game: PenteGame,
+        net: PenteNet,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        args: SelfPlayTrainerArgs,
+        metric_sink: MetricSink | None = None,
+    ) -> None:
+        self.args = args
+        self._replay_snapshot_path = os.path.join(
+            args.checkpoint_dir,
+            "replay-latest.pkl",
+        )
+        self.training_run_id = args.training_run_id or uuid.uuid4().hex
+        self._replay_source: str | None
+        resume_replay_path = args.resume_replay_filepath or self._default_resume_replay_path(
+            args.expected_replay_generation,
+        )
+        if (
+            args.start_iteration > 0
+            and args.resume_replay_filepath is not None
+            and not os.path.exists(resume_replay_path)
+        ):
+            raise FileNotFoundError(f"Replay snapshot not found: {resume_replay_path}")
+        if args.start_iteration > 0 and os.path.exists(resume_replay_path):
+            self.replay = ReplayBuffer.load(
+                resume_replay_path,
+                expected_training_run_id=self.training_run_id,
+                expected_board_size=game.get_board_size(),
+                expected_ruleset=game.ruleset.value,
+            )
+            if self.replay.capacity != args.max_training_examples:
+                raise ValueError("Replay snapshot capacity does not match trainer configuration")
+            assert self.replay.snapshot_generation is not None
+            if self.replay.snapshot_generation > args.start_iteration:
+                raise ValueError("Replay snapshot is newer than the resumed model checkpoint")
+            if (
+                args.expected_replay_generation is not None
+                and self.replay.snapshot_generation
+                != args.expected_replay_generation
+            ):
+                raise ValueError("Replay generation does not match the model checkpoint")
+            self._replay_source = os.path.abspath(resume_replay_path)
+        elif args.start_iteration > 0 and not args.seed_replay_from_professional:
+            raise ValueError(
+                "Resuming training requires a compatible replay snapshot or explicit "
+                "professional replay seeding"
+            )
+        else:
+            self.replay = ReplayBuffer(args.max_training_examples)
+            self._replay_source = None
         self.net = net
         self.game = game
         self.optimizer = optimizer
         self.device = device
-        self.args = args
-
-        self.policy_loss = torch.nn.CrossEntropyLoss()
-        self.value_loss = torch.nn.MSELoss()
-
+        self.metric_sink = metric_sink if metric_sink is not None else NullMetricSink()
+        self.rng = np.random.default_rng(args.seed)
         self.previous_net = copy.deepcopy(self.net)
+        self.professional_validation_examples: list[TrainingExample] = []
 
-    def __play_game(self):
-        examples = []
-        board = self.game.init_board()
-        current_player = Game.PLAYER_ONE
-        step = 0
-        mcts = MCTS(self.game, self.net, self.args.mcts_args)
+    def play_game(self) -> PlayedGame:
+        self.net.eval()
+        return self._self_play_generator().play_game()
 
-        while True:
-            step += 1
-            canonical_board = self.game.get_canonical_form(board, current_player)
-            temp = int(step < self.args.temp_threshold)
+    def build_self_play_training_examples(
+        self,
+    ) -> tuple[list[TrainingExample], list[PlayedGame], list[BatchedSearchTelemetry]]:
+        self.net.eval()
+        games, batches = self._self_play_generator().play_games(
+            self.args.batch_games,
+            self.args.active_games,
+        )
+        examples = [example for game in games for example in game.examples]
+        return examples, games, batches
 
-            pi = mcts.get_action_prob(canonical_board, temp=temp)
+    def _self_play_generator(self) -> SelfPlayGenerator:
+        return SelfPlayGenerator(
+            self.game,
+            self.net,
+            self.args.mcts_args,
+            self.args.temp_threshold,
+            self.rng,
+        )
 
-            symmetries = self.game.get_symmetries(canonical_board, pi)
-            for b, p in symmetries:
-                examples.append([b, current_player, p, None])
+    def _default_resume_replay_path(self, expected_generation: int | None) -> str:
+        if expected_generation is not None:
+            versioned_path = self._replay_generation_path(expected_generation)
+            if os.path.exists(versioned_path):
+                return versioned_path
+        return self._replay_snapshot_path
 
-            action = np.random.choice(len(pi), p=pi)
-            board, next_player = self.game.apply_action(board, current_player, action)
+    def _replay_generation_path(self, generation: int) -> str:
+        return os.path.join(self.args.checkpoint_dir, f"replay-{generation}.pkl")
 
-            is_terminal, winner = self.game.check_game_end(board, current_player)
-            if is_terminal:
-                return [(x[0], x[2], winner) for x in examples]
-
-            current_player = next_player
-
-    def __build_self_play_training_examples(self):
-        training_examples = []
-
-        for game_index in tqdm.tqdm(range(self.args.batch_games)):
-            training_examples += self.__play_game()
-
-        return training_examples
-
-    def __load_training_examples(self):
+    def load_professional_training_examples(self) -> list[TrainingExample]:
         loader = ProfessionGameLoader(
             raw_filepath=self.args.watch_training_raw_dataset_filepath,
             processed_filepath=self.args.watch_training_processed_dataset_filepath,
             board_size=self.game.get_board_size(),
-            force=self.args.force_watch_training_raw_dataset_processing
+            force=self.args.force_watch_training_raw_dataset_processing,
+            ruleset=self.game.ruleset,
         )
-        return loader.load_games()
+        examples = loader.load_games()
+        self.professional_validation_examples = loader.validation_examples
+        if loader.last_stats is not None:
+            stats = loader.last_stats
+            self.metric_sink.emit(
+                "professional_data",
+                0,
+                {
+                    "accepted_games": stats.accepted_games,
+                    "rejected_games": stats.rejected_games,
+                    "accepted_positions": stats.accepted_positions,
+                    "deduplicated_positions": stats.deduplicated_positions,
+                    "non_terminal_games": stats.non_terminal_games,
+                    "training_games": stats.training_games,
+                    "validation_games": stats.validation_games,
+                    "training_positions": stats.training_positions,
+                    "validation_positions": stats.validation_positions,
+                },
+            )
+        return examples
 
-    def __get_training_examples_for_current_iteration(self, iteration: int):
-        if self.args.professional_games_training_iterations > 0 and iteration < self.args.professional_games_training_iterations:
-            if iteration == 0 or len(self.training_examples) == 0:
-                logger.info("Loading training examples from professional games...")
-                return self.__load_training_examples()
-            else:
-                return []
-        else:
-            logger.info("Generating training examples from self-play games...")
-            return self.__build_self_play_training_examples()
+    def train(self) -> None:
+        total_iterations = (
+            self.args.professional_games_training_iterations
+            + self.args.self_play_training_iterations
+        )
+        professional_examples: list[TrainingExample] | None = None
 
-    def __save_training_examples(self, training_examples):
-        pass
-
-    def train(self):
-        logger.info("Entered training loop")
-        total_iterations = self.args.professional_games_training_iterations + self.args.self_play_training_iterations
-        for iteration in range(self.args.start_iteration, total_iterations):
-            iter_start_time = time.time()
-            logger.info(f"=== Iteration {iteration + 1}/{total_iterations} ===")
-
-            sp_start_time = time.time()
-
-            training_examples = self.__get_training_examples_for_current_iteration(iteration)
-            sp_time = time.time() - sp_start_time
-            logger.info(f"Generated {self.args.batch_games} training examples in {sp_time:.2f}s "
-                        f"({self.args.batch_games / sp_time:.2f} examples/sec)")
-
-            self.training_examples += training_examples
-
-            if not self.training_examples:
-                logger.warning("No training examples were generated in this iteration. Skipping training.")
-                continue
-
-            if 0 < self.args.max_training_examples < len(self.training_examples):
-                logger.info(f"Removing {len(self.training_examples) - self.args.max_training_examples} training examples")
-                self.training_examples = self.training_examples[-self.args.max_training_examples:]
-
-            flat_examples = [item for item in training_examples]
-            logger.info(f"Collected {len(flat_examples)} training positions ({len(flat_examples) / sp_time} positions/sec)")
-
-            train_start_time = time.time()
-            stats = self.__train_model(self.training_examples)
-            train_time = time.time() - train_start_time
-
-            avg_loss = stats.total_loss / stats.num_batches
-            avg_policy_loss = stats.total_policy_loss / stats.num_batches
-            avg_value_loss = stats.total_value_loss / stats.num_batches
-
-            logger.info(f"Training completed in {train_time:.2f}s")
-            logger.info(f"Avg Loss: {avg_loss:.4f} "
-                        f"(Policy: {avg_policy_loss:.4f}, Value: {avg_value_loss:.4f})")
-            logger.info(f"Training used {stats.num_batches} batches")
-
-            total_iter_time = time.time() - iter_start_time
-            logger.info(f"Iteration {iteration + 1} took {total_iter_time:.2f}s")
-
-            if self.args.should_use_arena and self.args.num_arena_games > 0 and iteration >= self.args.professional_games_training_iterations:
-                logger.info(f"Beginning Arena evaluation")
-
-                # Load previous network from cached weights
-                if self.args.should_checkpoint:
-                    path = os.path.join(self.args.checkpoint_dir, 'best.pth.tar')
-                    if os.path.exists(path):
-                        PenteNet.load_checkpoint(
-                            checkpoint_dir=self.args.checkpoint_dir,
-                            net=self.previous_net,
-                            filename='best.pth.tar'
-                        )
-                    else:
-                        logger.warn(f"Failed to retrieve best model from '{path}'")
-
-
-                logger.info("Initializing Arena")
-                arena_start = time.time()
-                previous_mcts = MCTS(self.game, self.previous_net, self.args.mcts_args)
-                current_mcts = MCTS(self.game, self.net, self.args.mcts_args)
-                arena = Arena(
-                    player1=NNetPlayer(self.previous_net, previous_mcts),
-                    player2=NNetPlayer(self.net, current_mcts),
-                    game=self.game,
-                    debug=self.args.debug,
-                )
-                arena_time = time.time() - arena_start
-                logger.info(f"Arena initialized in {arena_time:.2f}s")
-
-                arena_play_start = time.time()
-                arena_stats = arena.play_games(self.args.num_arena_games)
-                arena_play_time = time.time() - arena_play_start
-                logger.info(f"Arena played {self.args.num_arena_games} games in {arena_play_time:.2f}s")
-                previous_wins, current_wins, draws = arena_stats.p1_wins, arena_stats.p2_wins, arena_stats.draws
-
-                logger.info(f"Arena stats:\n  previous model wins: {previous_wins}\n  current model wins: {current_wins}\n  draws: {draws}")
-                win_rate = float(current_wins) / float(previous_wins + current_wins)
-                logger.info(f"New model win rate: {win_rate:.2%}")
-                avg_moves = arena_stats.avg_moves
-                logger.info(f"Average moves: {avg_moves:.2f}")
-
-                if previous_wins + current_wins == 0 or win_rate < self.args.update_threshold:
-                    logger.info(f"Skipping model update due to low performance")
-                    PenteNet.load_checkpoint(
-                        checkpoint_dir=self.args.checkpoint_dir,
-                        net=self.net,
-                        filename='best.pth.tar',
+        if self.args.start_iteration > 0:
+            if self.args.seed_replay_from_professional and not self.replay:
+                professional_examples = self.load_professional_training_examples()
+                if len(professional_examples) > self.replay.capacity:
+                    raise ValueError(
+                        "Replay capacity cannot hold the requested professional seed"
                     )
-                else:
-                    logger.info(f"Accepting new model due to high performance")
-                    if self.args.should_checkpoint:
-                        training_state = {
-                            'iteration': iteration + 1,
-                            'state_dict': self.net.state_dict(),
-                            'optimizer': self.optimizer.state_dict(),
-                        }
-                        PenteNet.save_checkpoint(
-                            state=training_state,
-                            checkpoint_dir=self.args.checkpoint_dir,
-                            filename=self.net.get_checkpoint_file_name(iteration + 1)
-                        )
-                        PenteNet.save_checkpoint(
-                            state=training_state,
-                            checkpoint_dir=self.args.checkpoint_dir,
-                            filename='best.pth.tar'
-                        )
-            elif self.args.should_checkpoint:
-                logger.info("Arena is not enabled. Checkpointing model")
-                training_state = {
-                    'iteration': iteration + 1,
-                    'state_dict': self.net.state_dict(),
-                    'optimizer': self.optimizer.state_dict(),
-                }
-                PenteNet.save_checkpoint(
-                    state=training_state,
-                    checkpoint_dir=self.args.checkpoint_dir,
-                    filename=self.net.get_checkpoint_file_name(iteration + 1)
+                self.replay.extend(
+                    professional_examples,
+                    generation=self.args.start_iteration,
+                    source=ReplaySource.PROFESSIONAL,
+                )
+                self.metric_sink.emit(
+                    "replay_seed",
+                    self.args.start_iteration,
+                    {
+                        "source": "professional",
+                        "positions": len(professional_examples),
+                        "capacity": self.replay.capacity,
+                    },
+                )
+            elif self.replay.snapshot_generation is not None:
+                self.metric_sink.emit(
+                    "replay_resume",
+                    self.args.start_iteration,
+                    {
+                        "source": self._replay_source,
+                        "snapshot_generation": self.replay.snapshot_generation,
+                        "model_generation": self.args.start_iteration,
+                        "generation_lag": (
+                            self.args.start_iteration - self.replay.snapshot_generation
+                        ),
+                        "positions": len(self.replay),
+                    },
                 )
 
-    def __train_model(self, training_examples: list[tuple[np.ndarray, np.ndarray, float]]) -> ModelTrainingStats:
-        num_batches = 0
-        pin_memory = True if self.device != torch.device("cpu") else False
-        dataloader = DataLoader(
-            PenteDataset(training_examples),
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            pin_memory=pin_memory,
+        if self.args.should_checkpoint and self.args.start_iteration == 0:
+            self._save_checkpoint(0)
+
+        for iteration in range(self.args.start_iteration, total_iterations):
+            iteration_started = time.perf_counter()
+            self.previous_net.load_state_dict(self.net.state_dict())
+            self.previous_net.eval()
+
+            is_professional = iteration < self.args.professional_games_training_iterations
+            generation_started = time.perf_counter()
+            played_games: list[PlayedGame] = []
+            search_batches: list[BatchedSearchTelemetry] = []
+            if is_professional:
+                if professional_examples is None:
+                    professional_examples = self.load_professional_training_examples()
+                new_examples = professional_examples if iteration == 0 else []
+                if iteration == 0 and self.professional_validation_examples:
+                    baseline = evaluate_supervised_examples(
+                        self.net,
+                        self.game,
+                        self.professional_validation_examples,
+                        self.args.batch_size,
+                    )
+                    self.metric_sink.emit(
+                        "professional_validation_baseline",
+                        0,
+                        supervised_evaluation_metrics(baseline),
+                    )
+            else:
+                generation_result, generation_cuda_metrics = measure_cuda_operation(
+                    self.device,
+                    self.build_self_play_training_examples,
+                )
+                new_examples, played_games, search_batches = generation_result
+            generation_seconds = time.perf_counter() - generation_started
+
+            self.replay.extend(
+                new_examples,
+                generation=iteration + 1,
+                source=(
+                    ReplaySource.PROFESSIONAL
+                    if is_professional
+                    else ReplaySource.SELF_PLAY
+                ),
+            )
+            if not self.replay:
+                raise RuntimeError("No training examples are available")
+            learner_sample = self.replay.sample_mixed(
+                self.args.batch_size * self.args.learner_steps_per_iteration,
+                self.rng,
+                self.args.professional_replay_fraction,
+            )
+            learner_examples = learner_sample.examples
+
+            training_started = time.perf_counter()
+            training_stats, learner_cuda_metrics = measure_cuda_operation(
+                self.device,
+                lambda: self.train_model(learner_examples),
+            )
+            training_seconds = time.perf_counter() - training_started
+            replay_stats = self.replay.stats(iteration + 1)
+
+            metrics: dict[str, int | float] = {
+                "new_positions": len(new_examples),
+                "new_unique_positions": len({example.position.state_key() for example in new_examples}),
+                "replay_positions": replay_stats.size,
+                "replay_unique_positions": replay_stats.unique_positions,
+                "replay_professional_positions": replay_stats.professional_positions,
+                "replay_self_play_positions": replay_stats.self_play_positions,
+                "replay_oldest_age": replay_stats.oldest_age,
+                "replay_mean_age": replay_stats.mean_age,
+                "learner_positions": len(learner_examples),
+                "learner_professional_positions": learner_sample.professional_positions,
+                "learner_self_play_positions": learner_sample.self_play_positions,
+                "generation_seconds": generation_seconds,
+                "training_seconds": training_seconds,
+                "iteration_seconds": time.perf_counter() - iteration_started,
+                "loss": training_stats.total_loss / training_stats.num_batches,
+                "policy_loss": training_stats.total_policy_loss / training_stats.num_batches,
+                "policy_kl": training_stats.total_policy_kl / training_stats.num_batches,
+                "value_loss": training_stats.total_value_loss / training_stats.num_batches,
+                "value_absolute_error": (
+                    training_stats.total_value_absolute_error / training_stats.num_batches
+                ),
+                "value_bias": training_stats.total_value_bias / training_stats.num_batches,
+            }
+            metrics.update(training_stats.value_metrics.to_metrics())
+            if not is_professional and generation_cuda_metrics is not None:
+                metrics.update(generation_cuda_metrics.to_metrics("self_play_gpu"))
+            if learner_cuda_metrics is not None:
+                metrics.update(learner_cuda_metrics.to_metrics("learner_gpu"))
+            if played_games:
+                metrics.update(
+                    collect_self_play_metrics(
+                        played_games,
+                        search_batches,
+                        generation_seconds,
+                    )
+                )
+            if is_professional and self.professional_validation_examples:
+                validation = evaluate_supervised_examples(
+                    self.net,
+                    self.game,
+                    self.professional_validation_examples,
+                    self.args.batch_size,
+                )
+                metrics.update(supervised_evaluation_metrics(validation))
+            self.metric_sink.emit("training_iteration", iteration + 1, metrics)
+
+            if (
+                self.args.should_use_arena
+                and self.args.num_arena_games > 0
+                and (iteration + 1) % self.args.eval_iteration_interval == 0
+            ):
+                evaluate_training_iteration(
+                    self.game,
+                    self.previous_net,
+                    self.net,
+                    self.args.mcts_args,
+                    self.metric_sink,
+                    iteration + 1,
+                    self.args.num_arena_games,
+                    self.args.arena_opening_plies,
+                    self.args.debug,
+                    self.args.seed,
+                )
+            if self.args.should_checkpoint:
+                self._save_checkpoint(iteration + 1)
+
+    def train_model(self, training_examples: list[TrainingExample]) -> ModelTrainingStats:
+        return train_policy_value_model(
+            self.net,
+            self.optimizer,
+            self.device,
+            self.game,
+            training_examples,
+            self.args.batch_size,
+            self.args.augment_training,
         )
-        total_loss, total_policy_loss, total_value_loss = 0, 0, 0
 
-        logger.info(f"Training with {len(training_examples)} training positions")
-        logger.info(f"  batches: {math.ceil(len(training_examples) / self.args.batch_size)}")
-        logger.info(f"  pin_memory: {pin_memory}")
-        for batch_idx, batch in tqdm.tqdm(enumerate(dataloader, 1)):
-            batch_start_time = time.time()
-            states, target_policies, target_values = batch
-            states = states.to(self.device, non_blocking=pin_memory)
-            target_policies = target_policies.to(self.device, non_blocking=pin_memory)
-            target_values = target_values.to(self.device, non_blocking=pin_memory).view(-1, 1)
+    def _save_checkpoint(self, iteration: int) -> None:
+        if (
+            not os.path.exists(self._replay_snapshot_path)
+            or iteration <= 1
+            or iteration % self.args.replay_checkpoint_interval == 0
+        ):
+            versioned_replay_path = self._replay_generation_path(iteration)
+            self.replay.save(
+                versioned_replay_path,
+                generation=iteration,
+                training_run_id=self.training_run_id,
+                board_size=self.game.get_board_size(),
+                ruleset=self.game.ruleset.value,
+            )
+            _replace_with_link_or_copy(
+                versioned_replay_path,
+                self._replay_snapshot_path,
+            )
+        state: dict[str, object] = {
+            "iteration": iteration,
+            "state_dict": self.net.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "metadata": self.net.checkpoint_metadata(self.game.ruleset.value),
+            "replay_snapshot_generation": self.replay.snapshot_generation,
+            "training_run_id": self.training_run_id,
+        }
+        PenteNet.save_checkpoint(
+            state,
+            self.args.checkpoint_dir,
+            self.net.get_checkpoint_file_name(iteration),
+        )
+        PenteNet.save_checkpoint(state, self.args.checkpoint_dir, "latest.pth.tar")
 
-            self.optimizer.zero_grad()
 
-            pred_policies_logits, pred_values = self.net.forward(states)
-
-            p_loss = self.policy_loss(pred_policies_logits, target_policies.type(dtype=torch.float32))
-            v_loss = self.value_loss(pred_values, target_values)
-            loss = p_loss + v_loss
-
-            loss.backward()
-
-            torch.nn.utils.clip_grad_value_(self.net.parameters(), 1.0)
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            total_policy_loss += p_loss.item()
-            total_value_loss += v_loss.item()
-            num_batches += 1
-
-            batch_time = time.time() - batch_start_time
-            if self.args.debug:
-                logger.info(f"Finished batch {batch_idx} in {batch_time:.2f} seconds")
-
-        return ModelTrainingStats(total_loss, total_policy_loss, total_value_loss, num_batches)
-
+def _replace_with_link_or_copy(source: str, destination: str) -> None:
+    directory = os.path.dirname(os.path.abspath(destination))
+    os.makedirs(directory, exist_ok=True)
+    file_descriptor, temporary_path = tempfile.mkstemp(dir=directory)
+    os.close(file_descriptor)
+    os.unlink(temporary_path)
+    try:
+        try:
+            os.link(source, temporary_path)
+        except OSError:
+            shutil.copy2(source, temporary_path)
+        os.replace(temporary_path, destination)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)

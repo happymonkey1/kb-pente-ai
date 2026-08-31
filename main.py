@@ -1,251 +1,218 @@
-import argparse
+from __future__ import annotations
 
-from src.game.pente.pente_game import PenteGame
-from src.mcts.mcts_v2 import MCTSArgs, MCTS
-from src.model.model_v1 import PenteNet
-from torch import optim
+import argparse
 import logging
 from logging.handlers import RotatingFileHandler
-import torch
-import numpy as np
 
+import numpy as np
+import torch
+
+from src.device import select_torch_device
+from src.game.pente.pente_game import PenteGame
+from src.game.pente.rules import PenteRuleset
+from src.mcts.mcts_v2 import MCTS, MCTSArgs
+from src.model.model_v1 import PenteNet
+from src.telemetry import JsonlMetricSink
 from src.train.arena import Arena
 from src.train.nnet_player import NNetPlayer
 from src.train.random_player import RandomPlayer
 from src.train.self_play import SelfPlayTrainer, SelfPlayTrainerArgs
 
+
 logger = logging.getLogger(__name__)
 
-def clamped_float(x):
-    try:
-        x = float(x)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"{x!r} is not a floating-point literal")
 
-    if x < 0.0:
-        x = 0.0
-    elif x > 1.0:
-        x = 1.0
-    return x
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train or evaluate the corrected Pente policy/value network")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--infer", action="store_true", help="Evaluate a model instead of training")
+    parser.add_argument("--gpu", action="store_true", help="Use CUDA when available")
+    parser.add_argument("--compile", action="store_true", help="Compile the model on supported CUDA systems")
+    parser.add_argument("--infer-games", type=int, default=20)
+    parser.add_argument("--model-dir", default="pente-model-v2")
+    parser.add_argument("--model", help="Compatible schema-v2 checkpoint to load")
+    parser.add_argument("--infer-mcts", action="store_true")
+    parser.add_argument("--mcts-sim", type=int, default=64)
+    parser.add_argument("--temp-threshold", type=int, default=15)
+    parser.add_argument("--batch-games", type=int, default=512)
+    parser.add_argument("--active-games", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--arena", action="store_true", help="Measure latest against the prior iteration")
+    parser.add_argument("--num-arena-games", type=int, default=40)
+    parser.add_argument("--eval-interval", type=int, default=5)
+    parser.add_argument("--arena-opening-plies", type=int, default=4)
+    parser.add_argument("--board-size", type=int, default=19)
+    parser.add_argument(
+        "--ruleset",
+        choices=[ruleset.value for ruleset in PenteRuleset],
+        default=PenteRuleset.STANDARD.value,
+    )
+    parser.add_argument("--professional-iterations", type=int, default=0)
+    parser.add_argument("--self-play-iterations", type=int, default=150)
+    parser.add_argument("--raw-dataset", default="data/pente_dataset.txt")
+    parser.add_argument("--processed-dataset", default="data/pente-dataset-v3.pkl")
+    parser.add_argument("--force-dataset-processing", action="store_true")
+    parser.add_argument("--max-training-examples", type=int, default=500_000)
+    parser.add_argument("--professional-replay-fraction", type=float, default=0.25)
+    parser.add_argument("--model-blocks", type=int, default=4)
+    parser.add_argument("--model-channels", type=int, default=64)
+    parser.add_argument("--model-hidden-size", type=int, default=256)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learner-steps", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--telemetry-file", default="metrics/training.jsonl")
+    parser.add_argument("--no-checkpoint", action="store_true")
+    parser.add_argument("--replay-checkpoint-interval", type=int, default=5)
+    parser.add_argument("--resume-replay")
+    parser.add_argument("--seed-replay-from-professional", action="store_true")
+    return parser
 
-if __name__ == "__main__":
-    level = logging.INFO
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--infer", action="store_true", help="Enable inference mode")
-    parser.add_argument("--gpu", action="store_true", help="Attempt to run model on the first available GPU")
-    parser.add_argument("--infer-games", type=int, help="Number of games to play in inference mode", default=1)
-    parser.add_argument("--no-interactive", action="store_true", help="Disable any and all user interactions")
-    parser.add_argument("--model-dir", type=str, help="Directory for model checkpoints")
-    parser.add_argument("--model", type=str, help="Path of a model to load")
-    parser.add_argument("--infer-mcts", action="store_true", help="Enable MCTS during inference")
-    parser.add_argument("--mcts-sim", type=int, help="Number of MCTS simulations", default=15)
-    parser.add_argument("--temp-threshold", type=int, help="Threshold for random move exploration during MCTS", default=15)
-    parser.add_argument("--batch-games", type=int, help="Number of self-play games to execute per iteration", default=64)
-    parser.add_argument("--batch-size", type=int, help="Size of training example batch(es)", default=32)
-    parser.add_argument("--arena", action="store_true", help="Enable Arena during self-play training")
-    parser.add_argument("--num-arena-games", type=int, help="Number of games to play during Arena evaluation", default=35)
-    parser.add_argument("--arena-threshold", type=clamped_float, metavar="[0.0-1.0]", help="Threshold ([0.0, 1.0]) for whether the current model should promoted during Arena self-play.", default=0.6)
-    parser.add_argument("--board-size", type=int, help="Size of the board", default=19)
-
-    parser.add_argument("--raw-dataset", type=str, help="Path to the raw 'pro' examples dataset", default="data/pente_dataset.txt")
-    parser.add_argument("--processed-dataset", type=str, help="Path to the 'pro' processed examples dataset", default="data/pente-dataset-processed.pkl")
-    parser.add_argument("--force-dataset-processing", action="store_true", help="Force processing of raw 'pro' examples dataset")
-    program_args = parser.parse_args()
-
-    file_handler = RotatingFileHandler(
-        'kb-pente-ai.log',
-        mode='a',
-        maxBytes=5*1024*1024,
+def configure_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    handler = RotatingFileHandler(
+        "kb-pente-ai.log",
+        mode="a",
+        maxBytes=5 * 1024 * 1024,
         backupCount=2,
-        encoding=None,
-        delay=False
     )
     logging.basicConfig(
         level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('kb-penta-ai.log'),
-            logging.StreamHandler()
-        ]
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=(handler, logging.StreamHandler()),
     )
-    logger.info("Starting training")
 
-    device = torch.device('cuda' if torch.cuda.is_available() and program_args.gpu else 'cpu')
 
-    professional_games_training_iterations = 0
-    board_size = program_args.board_size # Pente is usually played on 19x19
-    if professional_games_training_iterations:
-        # Professional game dataset is played on 19x19, so we force the board size
-        board_size = 19
-    player_count = 2 # Pente can be played with up to 4 players
-    args = SelfPlayTrainerArgs(
-        start_iteration=0,
-        professional_games_training_iterations=professional_games_training_iterations,
-        self_play_training_iterations=150,
+def main() -> int:
+    program_args = build_parser().parse_args()
+    configure_logging(program_args.debug)
+    np.random.seed(program_args.seed)
+    torch.manual_seed(program_args.seed)
+
+    ruleset = PenteRuleset.parse(program_args.ruleset)
+    if program_args.professional_iterations > 0 and program_args.board_size != 19:
+        raise ValueError("The checked-in professional dataset requires a 19 by 19 board")
+
+    device = select_torch_device(program_args.gpu)
+    use_cuda = device.type == "cuda"
+    game = PenteGame(program_args.board_size, ruleset=ruleset)
+    net = PenteNet(
+        device,
+        board_size=program_args.board_size,
+        action_size=game.get_action_size(),
+        num_res_blocks=program_args.model_blocks,
+        num_channels=program_args.model_channels,
+        hidden_fc_size=program_args.model_hidden_size,
+    )
+    optimizer = torch.optim.AdamW(
+        net.parameters(),
+        lr=program_args.learning_rate,
+        weight_decay=1e-4,
+    )
+    start_iteration = 0
+    training_run_id: str | None = None
+    expected_replay_generation: int | None = None
+    if program_args.model:
+        if program_args.infer:
+            PenteNet.load_checkpoint_from_path(
+                program_args.model,
+                net,
+                expected_ruleset=ruleset.value,
+            )
+        else:
+            resume_state = PenteNet.load_training_checkpoint_from_path(
+                program_args.model,
+                net,
+                optimizer,
+                expected_ruleset=ruleset.value,
+            )
+            start_iteration = resume_state.iteration
+            training_run_id = resume_state.training_run_id
+            expected_replay_generation = resume_state.replay_snapshot_generation
+
+    trainer_args = SelfPlayTrainerArgs(
+        start_iteration=start_iteration,
+        professional_games_training_iterations=program_args.professional_iterations,
+        self_play_training_iterations=program_args.self_play_iterations,
         temp_threshold=program_args.temp_threshold,
-        mcts_args=MCTSArgs(
-            num_simulations=program_args.mcts_sim,
-        ),
+        mcts_args=MCTSArgs(num_simulations=program_args.mcts_sim),
         watch_training_raw_dataset_filepath=program_args.raw_dataset,
         watch_training_processed_dataset_filepath=program_args.processed_dataset,
         force_watch_training_raw_dataset_processing=program_args.force_dataset_processing,
-        eval_iteration_interval=1,
+        eval_iteration_interval=program_args.eval_interval,
         num_arena_games=program_args.num_arena_games,
         batch_size=program_args.batch_size,
         batch_games=program_args.batch_games,
-        update_threshold=program_args.arena_threshold,
-        checkpoint_dir=program_args.model_dir if program_args.model_dir else f"pente-model-v1.3",
-        should_checkpoint=True,
-        max_training_examples = 256_000,
-        board_size=board_size,
-        player_count=2,
+        active_games=program_args.active_games,
+        checkpoint_dir=program_args.model_dir,
+        should_checkpoint=not program_args.no_checkpoint,
+        max_training_examples=program_args.max_training_examples,
         debug=program_args.debug,
-        should_use_arena=program_args.arena
+        should_use_arena=program_args.arena,
+        seed=program_args.seed,
+        replay_checkpoint_interval=program_args.replay_checkpoint_interval,
+        learner_steps_per_iteration=program_args.learner_steps,
+        arena_opening_plies=program_args.arena_opening_plies,
+        resume_replay_filepath=program_args.resume_replay,
+        seed_replay_from_professional=program_args.seed_replay_from_professional,
+        professional_replay_fraction=program_args.professional_replay_fraction,
+        training_run_id=training_run_id,
+        expected_replay_generation=expected_replay_generation,
     )
 
-    # Print arguments
-    logger.info(f"Arguments:")
-    logger.info(f"  model: '{program_args.model}'")
-    logger.info(f"  checkpoint_dir: '{args.checkpoint_dir}'")
-    logger.info(f"  num_simulations: {args.mcts_args.num_simulations}")
-    logger.info(f"  batch_games: {args.batch_games}")
-    logger.info(f"  batch_size: {args.batch_size}")
-    logger.info(f"  board_size: {args.board_size}")
-    logger.info(f"  device: {device}")
-    logger.info(f"  ----------------------")
-    logger.info(f"  arena: {args.should_use_arena}")
-    logger.info(f"  num_arena_games: {args.num_arena_games}")
-    logger.info(f"  arena_update_threshold: {args.update_threshold}")
-    logger.info(f"  ----------------------")
-    logger.info(f"  raw_dataset: {args.watch_training_raw_dataset_filepath}")
-    logger.info(f"  processed_dataset: {args.watch_training_processed_dataset_filepath}")
-    logger.info(f"  force_dataset_processing: {args.force_watch_training_raw_dataset_processing}")
-    logger.info(f"  ----------------------")
-    logger.info(f"  infer: {program_args.infer}")
-    logger.info(f"  infer_mcts: {program_args.infer_mcts}")
-    logger.info(f"  infer_games: {program_args.infer_games}")
-    logger.info(f"  no_interactive: {program_args.no_interactive}")
-
-    game = PenteGame(board_size=board_size, player_count=player_count)
-    logger.info(f"Initialized pente game with board_size={board_size} and player_count={player_count}")
-    pente_network = PenteNet(
-        device,
-        board_size=board_size,
-        action_size=game.get_action_size(),
-        num_res_blocks=4,
-        num_channels=512,
-        hidden_fc_size=768,
-    )
-
-    optimizer = optim.SGD(pente_network.parameters(), lr=1e-3, weight_decay=1e-4, foreach=True)
-
-    # Compile model and do other torch initialization
-    # TODO: this only works on Linux, and my hardware...
-    if torch.cuda.is_available():
-        logger.info("Compiling PenteNet with torch.compile()")
-        pente_network.compile(fullgraph=True)
-
-        torch.set_float32_matmul_precision('high')
-
-    if program_args.model:
-        logger.info(f"Trying to load model: '{program_args.model}'")
-        start_iteration = PenteNet.load_checkpoint_from_path(program_args.model, pente_network, optimizer=optimizer)
-        args.start_iteration = start_iteration
-
+    if program_args.compile:
+        if not use_cuda:
+            raise ValueError("--compile requires an available CUDA device selected with --gpu")
+        net.compile(fullgraph=True)
+        torch.set_float32_matmul_precision("high")
 
     logger.info(
-        f"Created PenteNet with {pente_network.get_parameter_count()} trainable parameters"
+        "Initialized board=%s ruleset=%s device=%s parameters=%s",
+        program_args.board_size,
+        ruleset.value,
+        device,
+        net.get_parameter_count(),
     )
+    if program_args.infer:
+        return run_inference(program_args, game, net, trainer_args)
 
-    game = PenteGame(board_size=board_size, player_count=player_count)
+    metric_sink = JsonlMetricSink(program_args.telemetry_file)
+    trainer = SelfPlayTrainer(game, net, optimizer, device, trainer_args, metric_sink)
+    trainer.train()
+    return 0
 
-    train = not program_args.infer
-    if train:
-        self_player_trainer = SelfPlayTrainer(
-            game=game,
-            net=pente_network,
-            optimizer=optimizer,
-            device=device,
-            args=args,
-        )
-        self_player_trainer.train()
-    else:
-        logger.info(f"Starting inference")
 
-        mcts1 = None
-        mcts2 = None
-        if program_args.infer_mcts:
-            mcts1 = MCTS(game, pente_network, args.mcts_args)
-            mcts2 = MCTS(game, pente_network, args.mcts_args)
+def run_inference(
+    program_args: argparse.Namespace,
+    game: PenteGame,
+    net: PenteNet,
+    trainer_args: SelfPlayTrainerArgs,
+) -> int:
+    if not program_args.model:
+        raise ValueError("Inference requires --model")
+    net.eval()
+    mcts = (
+        MCTS(game, net, trainer_args.mcts_args, np.random.default_rng(program_args.seed))
+        if program_args.infer_mcts
+        else None
+    )
+    arena = Arena(
+        NNetPlayer(net, mcts, "network"),
+        RandomPlayer(np.random.default_rng(program_args.seed + 1)),
+        game,
+        opening_plies=program_args.arena_opening_plies,
+        rng=np.random.default_rng(program_args.seed + 2),
+    )
+    stats = arena.play_games(program_args.infer_games)
+    logger.info(
+        "Evaluation complete: network_wins=%s random_wins=%s draws=%s average_moves=%s",
+        stats.p1_wins,
+        stats.p2_wins,
+        stats.draws,
+        stats.avg_moves,
+    )
+    return 0
 
-        # TODO: move to static method on board
-        def pretty_print_board(board: np.ndarray):
-            """
-            Prints a Pente board in a human-readable format with coordinate labels.
 
-            Args:
-                board: A 2D NumPy array representing the board state.
-                       Assumes 1 for Player 1, -1 for Player 2, and 0 for empty.
-            """
-            if not isinstance(board, np.ndarray) or board.ndim != 2:
-                print("Error: Input must be a 2D NumPy array.")
-                return
-
-            board_size = board.shape[0]
-
-            p1_char = 'X'
-            p2_char = 'O'
-            empty_char = '.'
-
-            COLS = "ABCDEFGHJKLMNOPQRST"
-            if board_size > len(COLS):
-                COLS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-            row_label_padding = len(str(board_size))
-            header_prefix = ' ' * (row_label_padding + 1)
-            header = header_prefix + " ".join(COLS[:board_size])
-            print(header)
-
-            for i in range(board_size):
-                row_label = f"{i + 1:>{row_label_padding}} "
-
-                row_items = []
-                for j in range(board_size):
-                    cell_value = board[i, j]
-                    if cell_value == 1:
-                        row_items.append(p1_char)
-                    elif cell_value == -1:
-                        row_items.append(p2_char)
-                    else:
-                        row_items.append(empty_char)
-
-                print(row_label + " ".join(row_items))
-
-            print(header)
-
-        arena = Arena(
-            player1=NNetPlayer(pente_network, mcts1, name="Player1"),
-            player2=NNetPlayer(pente_network, mcts2, name="Player2"),
-            game=game,
-            debug=True,
-            display=pretty_print_board
-        )
-
-        p1_wins, p2_wins, draws = 0, 0, 0
-        for i in range(program_args.infer_games):
-            stats = arena.play_game()
-            if stats.winner == 1:
-                p1_wins += 1
-            elif stats.winner == -1:
-                p2_wins += 1
-            else:
-                draws += 1
-
-            if not program_args.no_interactive and input("Play another game? (y/n): ") != "y":
-                break
-
-        logger.info(f"p1 wins: {p1_wins}")
-        logger.info(f"p2 wins: {p2_wins}")
-        logger.info(f"draws: {draws}")
+if __name__ == "__main__":
+    raise SystemExit(main())

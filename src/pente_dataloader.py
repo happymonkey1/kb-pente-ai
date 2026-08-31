@@ -1,27 +1,35 @@
+from __future__ import annotations
+
 import torch
 from torch.utils.data import Dataset
-import numpy as np
 
 from src.game.pente.pente_game import PenteGame
+from src.train.training_example import TrainingExample
 
-def board_to_cpu_tensor(board: np.ndarray) -> torch.Tensor:
-    # TODO: this only supports two players
-    p1_mask = (board == PenteGame.PLAYER_ONE)
-    p2_mask = (board == PenteGame.PLAYER_TWO)
-    return torch.from_numpy(np.stack([p1_mask, p2_mask], axis=0)).type(dtype=torch.float32)
 
-class PenteDataset(Dataset):
-    def __init__(self, games: list[tuple[np.ndarray, np.ndarray, float]]):
-        self.games = games
+class PenteDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+    def __init__(
+        self,
+        examples: list[TrainingExample],
+        game: PenteGame,
+        augment: bool = False,
+    ) -> None:
+        self.examples = examples
+        self.game = game
+        self.augment = augment
 
-    def __len__(self):
-        return len(self.games)
+    def __len__(self) -> int:
+        return len(self.examples)
 
-    def __getitem__(self, idx):
-        state, policy, outcome = self.games[idx]
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        example = self.examples[index]
+        position = example.position
+        policy = example.policy
+        if self.augment:
+            symmetry = int(torch.randint(0, 8, ()).item())
+            position, policy = self.game.get_symmetry(position, policy, symmetry)
 
-        state_tensor = board_to_cpu_tensor(state)
-        policy_tensor = torch.from_numpy(policy).type(dtype=torch.float32)
-        outcome_tensor = torch.tensor(outcome, dtype=torch.float32)
-
-        return state_tensor, policy_tensor, outcome_tensor
+        state_tensor = torch.from_numpy(position.feature_planes())
+        policy_tensor = torch.from_numpy(policy.copy())
+        value_tensor = torch.tensor(example.value, dtype=torch.float32)
+        return state_tensor, policy_tensor, value_tensor

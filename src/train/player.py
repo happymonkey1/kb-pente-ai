@@ -1,9 +1,21 @@
-from src.game.game import Game
+from __future__ import annotations
 
-class Player:
+from abc import ABC, abstractmethod
 
-    def play(self, game: 'Game', board, player: int, debug: bool = False):
-        pass
+from src.game.pente.pente_board import PenteBoard
+from src.game.pente.pente_game import PenteGame
 
-    def reset(self):
-        pass
+
+class Player(ABC):
+    @abstractmethod
+    def play(
+        self,
+        game: PenteGame,
+        board: PenteBoard,
+        player: int,
+        debug: bool = False,
+    ) -> int:
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        return

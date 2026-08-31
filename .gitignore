@@ -1,5 +1,7 @@
-
-src/**/__pycache__/
+__pycache__/
+*.py[cod]
+.venv/
 *.log
+metrics/
 pente-model*/
 *.pkl

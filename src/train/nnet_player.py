@@ -1,38 +1,40 @@
-from src.train.player import Player
-from src.model.model_v1 import PenteNet
-from src.game.game import Game
-from src.mcts.mcts_v2 import MCTS
+from __future__ import annotations
 
 import numpy as np
-from typing import Union
-import logging
 
-logger = logging.getLogger(__name__)
+from src.game.game import Game
+from src.game.pente.pente_board import PenteBoard
+from src.game.pente.pente_game import PenteGame
+from src.mcts.mcts_v2 import MCTS
+from src.model.model_v1 import PenteNet
+from src.train.player import Player
+
 
 class NNetPlayer(Player):
-    def __init__(self, net: 'PenteNet', mcts: Union['MCTS', None], name: str = "NNetPlayer"):
+    def __init__(self, net: PenteNet, mcts: MCTS | None, name: str = "NNetPlayer") -> None:
         self.net = net
         self.mcts = mcts
         self.name = name
 
-    def reset(self):
-        if self.mcts:
+    def reset(self) -> None:
+        if self.mcts is not None:
             self.mcts.reset()
 
-    def play(self, game: 'Game', board, player: int, debug: bool = False):
-        if not self.mcts:
-            canonical_board = game.get_canonical_form(board, player)
-            legal_moves = game.get_valid_moves(board, player)
-            p, v = self.net.predict(canonical_board)
-            if debug:
-                logger.info(f"{self.name} prediction (no mcts): {v * player}")
-            masked = p.cpu().numpy() * legal_moves
-            return np.argmax(masked)
-        else:
-            canonical_board = game.get_canonical_form(board, player)
-            action_probs = self.mcts.get_action_prob(canonical_board, temp=1)
-            if debug:
-                _, v = self.net.predict(canonical_board)
-                logger.info(f"{self.name} prediction (mcts): {v * player}")
+    def play(
+        self,
+        game: PenteGame,
+        board: PenteBoard,
+        player: int,
+        debug: bool = False,
+    ) -> int:
+        if player != board.current_player:
+            raise ValueError(f"Expected Player {board.current_player}, received Player {player}")
+        self.net.eval()
+        if self.mcts is not None:
+            policy = self.mcts.get_action_prob(board, temp=0, add_root_noise=False)
+            return int(np.argmax(policy))
 
-            return np.argmax(action_probs)
+        policy, _ = self.net.evaluate(board)
+        legal = game.get_valid_moves(board, player).astype(bool)
+        masked = np.where(legal, policy, -np.inf)
+        return int(np.argmax(masked))

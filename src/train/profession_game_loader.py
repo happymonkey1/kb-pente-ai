@@ -1,166 +1,273 @@
-import os.path
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+import hashlib
+import os
 import pickle
+import tempfile
 
 import numpy as np
-import logging
 
-from src.game.pente.pente_board import PenteBoard
+from src.artifacts import PROFESSIONAL_DATA_SCHEMA_VERSION
+from src.game.game import Game, GameStatus
 from src.game.pente.pente_game import PenteGame
+from src.game.pente.rules import PenteRuleset
+from src.train.training_example import TrainingExample
 
-logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True, slots=True)
+class ProfessionalDataStats:
+    accepted_games: int
+    rejected_games: int
+    accepted_positions: int
+    deduplicated_positions: int
+    non_terminal_games: int
+    training_games: int
+    validation_games: int
+    training_positions: int
+    validation_positions: int
+    deduplicated_training_positions: int
+    deduplicated_validation_positions: int
+    rejection_reasons: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessedProfessionalData:
+    schema_version: int
+    board_size: int
+    ruleset: str
+    validation_fraction: float
+    examples: list[TrainingExample]
+    validation_examples: list[TrainingExample]
+    stats: ProfessionalDataStats
+
 
 class ProfessionGameLoader:
-    def __init__(self, raw_filepath: str, processed_filepath: str, board_size: int = 19, player_count: int = 2, force: bool = False):
+    COLUMNS = "ABCDEFGHJKLMNOPQRST"
+
+    def __init__(
+        self,
+        raw_filepath: str,
+        processed_filepath: str,
+        board_size: int = 19,
+        player_count: int = 2,
+        force: bool = False,
+        ruleset: PenteRuleset = PenteRuleset.STANDARD,
+        validation_fraction: float = 0.1,
+    ) -> None:
+        if player_count != 2:
+            raise ValueError("Professional loader supports exactly two players")
         self.raw_filepath = raw_filepath
         self.processed_filepath = processed_filepath
         self.board_size = board_size
         self.player_count = player_count
         self.force = force
+        self.ruleset = ruleset
+        if not 0 <= validation_fraction < 1:
+            raise ValueError("Validation fraction must be in [0, 1)")
+        self.validation_fraction = validation_fraction
+        self.last_stats: ProfessionalDataStats | None = None
+        self.validation_examples: list[TrainingExample] = []
 
-        assert player_count == 2, "Only 2-player games are supported"
-        assert board_size == 19, "Only 19x19 boards are supported"
-
-    def load_games(self):
-        processed_exists = os.path.exists(self.processed_filepath)
-        if self.force or not processed_exists:
-            return self.__process_games()
-        elif processed_exists:
-            return self.__load_processed_list(self.processed_filepath)
-        else:
-            raise ValueError(f"Failed to load processed dataset file: {self.processed_filepath}")
-
-    def __process_games(self):
-        """
-        Loads a Pente dataset from a file, parses the games, and generates
-        training examples. Each example is a tuple containing the board state
-        and the final game outcome from the current player's perspective.
-
-        Returns:
-            A list of training examples, where each example is a tuple of
-            (board_state_array, final_outcome_for_current_player).
-        """
-        all_training_examples = []
-
-        logger.info(f"Loading dataset from: {self.raw_filepath}")
-        if not os.path.exists(self.raw_filepath):
-            raise ValueError(f"Raw dataset file '{self.raw_filepath}' does not exist")
-
-        with open(self.raw_filepath, 'r') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-
-                parts = line.split(';')[:-1]
-                move_sequence = parts[:-1]
-                result_str = parts[-1]
-
-                if result_str == "1-0":
-                    final_winner = 1.0
-                elif result_str == "0-1":
-                    final_winner = -1.0
-                else:
-                    print(f"Warning: Skipping line {line_num} due to unrecognized result '{result_str}'")
-                    continue
-
-                game = PenteGame(self.board_size, self.player_count)
-                board = game.init_board()
-                current_player = 1
-
-                for move_str in move_sequence:
-                    try:
-                        row, col = self.parse_move(move_str)
-                    except ValueError as e:
-                        logger.warning(f"Skipping invalid move '{move_str}' in line {line_num}. Error: {e}")
-                        continue
-
-                    if current_player == 1:
-                        value_for_current_player = final_winner
-                    else:
-                        value_for_current_player = -final_winner
-
-                    action = row * self.board_size + col
-
-                    pi = np.zeros((self.board_size * self.board_size), dtype=float)
-                    pi[action] = 1
-
-                    board, next_player = game.apply_action(board, current_player, action)
-
-                    canonical_board = game.get_canonical_form(board, current_player)
-
-                    symmetries = game.get_symmetries(canonical_board, pi)
-                    for sym_board, sym_pi in symmetries:
-                        all_training_examples.append((sym_board.copy(), sym_pi, value_for_current_player))
-
-                    current_player = next_player
-
-
-        logger.info(f"Successfully loaded and processed {len(all_training_examples)} positions.")
-
-        deduplicated = {
-            PenteBoard(board=example[0], captures=np.zeros(self.player_count, dtype=np.int8)).to_string(): example
-            for example in reversed(all_training_examples)
-        }
-
-        deduplicated_examples = list(deduplicated.values())
-
-        logger.info(f"Deduplication leaves {len(deduplicated_examples)}")
-
+    def load_games(self) -> list[TrainingExample]:
         if self.force or not os.path.exists(self.processed_filepath):
-            ProfessionGameLoader.__save_processed_list(deduplicated_examples, self.processed_filepath)
+            processed = self.process_games()
+            self._save_processed(processed)
+        else:
+            processed = self._load_processed()
+        self.last_stats = processed.stats
+        self.validation_examples = processed.validation_examples
+        return processed.examples
 
-        logger.info("Finished saving processed dataset")
+    def process_games(self) -> ProcessedProfessionalData:
+        if not os.path.exists(self.raw_filepath):
+            raise ValueError(f"Raw dataset file does not exist: {self.raw_filepath}")
 
-        return deduplicated_examples
+        training_groups: dict[bytes, list[TrainingExample]] = defaultdict(list)
+        validation_groups: dict[bytes, list[TrainingExample]] = defaultdict(list)
+        accepted_games = 0
+        rejected_games = 0
+        accepted_positions = 0
+        non_terminal_games = 0
+        training_games = 0
+        validation_games = 0
+        training_positions = 0
+        validation_positions = 0
+        rejection_reasons: Counter[str] = Counter()
+
+        with open(self.raw_filepath, "r", encoding="utf-8") as stream:
+            for line_number, raw_line in enumerate(stream, 1):
+                fields = [field for field in raw_line.strip().split(";") if field]
+                if len(fields) < 2:
+                    rejected_games += 1
+                    rejection_reasons["malformed_record"] += 1
+                    continue
+
+                result_text = fields[-1]
+                winner = self._parse_winner(result_text)
+                if winner is None:
+                    rejected_games += 1
+                    rejection_reasons["unknown_result"] += 1
+                    continue
+
+                game = PenteGame(self.board_size, self.player_count, self.ruleset)
+                position = game.init_board()
+                game_examples: list[TrainingExample] = []
+                rejection: str | None = None
+
+                move_fields = fields[:-1]
+                for move_index, move_text in enumerate(move_fields):
+                    try:
+                        row, column = self.parse_move(move_text)
+                    except (TypeError, ValueError):
+                        rejection = "invalid_notation"
+                        break
+
+                    action = row * self.board_size + column
+                    if not game.is_valid_move(position, position.current_player, action):
+                        rejection = "illegal_move"
+                        break
+
+                    policy = np.zeros(game.get_action_size(), dtype=np.float32)
+                    policy[action] = 1.0
+                    game_examples.append(
+                        TrainingExample(
+                            position=position,
+                            policy=policy,
+                            value=float(winner * position.current_player),
+                        )
+                    )
+                    position, _ = game.apply_action(position, position.current_player, action)
+                    if game.check_game_end(position).is_terminal and move_index < len(move_fields) - 1:
+                        rejection = "move_after_terminal"
+                        break
+
+                if rejection is not None:
+                    rejected_games += 1
+                    rejection_reasons[rejection] += 1
+                    continue
+
+                terminal = game.check_game_end(position)
+                if terminal.status is GameStatus.WIN and terminal.winner != winner:
+                    rejected_games += 1
+                    rejection_reasons["winner_mismatch"] += 1
+                    continue
+                if terminal.status is GameStatus.DRAW:
+                    rejected_games += 1
+                    rejection_reasons["winner_mismatch"] += 1
+                    continue
+                if not terminal.is_terminal:
+                    non_terminal_games += 1
+
+                accepted_games += 1
+                accepted_positions += len(game_examples)
+                is_validation = self._is_validation_game(raw_line.strip())
+                selected_groups = validation_groups if is_validation else training_groups
+                if is_validation:
+                    validation_games += 1
+                    validation_positions += len(game_examples)
+                else:
+                    training_games += 1
+                    training_positions += len(game_examples)
+                for example in game_examples:
+                    selected_groups[example.position.state_key()].append(example)
+
+        examples = [self._aggregate(group) for group in training_groups.values()]
+        validation_examples = [self._aggregate(group) for group in validation_groups.values()]
+        stats = ProfessionalDataStats(
+            accepted_games=accepted_games,
+            rejected_games=rejected_games,
+            accepted_positions=accepted_positions,
+            deduplicated_positions=len(examples) + len(validation_examples),
+            non_terminal_games=non_terminal_games,
+            training_games=training_games,
+            validation_games=validation_games,
+            training_positions=training_positions,
+            validation_positions=validation_positions,
+            deduplicated_training_positions=len(examples),
+            deduplicated_validation_positions=len(validation_examples),
+            rejection_reasons=dict(sorted(rejection_reasons.items())),
+        )
+        return ProcessedProfessionalData(
+            schema_version=PROFESSIONAL_DATA_SCHEMA_VERSION,
+            board_size=self.board_size,
+            ruleset=self.ruleset.value,
+            validation_fraction=self.validation_fraction,
+            examples=examples,
+            validation_examples=validation_examples,
+            stats=stats,
+        )
+
+    def parse_move(self, move_text: str) -> tuple[int, int]:
+        if not 2 <= len(move_text) <= 3:
+            raise ValueError(f"Invalid move format: {move_text}")
+        column_text = move_text[0].upper()
+        if column_text not in self.COLUMNS[: self.board_size]:
+            raise ValueError(f"Invalid column in move: {move_text}")
+        try:
+            row = int(move_text[1:]) - 1
+        except ValueError as error:
+            raise ValueError(f"Invalid row in move: {move_text}") from error
+        column = self.COLUMNS.index(column_text)
+        if not 0 <= row < self.board_size:
+            raise ValueError(f"Move is outside the board: {move_text}")
+        return row, column
 
     @staticmethod
-    def __save_processed_list(data, filepath: str):
-        logger.info(f"Saving processed dataset to: {filepath}")
-        try:
-            with open(filepath, 'wb') as f:
-                pickle.dump(data, f)
-        except IOError as e:
-            logger.error(f"Failed to save pente processed dataset file '{filepath}': {e}")
+    def _parse_winner(result_text: str) -> int | None:
+        if result_text == "1-0":
+            return Game.PLAYER_ONE
+        if result_text == "0-1":
+            return Game.PLAYER_TWO
+        return None
+
+    def _is_validation_game(self, record: str) -> bool:
+        if self.validation_fraction == 0:
+            return False
+        digest = hashlib.sha256(record.encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:8], "big") / 2**64
+        return bucket < self.validation_fraction
 
     @staticmethod
-    def __load_processed_list(filepath: str):
-        logger.info(f"Loading processed dataset from: {filepath}")
+    def _aggregate(group: list[TrainingExample]) -> TrainingExample:
+        position = group[0].position
+        policy = np.mean(np.stack([example.policy for example in group], axis=0), axis=0)
+        policy /= policy.sum()
+        value = float(np.mean([example.value for example in group]))
+        return TrainingExample(position, policy, value)
+
+    def _save_processed(self, processed: ProcessedProfessionalData) -> None:
+        directory = os.path.dirname(os.path.abspath(self.processed_filepath))
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = ""
         try:
-            with open(filepath, 'rb') as f:
-                return pickle.load(f)
-        except IOError as e:
-            logger.error(f"Failed to load pente processed dataset from file '{filepath}': {e}")
+            with tempfile.NamedTemporaryFile("wb", dir=directory, delete=False) as stream:
+                temporary_path = stream.name
+                pickle.dump(processed, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temporary_path, self.processed_filepath)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
-
-    def parse_move(self, move_str: str):
-        """
-       Converts a single move in algebraic notation (e.g., 'K10') to 0-indexed
-       (row, col) coordinates. Assumes a standard Pente board layout where
-       the letter 'I' is skipped.
-
-       Args:
-           move_str: The move string, like "K10", "A1", etc.
-           board_size: The size of the board (e.g., 19 for a standard board).
-
-       Returns:
-           A tuple (row, col) of 0-indexed coordinates.
-       """
-        if not 2 <= len(move_str) <= 3:
-            raise ValueError(f"Invalid move format: {move_str}")
-
-        # Standard Pente column letters, skipping 'I'
-        COLS = "ABCDEFGHJKLMNOPQRST"
-
-        col_char = move_str[0].upper()
-        row_str = move_str[1:]
-
-        if col_char not in COLS:
-            raise ValueError(f"Invalid column character '{col_char}' in move '{move_str}'")
-
-        col = COLS.index(col_char)
-        row = int(row_str) - 1
-
-        if not (0 <= row < self.board_size and 0 <= col < self.board_size):
-            raise ValueError(f"Move {move_str} with coords ({row}, {col}) is out of bounds for size {self.board_size}")
-
-        return row, col
+    def _load_processed(self) -> ProcessedProfessionalData:
+        with open(self.processed_filepath, "rb") as stream:
+            processed = pickle.load(stream)
+        if not isinstance(processed, ProcessedProfessionalData):
+            raise ValueError(
+                "Processed professional data is a legacy format; rebuild it with force processing enabled"
+            )
+        if processed.schema_version != PROFESSIONAL_DATA_SCHEMA_VERSION:
+            raise ValueError(
+                f"Professional data schema {processed.schema_version} is incompatible with "
+                f"schema {PROFESSIONAL_DATA_SCHEMA_VERSION}"
+            )
+        if (
+            processed.board_size != self.board_size
+            or processed.ruleset != self.ruleset.value
+            or processed.validation_fraction != self.validation_fraction
+        ):
+            raise ValueError(
+                "Processed professional data does not match board size, ruleset, and validation split"
+            )
+        return processed

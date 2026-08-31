@@ -3,12 +3,10 @@ name = "kb-pente-ai"
 version = "0.1.0"
 description = "Machine learning for the board game Pente"
 readme = "README.md"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "mypy",
-    "numba>=0.61.2",
+    "nvidia-ml-py; sys_platform == 'linux'",
     "numpy",
-    "scipy",
-    "scipy-stubs",
     "torch",
-    "tqdm>=4.67.1",
 ]
