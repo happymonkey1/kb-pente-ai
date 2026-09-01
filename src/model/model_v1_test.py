@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -99,6 +99,19 @@ class PenteNetTest(unittest.TestCase):
         np_policies, np_values = self.net.evaluate_batch(positions)
         np.testing.assert_allclose(policies.numpy(), np_policies)
         np.testing.assert_allclose(values.numpy(), np_values)
+
+    def test_tensor_feature_evaluation_uses_module_call(self) -> None:
+        inputs = positions_to_tensor((PenteBoard.new_board(5),), self.device)
+        self.net.eval()
+        forward_hook = Mock(return_value=None)
+        handle = self.net.register_forward_hook(forward_hook)
+        try:
+            self.net.evaluate_features(inputs)
+        finally:
+            handle.remove()
+
+        forward_hook.assert_called_once()
+        self.assertIs(self.net, forward_hook.call_args.args[0])
 
     def test_tensor_feature_evaluation_rejects_wrong_boundary(self) -> None:
         with self.assertRaises(ValueError):

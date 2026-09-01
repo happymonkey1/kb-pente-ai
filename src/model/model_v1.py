@@ -164,7 +164,7 @@ class PenteNet(nn.Module):
             dtype=autocast_dtype,
             enabled=use_autocast,
         ):
-            policy_logits, values = self.forward(inputs)
+            policy_logits, values = self(inputs)
             policies = F.softmax(policy_logits, dim=1)
         return policies.detach().float(), values.detach().float().reshape(-1)
 
