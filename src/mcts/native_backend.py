@@ -68,6 +68,13 @@ class _Selection:
     raw_size: int
 
 
+@dataclass(frozen=True, slots=True)
+class _NativeSlotSnapshot:
+    complete: bool
+    simulations: int
+    evaluator_completions: int
+
+
 def load_native_extension() -> Any:
     """Load ``kb_pente_native`` without compiling it at runtime."""
 
@@ -147,6 +154,7 @@ class NativeSearchBackend:
 
         self._roots: dict[int, PenteBoard] = {}
         self._batch_sizes: dict[int, list[int]] = {}
+        self._slot_progress: dict[int, _NativeSlotSnapshot] = {}
         self._pending: _Selection | None = None
         self._pending_completions: dict[int, int] = {}
         self._inference_timing = NativeInferenceTiming()
@@ -185,12 +193,16 @@ class NativeSearchBackend:
             raise RuntimeError(f"Native batch reused an active slot {slot}")
         self._roots[slot] = root
         self._batch_sizes[slot] = []
+        self._slot_progress[slot] = _NativeSlotSnapshot(False, 0, 0)
         return slot
 
     def evaluate_wave(self) -> NativeWave:
         if self._pending is None:
             self._validate_staging()
-            before = self._snapshot_completions()
+            before = {
+                slot: snapshot.evaluator_completions
+                for slot, snapshot in self._slot_progress.items()
+            }
             selected = self._batch.select()
             self._pending = self._convert_selection(selected)
             self._pending_completions = before
@@ -198,6 +210,7 @@ class NativeSearchBackend:
         assert selection is not None
 
         if selection.size == 0:
+            self._update_slot_progress(self._read_slot_snapshots())
             self._pending = None
             self._pending_completions = {}
             return NativeWave(selection.token, 0, selection.raw_size, 0.0, 0.0, 0.0, 0.0)
@@ -207,7 +220,9 @@ class NativeSearchBackend:
         previous = self._pending_completions
         self._pending = None
         self._pending_completions = {}
-        self._record_batch_sizes(selection, previous)
+        snapshots = self._read_slot_snapshots()
+        self._record_batch_sizes(selection, previous, snapshots)
+        self._update_slot_progress(snapshots)
         return NativeWave(selection.token, selection.size, selection.raw_size, *timings)
 
     def root_policy(self, slot: int) -> np.ndarray:
@@ -250,6 +265,7 @@ class NativeSearchBackend:
         )
         self._roots[parsed_slot] = next_position
         self._batch_sizes[parsed_slot] = []
+        self._slot_progress[parsed_slot] = _NativeSlotSnapshot(False, 0, 0)
         return dict(result)
 
     def observe_action(
@@ -278,6 +294,7 @@ class NativeSearchBackend:
         )
         self._roots[parsed_slot] = next_position
         self._batch_sizes[parsed_slot] = []
+        self._slot_progress[parsed_slot] = _NativeSlotSnapshot(False, 0, 0)
         return dict(result)
 
     def remove(self, slot: int) -> None:
@@ -285,6 +302,7 @@ class NativeSearchBackend:
         self._batch.remove(parsed_slot)
         self._roots.pop(parsed_slot, None)
         self._batch_sizes.pop(parsed_slot, None)
+        self._slot_progress.pop(parsed_slot, None)
 
     def replace_root(
         self,
@@ -306,11 +324,14 @@ class NativeSearchBackend:
         )
         self._roots[parsed_slot] = root
         self._batch_sizes[parsed_slot] = []
+        self._slot_progress[parsed_slot] = _NativeSlotSnapshot(False, 0, 0)
 
     def root_terminal(self, slot: int) -> TerminalResult:
-        return _convert_terminal(
-            self._batch.root_terminal(_nonnegative_int(slot, "slot"))
-        )
+        parsed_slot = _nonnegative_int(slot, "slot")
+        result = _convert_terminal(self._batch.root_terminal(parsed_slot))
+        if result.is_terminal:
+            self._slot_progress[parsed_slot] = _NativeSlotSnapshot(True, 0, 0)
+        return result
 
     def slot_telemetry(self, slot: int) -> SearchTelemetry:
         parsed_slot = _nonnegative_int(slot, "slot")
@@ -323,7 +344,18 @@ class NativeSearchBackend:
         return bool(self._batch.complete())
 
     def slot_complete(self, slot: int) -> bool:
-        return bool(self._batch.slot_complete(_nonnegative_int(slot, "slot")))
+        parsed_slot = _nonnegative_int(slot, "slot")
+        try:
+            return self._slot_progress[parsed_slot].complete
+        except KeyError as error:
+            raise ValueError(f"Unknown native root slot: {parsed_slot}") from error
+
+    def slot_simulations(self, slot: int) -> int:
+        parsed_slot = _nonnegative_int(slot, "slot")
+        try:
+            return self._slot_progress[parsed_slot].simulations
+        except KeyError as error:
+            raise ValueError(f"Unknown native root slot: {parsed_slot}") from error
 
     def deduplication_telemetry(self) -> dict[str, Any]:
         return dict(self._batch.deduplication_telemetry())
@@ -539,36 +571,56 @@ class NativeSearchBackend:
                 self._policies[:rows, self._action_size :].zero_()
             self._values[:rows].copy_(values, non_blocking=non_blocking)
 
-    def _snapshot_completions(self) -> dict[int, int]:
-        result: dict[int, int] = {}
-        for slot in tuple(self._roots):
-            try:
-                telemetry = self._batch.slot_telemetry(slot)
-            except (IndexError, RuntimeError, ValueError):
-                continue
-            result[slot] = _nonnegative_int(
-                telemetry["evaluator_completions"],
-                "evaluator completions",
+    def _read_slot_snapshots(self) -> dict[int, _NativeSlotSnapshot]:
+        raw_snapshots = self._batch.slot_snapshots()
+        if not isinstance(raw_snapshots, tuple):
+            raise TypeError("Native slot snapshots must be an immutable tuple")
+
+        snapshots: dict[int, _NativeSlotSnapshot] = {}
+        for raw_snapshot in raw_snapshots:
+            if not isinstance(raw_snapshot, tuple) or len(raw_snapshot) != 4:
+                raise ValueError(
+                    "Native slot snapshots must contain four tuple fields"
+                )
+            slot = _nonnegative_int(raw_snapshot[0], "native slot")
+            complete = raw_snapshot[1]
+            if not isinstance(complete, bool):
+                raise TypeError("Native slot completion must be a bool")
+            snapshot = _NativeSlotSnapshot(
+                complete,
+                _nonnegative_int(raw_snapshot[2], "native simulations"),
+                _nonnegative_int(
+                    raw_snapshot[3],
+                    "native evaluator completions",
+                ),
             )
-        return result
+            if slot in snapshots:
+                raise ValueError(f"Native slot snapshots contain duplicate slot {slot}")
+            snapshots[slot] = snapshot
+
+        if set(snapshots) != set(self._roots):
+            raise RuntimeError("Native slot snapshots do not match active roots")
+        return snapshots
+
+    def _update_slot_progress(
+        self,
+        snapshots: Mapping[int, _NativeSlotSnapshot],
+    ) -> None:
+        self._slot_progress = dict(snapshots)
 
     def _record_batch_sizes(
         self,
         selection: _Selection,
         previous: Mapping[int, int],
+        current: Mapping[int, _NativeSlotSnapshot],
     ) -> None:
         for slot, before in previous.items():
-            try:
-                telemetry = self._batch.slot_telemetry(slot)
-            except (IndexError, RuntimeError, ValueError):
+            snapshot = current.get(slot)
+            if snapshot is None:
                 continue
-            current = _nonnegative_int(
-                telemetry["evaluator_completions"],
-                "evaluator completions",
-            )
-            if current > before:
+            if snapshot.evaluator_completions > before:
                 self._batch_sizes.setdefault(slot, []).extend(
-                    [selection.size] * (current - before)
+                    [selection.size] * (snapshot.evaluator_completions - before)
                 )
 
     def _add_timing(

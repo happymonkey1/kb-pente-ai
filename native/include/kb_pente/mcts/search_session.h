@@ -71,6 +71,10 @@ public:
         return completed_simulations_;
     }
 
+    [[nodiscard]] std::uint64_t evaluator_completions() const noexcept {
+        return evaluator_completions_;
+    }
+
     [[nodiscard]] std::uint32_t simulation_budget() const noexcept {
         return tree_.config().simulation_budget;
     }

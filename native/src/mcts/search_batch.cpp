@@ -503,6 +503,31 @@ bool SearchBatch::slot_complete(SlotId slot) const {
     return !checked.session || checked.session->complete();
 }
 
+std::vector<SlotSnapshot> SearchBatch::slot_snapshots() const {
+    ensure_usable();
+    std::vector<SlotSnapshot> result;
+    result.reserve(active_count_);
+    for (SlotId slot = 0U; slot < slots_.size(); ++slot) {
+        const Slot& checked = slots_[slot];
+        if (!checked.tree) {
+            continue;
+        }
+
+        SlotSnapshot snapshot{};
+        snapshot.slot = slot;
+        if (!checked.session) {
+            snapshot.complete = true;
+        } else {
+            snapshot.complete = checked.session->complete();
+            snapshot.simulations = checked.session->completed_simulations();
+            snapshot.evaluator_completions =
+                checked.session->evaluator_completions();
+        }
+        result.push_back(snapshot);
+    }
+    return result;
+}
+
 std::uint64_t SearchBatch::slot_seed(SlotId slot) const {
     const Slot& checked = checked_slot(slot);
     if (!checked.tree) {

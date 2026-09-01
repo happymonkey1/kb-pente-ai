@@ -51,6 +51,7 @@ using kb_pente::SearchBatchStageTelemetry;
 using kb_pente::SearchBatchTimingTelemetry;
 using kb_pente::SearchSessionConfig;
 using kb_pente::SearchTelemetry;
+using kb_pente::SlotSnapshot;
 using kb_pente::SlotId;
 using kb_pente::TerminalResult;
 using kb_pente::WinReason;
@@ -868,6 +869,26 @@ public:
         return search_telemetry_to_dict(telemetry);
     }
 
+    [[nodiscard]] py::tuple slot_snapshots() const {
+        std::vector<SlotSnapshot> snapshots;
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshots = batch_.slot_snapshots();
+        }
+
+        py::tuple result(snapshots.size());
+        for (std::size_t index = 0U; index < snapshots.size(); ++index) {
+            const SlotSnapshot& snapshot = snapshots[index];
+            result[index] = py::make_tuple(
+                snapshot.slot,
+                snapshot.complete,
+                snapshot.simulations,
+                snapshot.evaluator_completions);
+        }
+        return result;
+    }
+
     [[nodiscard]] py::dict deduplication_telemetry() const {
         DeduplicationTelemetry telemetry{};
         {
@@ -1105,6 +1126,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
             "slot_telemetry",
             &SearchBatchBinding::slot_telemetry,
             py::arg("slot"))
+        .def("slot_snapshots", &SearchBatchBinding::slot_snapshots)
         .def(
             "deduplication_telemetry",
             &SearchBatchBinding::deduplication_telemetry)

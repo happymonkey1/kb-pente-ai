@@ -509,6 +509,56 @@ void test_terminal_advancement_and_slot_removal() {
            "removing all slots restores an empty complete batch");
 }
 
+void test_slot_snapshots() {
+    kb_pente::SearchBatch batch(batch_config(2U, 67U), 2U, 2U);
+    const auto first = batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+    const auto second = batch.add(
+        kb_pente::Position::initial(5), kb_pente::Ruleset::Freestyle);
+
+    const auto initial = batch.slot_snapshots();
+    expect(initial.size() == 2U && initial[0] == kb_pente::SlotSnapshot{
+        first, false, 0U, 0U} &&
+               initial[1] == kb_pente::SlotSnapshot{second, false, 0U, 0U},
+           "slot snapshots report fresh sessions in slot order");
+
+    const auto selection = batch.select();
+    const auto pending = batch.slot_snapshots();
+    expect(pending == initial,
+           "selecting a nonterminal leaf does not advance slot counters");
+    backup_uniform(batch, selection);
+
+    const auto progressed = batch.slot_snapshots();
+    expect(progressed.size() == 2U &&
+               progressed[0] == kb_pente::SlotSnapshot{first, false, 1U, 1U} &&
+               progressed[1] == kb_pente::SlotSnapshot{second, false, 1U, 1U},
+           "slot snapshots report completed evaluator progress");
+
+    run_to_completion(batch);
+    const auto complete = batch.slot_snapshots();
+    expect(complete.size() == 2U && complete[0].complete &&
+               complete[1].complete && complete[0].simulations == 2U &&
+               complete[1].simulations == 2U,
+           "slot snapshots report completed sessions");
+
+    kb_pente::SearchBatch terminal(batch_config(4U, 71U), 1U, 1U);
+    const auto terminal_slot = terminal.add(
+        make_draw_root(), kb_pente::Ruleset::Freestyle);
+    const auto terminal_selection = terminal.select();
+    backup_first_one_hot(terminal, terminal_selection, 24U);
+    const auto terminal_pending = terminal.select();
+    expect(terminal_pending.empty(), "terminal fixture emits an empty wave");
+    const auto terminal_snapshot = terminal.slot_snapshots();
+    expect(terminal_snapshot.size() == 1U &&
+               terminal_snapshot[0] == kb_pente::SlotSnapshot{
+                   terminal_slot, true, 4U, 1U},
+           "slot snapshots include terminal leaves in simulation progress");
+
+    terminal.remove(terminal_slot);
+    expect(terminal.slot_snapshots().empty(),
+           "slot snapshots omit removed slots");
+}
+
 void test_lifecycle_rejection_and_lowest_free_reuse() {
     kb_pente::SearchBatch batch(batch_config(2U, 71U), 2U, 2U);
     const auto first = batch.add(
@@ -1534,6 +1584,7 @@ int main() {
         test_observed_action_worker_equivalence();
         test_allocated_root_advancement_and_continuation();
         test_terminal_advancement_and_slot_removal();
+        test_slot_snapshots();
         test_lifecycle_rejection_and_lowest_free_reuse();
         test_strong_replacement_and_seed_progression();
         test_worker_equivalence_after_lifecycle_changes();

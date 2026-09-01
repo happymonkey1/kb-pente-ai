@@ -185,6 +185,30 @@ struct Selection final {
     [[nodiscard]] bool empty() const noexcept { return count == 0U; }
 };
 
+// SlotSnapshot is a compact read-only progress report for one active slot.
+// Terminal roots retain their slot but no session, so their counters are zero
+// and complete is true.
+struct SlotSnapshot final {
+    SlotId slot = kInvalidSlot;
+    bool complete = false;
+    std::uint64_t simulations = 0U;
+    std::uint64_t evaluator_completions = 0U;
+};
+
+[[nodiscard]] inline bool operator==(
+    const SlotSnapshot& left,
+    const SlotSnapshot& right) noexcept {
+    return left.slot == right.slot && left.complete == right.complete &&
+           left.simulations == right.simulations &&
+           left.evaluator_completions == right.evaluator_completions;
+}
+
+[[nodiscard]] inline bool operator!=(
+    const SlotSnapshot& left,
+    const SlotSnapshot& right) noexcept {
+    return !(left == right);
+}
+
 // SearchBatch coordinates independent single-tree sessions through
 // synchronous evaluator-selection waves, with stable slot admission and
 // explicit root lifecycle operations.
@@ -303,6 +327,8 @@ public:
 
     [[nodiscard]] bool slot_active(SlotId slot) const;
     [[nodiscard]] bool slot_complete(SlotId slot) const;
+    // Return compact progress snapshots for every active slot in slot order.
+    [[nodiscard]] std::vector<SlotSnapshot> slot_snapshots() const;
     // Return the deterministic per-admission seed assigned to one slot.
     [[nodiscard]] std::uint64_t slot_seed(SlotId slot) const;
     [[nodiscard]] const Position& root_position(SlotId slot) const;

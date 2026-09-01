@@ -256,7 +256,7 @@ class _NativeSearchCoordinator:
         after: dict[int, int] = {}
         for game in active:
             slot = self._slot(game)
-            current = self._backend.slot_telemetry(slot).simulations
+            current = self._backend.slot_simulations(slot)
             selected_leaves += max(0, current - before[slot])
             after[slot] = current
         accumulator.record_native_wave(

@@ -59,6 +59,9 @@ class _FakeBatch:
         self._token = 0
         self._pending = False
         self._slots: list[dict[str, Any] | None] = [None] * capacity
+        self.slot_snapshot_calls = 0
+        self.slot_telemetry_calls = 0
+        self.slot_complete_calls = 0
         self._dedup = {
             "cumulative": {
                 "selection_waves": 0,
@@ -154,6 +157,7 @@ class _FakeBatch:
         return terminal or {"status": "in_progress", "reason": "none", "winner": None}
 
     def slot_telemetry(self, slot: int) -> dict[str, Any]:
+        self.slot_telemetry_calls += 1
         state = self._slots[slot]
         if state is None:
             raise IndexError(slot)
@@ -163,8 +167,22 @@ class _FakeBatch:
         )
 
     def slot_complete(self, slot: int) -> bool:
+        self.slot_complete_calls += 1
         state = self._slots[slot]
         return state is not None and int(state["simulations"]) >= self._simulations
+
+    def slot_snapshots(self) -> tuple[tuple[int, bool, int, int], ...]:
+        self.slot_snapshot_calls += 1
+        return tuple(
+            (
+                slot,
+                int(state["simulations"]) >= self._simulations,
+                int(state["simulations"]),
+                int(state["completions"]),
+            )
+            for slot, state in enumerate(self._slots)
+            if state is not None
+        )
 
     def advance_root(self, slot: int, _action: int, **_kwargs: object) -> dict[str, Any]:
         state = self._slots[slot]
@@ -293,6 +311,22 @@ class NativeBackendTests(TestCase):
         self.assertEqual(backend.slot_telemetry(second), backend.slot_telemetry(first))
         np.testing.assert_allclose(backend.root_policy(first), np.eye(1, 25, 0)[0])
 
+    def test_successful_wave_uses_one_bulk_snapshot_without_slot_fanout(self) -> None:
+        backend = self.make_backend()
+        backend.add_root(self.game.init_board())
+        backend.add_root(self.game.init_board())
+
+        backend.evaluate_wave()
+
+        self.assertEqual(1, backend._batch.slot_snapshot_calls)
+        self.assertEqual(0, backend._batch.slot_telemetry_calls)
+        self.assertEqual(0, backend._batch.slot_complete_calls)
+        self.assertEqual(1, backend.slot_simulations(0))
+        self.assertEqual(1, backend.slot_simulations(1))
+        self.assertFalse(backend.slot_complete(0))
+        self.assertFalse(backend.slot_complete(1))
+        self.assertEqual(0, backend._batch.slot_complete_calls)
+
     def test_failed_wave_keeps_pending_token_for_retry(self) -> None:
         class InvalidThenValidEvaluator(_FakeEvaluator):
             def __init__(self) -> None:
@@ -319,6 +353,29 @@ class NativeBackendTests(TestCase):
         self.assertFalse(backend.complete())
         backend.evaluate_wave()
         self.assertTrue(backend.complete())
+
+    def test_failed_backup_does_not_publish_slot_snapshot_to_cache(self) -> None:
+        backend = NativeSearchBackend(
+            self.game,
+            _FakeEvaluator(),
+            MCTSArgs(num_simulations=1),
+            max_active_games=1,
+            worker_threads=1,
+            pin_memory=False,
+            extension=_FailingBackupExtension,
+        )
+        slot = backend.add_root(self.game.init_board())
+
+        with self.assertRaisesRegex(RuntimeError, "transient"):
+            backend.evaluate_wave()
+
+        self.assertEqual(0, backend._batch.slot_snapshot_calls)
+        self.assertEqual(0, backend.slot_simulations(slot))
+        self.assertFalse(backend.slot_complete(slot))
+
+        backend.evaluate_wave()
+        self.assertEqual(1, backend._batch.slot_snapshot_calls)
+        self.assertEqual(1, backend.slot_simulations(slot))
 
     def test_failed_backup_keeps_pending_token_for_retry(self) -> None:
         backend = NativeSearchBackend(
@@ -354,6 +411,8 @@ class NativeBackendTests(TestCase):
         self.assertTrue(result["reused_subtree"])
         self.assertEqual(backend._roots[slot].state_key(), expected.state_key())
         self.assertEqual(backend._batch_sizes[slot], [])
+        self.assertEqual(backend.slot_simulations(slot), 0)
+        self.assertFalse(backend.slot_complete(slot))
 
     def test_failed_observed_action_does_not_update_python_mirrors(self) -> None:
         backend = NativeSearchBackend(

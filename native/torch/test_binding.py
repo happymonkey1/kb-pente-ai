@@ -119,6 +119,37 @@ class SearchBatchBindingTests(unittest.TestCase):
         repeat.backup(repeat_selection.token, repeat_selection.size)
         self.assertTrue(torch.equal(policy, repeat.root_policy(0)))
 
+    def test_slot_snapshots_are_immutable_and_track_progress(self) -> None:
+        batch = self.make_batch(simulations=2)
+        stones, captures = _initial_root(5)
+        first = batch.add(stones, captures, 1, 0)
+        second = batch.add(stones.clone(), captures.clone(), 1, 0)
+
+        self.assertEqual(
+            batch.slot_snapshots(),
+            ((first, False, 0, 0), (second, False, 0, 0)),
+        )
+        selected = batch.select()
+        self.assertEqual(
+            batch.slot_snapshots(),
+            ((first, False, 0, 0), (second, False, 0, 0)),
+        )
+        _backup_one_hot(batch, selected)
+        self.assertEqual(
+            batch.slot_snapshots(),
+            ((first, False, 1, 1), (second, False, 1, 1)),
+        )
+
+        _run_to_completion(batch)
+        self.assertEqual(
+            batch.slot_snapshots(),
+            ((first, True, 2, 2), (second, True, 2, 2)),
+        )
+        batch.remove(first)
+        self.assertEqual(batch.slot_snapshots(), ((second, True, 2, 2),))
+        batch.remove(second)
+        self.assertEqual(batch.slot_snapshots(), ())
+
     def test_rejected_backup_is_retryable(self) -> None:
         batch = self.make_batch(simulations=1)
         stones, captures = _initial_root(5)

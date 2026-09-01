@@ -101,6 +101,9 @@ class _FakeNativeBackend:
     def slot_complete(self, slot: int) -> bool:
         return self.slots[slot].simulations >= self.args.num_simulations
 
+    def slot_simulations(self, slot: int) -> int:
+        return self.slots[slot].simulations
+
     def root_policy(self, slot: int) -> np.ndarray:
         state = self.slots[slot]
         legal = np.flatnonzero(
