@@ -155,6 +155,7 @@ class NativeSearchBackend:
         self._roots: dict[int, PenteBoard] = {}
         self._batch_sizes: dict[int, list[int]] = {}
         self._slot_progress: dict[int, _NativeSlotSnapshot] = {}
+        self._terminal_results: dict[int, TerminalResult] = {}
         self._pending: _Selection | None = None
         self._pending_completions: dict[int, int] = {}
         self._inference_timing = NativeInferenceTiming()
@@ -193,7 +194,7 @@ class NativeSearchBackend:
             raise RuntimeError(f"Native batch reused an active slot {slot}")
         self._roots[slot] = root
         self._batch_sizes[slot] = []
-        self._slot_progress[slot] = _NativeSlotSnapshot(False, 0, 0)
+        self._refresh_lifecycle_progress(slot)
         return slot
 
     def evaluate_wave(self) -> NativeWave:
@@ -265,7 +266,7 @@ class NativeSearchBackend:
         )
         self._roots[parsed_slot] = next_position
         self._batch_sizes[parsed_slot] = []
-        self._slot_progress[parsed_slot] = _NativeSlotSnapshot(False, 0, 0)
+        self._refresh_lifecycle_progress(parsed_slot)
         return dict(result)
 
     def observe_action(
@@ -294,7 +295,7 @@ class NativeSearchBackend:
         )
         self._roots[parsed_slot] = next_position
         self._batch_sizes[parsed_slot] = []
-        self._slot_progress[parsed_slot] = _NativeSlotSnapshot(False, 0, 0)
+        self._refresh_lifecycle_progress(parsed_slot)
         return dict(result)
 
     def remove(self, slot: int) -> None:
@@ -303,6 +304,7 @@ class NativeSearchBackend:
         self._roots.pop(parsed_slot, None)
         self._batch_sizes.pop(parsed_slot, None)
         self._slot_progress.pop(parsed_slot, None)
+        self._terminal_results.pop(parsed_slot, None)
 
     def replace_root(
         self,
@@ -324,12 +326,16 @@ class NativeSearchBackend:
         )
         self._roots[parsed_slot] = root
         self._batch_sizes[parsed_slot] = []
-        self._slot_progress[parsed_slot] = _NativeSlotSnapshot(False, 0, 0)
+        self._refresh_lifecycle_progress(parsed_slot)
 
     def root_terminal(self, slot: int) -> TerminalResult:
         parsed_slot = _nonnegative_int(slot, "slot")
+        cached = self._terminal_results.get(parsed_slot)
+        if cached is not None:
+            return cached
         result = _convert_terminal(self._batch.root_terminal(parsed_slot))
         if result.is_terminal:
+            self._terminal_results[parsed_slot] = result
             self._slot_progress[parsed_slot] = _NativeSlotSnapshot(True, 0, 0)
         return result
 
@@ -348,7 +354,7 @@ class NativeSearchBackend:
         try:
             return self._slot_progress[parsed_slot].complete
         except KeyError as error:
-            raise ValueError(f"Unknown native root slot: {parsed_slot}") from error
+            raise IndexError(f"Native root slot is not active: {parsed_slot}") from error
 
     def slot_simulations(self, slot: int) -> int:
         parsed_slot = _nonnegative_int(slot, "slot")
@@ -601,6 +607,18 @@ class NativeSearchBackend:
         if set(snapshots) != set(self._roots):
             raise RuntimeError("Native slot snapshots do not match active roots")
         return snapshots
+
+    def _refresh_lifecycle_progress(self, slot: int) -> None:
+        terminal = _convert_terminal(self._batch.root_terminal(slot))
+        self._slot_progress[slot] = _NativeSlotSnapshot(
+            terminal.is_terminal,
+            0,
+            0,
+        )
+        if terminal.is_terminal:
+            self._terminal_results[slot] = terminal
+        else:
+            self._terminal_results.pop(slot, None)
 
     def _update_slot_progress(
         self,

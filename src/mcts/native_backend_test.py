@@ -62,6 +62,7 @@ class _FakeBatch:
         self.slot_snapshot_calls = 0
         self.slot_telemetry_calls = 0
         self.slot_complete_calls = 0
+        self.root_terminal_calls = 0
         self._dedup = {
             "cumulative": {
                 "selection_waves": 0,
@@ -151,6 +152,7 @@ class _FakeBatch:
         return result
 
     def root_terminal(self, slot: int) -> dict[str, Any]:
+        self.root_terminal_calls += 1
         state = self._slots[slot]
         assert state is not None
         terminal = state["terminal"]
@@ -247,6 +249,24 @@ class _FailingObserveBatch(_FakeBatch):
 
 class _FailingObserveExtension:
     SearchBatch = _FailingObserveBatch
+
+
+class _TerminalAdvanceBatch(_FakeBatch):
+    def advance_root(
+        self,
+        slot: int,
+        _action: int,
+        **_kwargs: object,
+    ) -> dict[str, Any]:
+        result = super().advance_root(slot, _action, **_kwargs)
+        state = self._slots[slot]
+        assert state is not None
+        state["terminal"] = {"status": "draw", "reason": "none", "winner": None}
+        return result
+
+
+class _TerminalAdvanceExtension:
+    SearchBatch = _TerminalAdvanceBatch
 
 
 class _FakeEvaluator:
@@ -413,6 +433,28 @@ class NativeBackendTests(TestCase):
         self.assertEqual(backend._batch_sizes[slot], [])
         self.assertEqual(backend.slot_simulations(slot), 0)
         self.assertFalse(backend.slot_complete(slot))
+
+    def test_terminal_lifecycle_is_complete_before_public_terminal_read(self) -> None:
+        backend = NativeSearchBackend(
+            self.game,
+            _FakeEvaluator(),
+            self.args,
+            max_active_games=1,
+            worker_threads=1,
+            pin_memory=False,
+            extension=_TerminalAdvanceExtension,
+        )
+        slot = backend.add_root(self.game.init_board())
+        calls_before_advance = backend._batch.root_terminal_calls
+
+        backend.advance_root(slot, 0)
+
+        self.assertTrue(backend.slot_complete(slot))
+        self.assertEqual(backend.root_terminal(slot), TerminalResult.draw())
+        self.assertEqual(
+            calls_before_advance + 1,
+            backend._batch.root_terminal_calls,
+        )
 
     def test_failed_observed_action_does_not_update_python_mirrors(self) -> None:
         backend = NativeSearchBackend(

@@ -109,6 +109,52 @@ class NativeBackendExtensionTests(unittest.TestCase):
         backend.remove(slot)
         self.assertEqual(backend.active_count, 0)
 
+    def test_terminal_advance_updates_cached_completion_immediately(self) -> None:
+        class TerminalEvaluator:
+            device = torch.device("cpu")
+
+            def evaluate_features(
+                self,
+                inputs: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                policies = torch.zeros((inputs.shape[0], 25), dtype=torch.float32)
+                policies[:, 24] = 1.0
+                return policies, torch.zeros(inputs.shape[0], dtype=torch.float32)
+
+        backend = NativeSearchBackend(
+            self.game,
+            TerminalEvaluator(),
+            MCTSArgs(num_simulations=1, root_noise_epsilon=0.0),
+            max_active_games=1,
+            worker_threads=1,
+            pin_memory=False,
+            extension=self.extension,
+        )
+        draw_stones, draw_captures = _draw_root()
+        root = PenteBoard(
+            draw_stones.numpy(),
+            draw_captures.numpy(),
+            current_player=1,
+            ply=24,
+        )
+        slot = backend.add_root(root, temperature=0.0)
+        selected = backend.evaluate_wave()
+        self.assertEqual(1, selected.size)
+
+        backend.advance_root(slot, 24, temperature=0.0)
+
+        self.assertTrue(backend.slot_complete(slot))
+        self.assertEqual(backend.root_terminal(slot).status.value, "draw")
+
+    def test_removed_slot_completion_preserves_index_error(self) -> None:
+        backend = self.make_backend(simulations=1, capacity=1)
+        slot = backend.add_root(self.game.init_board(), temperature=0.0)
+        backend.evaluate_wave()
+        backend.remove(slot)
+
+        with self.assertRaises(IndexError):
+            backend.slot_complete(slot)
+
     def test_observe_action_updates_root_mirror_and_continues_search(self) -> None:
         backend = self.make_backend(simulations=1, capacity=1)
         root = self.game.init_board()
