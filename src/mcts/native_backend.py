@@ -151,6 +151,17 @@ class NativeSearchBackend:
         self._policy_pointer = _pointer(self._policies)
         self._value_pointer = _pointer(self._values)
         self._validate_staging()
+        self._cuda_feature_staging: torch.Tensor | None = None
+        self._cuda_timing_events: tuple[torch.cuda.Event, ...] | None = None
+        if self.device.type == "cuda":
+            self._cuda_feature_staging = torch.empty(
+                (self._capacity, 4, self._board_size, self._board_size),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._cuda_timing_events = tuple(
+                torch.cuda.Event(enable_timing=True) for _ in range(6)
+            )
 
         self._roots: dict[int, PenteBoard] = {}
         self._batch_sizes: dict[int, list[int]] = {}
@@ -486,6 +497,8 @@ class NativeSearchBackend:
         selection: _Selection,
     ) -> tuple[float, float, float, float]:
         self._validate_staging()
+        if self._cuda_feature_staging is None or self._cuda_timing_events is None:
+            raise RuntimeError("CUDA inference resources were not initialized")
         stream = torch.cuda.current_stream(self.device)
         (
             h2d_started,
@@ -494,10 +507,11 @@ class NativeSearchBackend:
             model_finished,
             d2h_started,
             d2h_finished,
-        ) = (torch.cuda.Event(enable_timing=True) for _ in range(6))
+        ) = self._cuda_timing_events
 
         h2d_started.record(stream)
-        inputs = selection.features.to(device=self.device, non_blocking=True)
+        inputs = self._cuda_feature_staging[: selection.size]
+        inputs.copy_(selection.features, non_blocking=True)
         h2d_finished.record(stream)
         model_started.record(stream)
         policies, values = self._call_evaluator(inputs)

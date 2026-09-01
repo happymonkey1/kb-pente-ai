@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from unittest import TestCase
+from unittest import TestCase, skipUnless
 from unittest.mock import patch
 
 import numpy as np
@@ -52,12 +52,17 @@ class _FakeBatch:
         self.options = options
         capacity = int(options["active_games"])
         board_size = int(options["board_size"])
-        self.features = torch.empty((capacity, 4, board_size, board_size))
-        self.policies = torch.empty((capacity, 361))
-        self.values = torch.empty((capacity,))
+        pin_memory = bool(options["pin_memory"])
+        self.features = torch.empty(
+            (capacity, 4, board_size, board_size),
+            pin_memory=pin_memory,
+        )
+        self.policies = torch.empty((capacity, 361), pin_memory=pin_memory)
+        self.values = torch.empty((capacity,), pin_memory=pin_memory)
         self._simulations = int(options["simulations"])
         self._token = 0
         self._pending = False
+        self._selection_sizes: list[int] = []
         self._slots: list[dict[str, Any] | None] = [None] * capacity
         self.slot_snapshot_calls = 0
         self.slot_telemetry_calls = 0
@@ -102,9 +107,11 @@ class _FakeBatch:
         self._pending = True
         active = [slot for slot in self._slots if slot is not None]
         size = 1 if active else 0
+        if self._selection_sizes:
+            size = min(self._selection_sizes.pop(0), len(active))
         raw_size = len(active)
         if size:
-            self.features[0].fill_(0.0)
+            self.features[:size].fill_(float(self._token))
         self._dedup["last_wave"] = {
             "selection_waves": 1,
             "raw_evaluation_requests": raw_size,
@@ -130,7 +137,7 @@ class _FakeBatch:
         return _FakeSelection(self.features[:size], self._token, size, raw_size)
 
     def backup(self, token: int, rows: int) -> None:
-        if not self._pending or token != self._token or rows != 1:
+        if not self._pending or token != self._token or rows < 1:
             raise RuntimeError("invalid fake backup")
         if torch.count_nonzero(self.policies[0, 25:]).item() != 0:
             raise RuntimeError("adapter did not clear inactive policy staging")
@@ -277,6 +284,43 @@ class _FakeEvaluator:
         return torch.ones((rows, 25), dtype=torch.float32) / 25.0, torch.zeros(rows)
 
 
+class _CudaEvaluator:
+    device = torch.device("cuda")
+
+    def __init__(self) -> None:
+        self.inputs: list[tuple[tuple[int, ...], int, torch.Tensor]] = []
+
+    def evaluate_features(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.inputs.append((tuple(inputs.shape), inputs.data_ptr(), inputs.detach().clone()))
+        rows = inputs.shape[0]
+        return (
+            torch.ones((rows, 25), dtype=torch.float32, device=inputs.device) / 25.0,
+            torch.zeros(rows, dtype=torch.float32, device=inputs.device),
+        )
+
+
+class _RetryingCudaEvaluator(_CudaEvaluator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def evaluate_features(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("transient CUDA evaluator failure")
+        return super().evaluate_features(inputs)
+
+
+class _VariableCudaBatch(_FakeBatch):
+    def __init__(self, **options: Any) -> None:
+        super().__init__(**options)
+        self._selection_sizes = [1, 2]
+
+
+class _VariableCudaExtension:
+    SearchBatch = _VariableCudaBatch
+
+
 class NativeBackendTests(TestCase):
     def setUp(self) -> None:
         self.game = PenteGame(board_size=5, ruleset=PenteRuleset.FREESTYLE)
@@ -292,6 +336,28 @@ class NativeBackendTests(TestCase):
             seed=103,
             pin_memory=False,
             extension=_FakeExtension,
+        )
+
+    def make_cuda_backend(
+        self,
+        evaluator: _CudaEvaluator,
+        *,
+        capacity: int = 2,
+        extension: Any = _FakeExtension,
+        simulations: int | None = None,
+    ) -> NativeSearchBackend:
+        return NativeSearchBackend(
+            self.game,
+            evaluator,
+            (
+                self.args
+                if simulations is None
+                else MCTSArgs(num_simulations=simulations)
+            ),
+            max_active_games=capacity,
+            worker_threads=2,
+            seed=103,
+            extension=extension,
         )
 
     def test_extension_loading_is_explicit_and_actionable(self) -> None:
@@ -330,6 +396,73 @@ class NativeBackendTests(TestCase):
         self.assertEqual(backend.slot_telemetry(first).mean_inference_batch_size, 1.0)
         self.assertEqual(backend.slot_telemetry(second), backend.slot_telemetry(first))
         np.testing.assert_allclose(backend.root_policy(first), np.eye(1, 25, 0)[0])
+
+    def test_cpu_backend_does_not_allocate_cuda_resources(self) -> None:
+        backend = self.make_backend()
+
+        self.assertIsNone(backend._cuda_feature_staging)
+        self.assertIsNone(backend._cuda_timing_events)
+
+    @skipUnless(torch.cuda.is_available(), "CUDA device required")
+    def test_cuda_reuses_feature_storage_events_and_variable_row_views(self) -> None:
+        evaluator = _CudaEvaluator()
+        backend = self.make_cuda_backend(evaluator, extension=_VariableCudaExtension)
+        backend.add_root(self.game.init_board())
+        backend.add_root(self.game.init_board())
+        device_features = backend._cuda_feature_staging
+        timing_events = backend._cuda_timing_events
+        self.assertIsNotNone(device_features)
+        self.assertIsNotNone(timing_events)
+        assert device_features is not None
+        assert timing_events is not None
+        self.assertEqual((2, 4, 5, 5), tuple(device_features.shape))
+        self.assertEqual(6, len(timing_events))
+        event_ids = tuple(id(event) for event in timing_events)
+
+        first = backend.evaluate_wave()
+        second = backend.evaluate_wave()
+
+        self.assertEqual((1, 2), (first.size, second.size))
+        self.assertTrue(backend.complete())
+        self.assertIs(device_features, backend._cuda_feature_staging)
+        self.assertIs(timing_events, backend._cuda_timing_events)
+        self.assertEqual(event_ids, tuple(id(event) for event in timing_events))
+        self.assertEqual(2, backend.inference_timing()["calls"])
+        self.assertGreaterEqual(first.host_to_device_seconds, 0.0)
+        self.assertGreaterEqual(first.model_inference_seconds, 0.0)
+        self.assertGreaterEqual(first.device_to_host_seconds, 0.0)
+        self.assertGreaterEqual(first.inference_wait_seconds, 0.0)
+        self.assertGreaterEqual(second.host_to_device_seconds, 0.0)
+        self.assertGreaterEqual(second.model_inference_seconds, 0.0)
+        self.assertGreaterEqual(second.device_to_host_seconds, 0.0)
+        self.assertGreaterEqual(second.inference_wait_seconds, 0.0)
+
+        self.assertEqual(
+            [(1, 4, 5, 5), (2, 4, 5, 5)],
+            [entry[0] for entry in evaluator.inputs],
+        )
+        for (shape, pointer, snapshot), token in zip(evaluator.inputs, (1.0, 2.0)):
+            self.assertEqual((int(token), 4, 5, 5), shape)
+            self.assertEqual(device_features.data_ptr(), pointer)
+            torch.testing.assert_close(snapshot, torch.full_like(snapshot, token))
+
+    @skipUnless(torch.cuda.is_available(), "CUDA device required")
+    def test_cuda_evaluator_failure_can_retry_with_reused_resources(self) -> None:
+        evaluator = _RetryingCudaEvaluator()
+        backend = self.make_cuda_backend(evaluator, capacity=1, simulations=1)
+        backend.add_root(self.game.init_board())
+        device_features = backend._cuda_feature_staging
+        timing_events = backend._cuda_timing_events
+
+        with self.assertRaisesRegex(RuntimeError, "transient CUDA"):
+            backend.evaluate_wave()
+        self.assertFalse(backend.complete())
+        backend.evaluate_wave()
+
+        self.assertTrue(backend.complete())
+        self.assertEqual(2, evaluator.calls)
+        self.assertIs(device_features, backend._cuda_feature_staging)
+        self.assertIs(timing_events, backend._cuda_timing_events)
 
     def test_successful_wave_uses_one_bulk_snapshot_without_slot_fanout(self) -> None:
         backend = self.make_backend()
