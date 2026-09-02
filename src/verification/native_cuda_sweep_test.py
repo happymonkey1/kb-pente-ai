@@ -61,10 +61,47 @@ class NativeCudaSweepTest(unittest.TestCase):
         self.assertIn("--minimum-batch-occupancy 0.80", result.stdout)
         self.assertIn("--active-games 2", result.stdout)
         self.assertIn("--native-search-threads 2", result.stdout)
+        self.assertEqual(2, result.stdout.count("--native-search-cohorts 1"))
         self.assertIn("Dry run complete: 2 profiles validated", result.stdout)
         self.assertFalse(
             (_ROOT / f"pente-model-{prefix}-active1-workers1").exists()
         )
+        self.assertFalse(
+            (_ROOT / f"pente-model-{prefix}-active2-workers2").exists()
+        )
+        self.assertFalse(
+            (_ROOT / "metrics" / f"{prefix}-active1-workers1.jsonl").exists()
+        )
+        self.assertFalse(
+            (_ROOT / "replays" / f"{prefix}-active2-workers2.jsonl").exists()
+        )
+
+    def test_profile_validation_rejects_normalized_duplicates_and_invalid_budgets(self) -> None:
+        duplicate = _run(
+            "--dry-run",
+            "--profiles",
+            "512:8 512:8:1",
+            "--prefix",
+            f"test-native-cuda-duplicate-{os.getpid()}",
+        )
+        self.assertEqual(64, duplicate.returncode)
+        self.assertIn("duplicate profile", duplicate.stderr)
+
+        for profile, message in (
+            ("2:2:3", "cohorts must be 1 or 2"),
+            ("1:2:2", "active-games >= 2"),
+            ("2:1:2", "native-workers >= 2"),
+            ("513:2", "must not exceed 512"),
+        ):
+            result = _run(
+                "--dry-run",
+                "--profiles",
+                profile,
+                "--prefix",
+                f"test-native-cuda-invalid-{os.getpid()}-{profile.replace(':', '-')}",
+            )
+            self.assertEqual(64, result.returncode, profile)
+            self.assertIn(message, result.stderr, profile)
 
     def test_checkpoint_requires_paired_replay_and_explicit_final_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -131,14 +168,19 @@ class NativeCudaSweepTest(unittest.TestCase):
             )
             fake_python.chmod(0o755)
             prefix = f"test-native-cuda-run-{os.getpid()}"
-            profiles = ((1, 1), (2, 2))
+            profile_text = "1:1 2:2:1 2:2:2"
+            profiles = (
+                (1, 1, 1, ""),
+                (2, 2, 1, "-cohorts1"),
+                (2, 2, 2, "-cohorts2"),
+            )
             try:
                 result = _run(
                     "--no-compile",
                     "--prefix",
                     prefix,
                     "--profiles",
-                    "1:1 2:2",
+                    profile_text,
                     python=str(fake_python),
                     environment={"SWEEP_TEST_MARKER": str(marker)},
                 )
@@ -148,7 +190,7 @@ class NativeCudaSweepTest(unittest.TestCase):
                     for line in marker.read_text(encoding="utf-8").splitlines()
                 ]
                 self.assertEqual(
-                    ["cuda-check", "native-check", "main", "main"],
+                    ["cuda-check", "native-check", "main", "main", "main"],
                     [record["kind"] for record in records],
                 )
                 native_code = records[1]["code"]
@@ -162,43 +204,51 @@ class NativeCudaSweepTest(unittest.TestCase):
                     (
                         record["argv"][record["argv"].index("--active-games") + 1],
                         record["argv"][record["argv"].index("--native-search-threads") + 1],
+                        record["argv"][record["argv"].index("--native-search-cohorts") + 1],
                     )
                     for record in records[2:]
                 ]
-                self.assertEqual([("1", "1"), ("2", "2")], actual_profiles)
-                for active, workers in profiles:
+                self.assertEqual(
+                    [("1", "1", "1"), ("2", "2", "1"), ("2", "2", "2")],
+                    actual_profiles,
+                )
+                for active, workers, cohorts, suffix in profiles:
+                    name = f"{prefix}-active{active}-workers{workers}{suffix}"
                     self.assertTrue(
-                        (_ROOT / f"pente-model-{prefix}-active{active}-workers{workers}").is_dir()
+                        (_ROOT / f"pente-model-{name}").is_dir()
                     )
                     self.assertTrue(
-                        (_ROOT / "metrics" / f"{prefix}-active{active}-workers{workers}.jsonl").is_file()
+                        (_ROOT / "metrics" / f"{name}.jsonl").is_file()
                     )
                     self.assertTrue(
-                        (_ROOT / "replays" / f"{prefix}-active{active}-workers{workers}.jsonl").is_file()
+                        (_ROOT / "replays" / f"{name}.jsonl").is_file()
                     )
+                    log = (_ROOT / "logs" / f"{name}.log").read_text(encoding="utf-8")
+                    self.assertIn(f"native-cohorts={cohorts}", log)
 
                 rerun = _run(
                     "--no-compile",
                     "--prefix",
                     prefix,
                     "--profiles",
-                    "1:1 2:2",
+                    profile_text,
                     python=str(fake_python),
                     environment={"SWEEP_TEST_MARKER": str(marker)},
                 )
                 self.assertEqual(64, rerun.returncode)
                 self.assertIn("output already exists", rerun.stderr)
-                self.assertEqual(4, len(marker.read_text(encoding="utf-8").splitlines()))
+                self.assertEqual(5, len(marker.read_text(encoding="utf-8").splitlines()))
             finally:
-                for active, workers in profiles:
+                for active, workers, _cohorts, suffix in profiles:
+                    name = f"{prefix}-active{active}-workers{workers}{suffix}"
                     shutil.rmtree(
-                        _ROOT / f"pente-model-{prefix}-active{active}-workers{workers}",
+                        _ROOT / f"pente-model-{name}",
                         ignore_errors=True,
                     )
                     for output in (
-                        _ROOT / "metrics" / f"{prefix}-active{active}-workers{workers}.jsonl",
-                        _ROOT / "replays" / f"{prefix}-active{active}-workers{workers}.jsonl",
-                        _ROOT / "logs" / f"{prefix}-active{active}-workers{workers}.log",
+                        _ROOT / "metrics" / f"{name}.jsonl",
+                        _ROOT / "replays" / f"{name}.jsonl",
+                        _ROOT / "logs" / f"{name}.log",
                     ):
                         output.unlink(missing_ok=True)
 

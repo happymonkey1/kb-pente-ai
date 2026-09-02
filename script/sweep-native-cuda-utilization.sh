@@ -9,10 +9,11 @@ usage() {
     cat <<'EOF'
 Sweep native CUDA self-play across active-game/native-worker profiles.
 Defaults: Standard19, model 6/128/256, 512 games, 64 simulations, one learner
-step, and profiles 256:4 256:8 256:16 384:8 512:8 (active:workers).
+step, and profiles 256:4 256:8 256:16 384:8 512:8:1 512:8:2
+(active:workers[:cohorts], where omitted cohorts means one).
 
 Options (also available as SWEEP_* environment variables):
-  --profiles LIST          space- or comma-separated active:worker profiles
+  --profiles LIST          space- or comma-separated active:workers[:cohorts] profiles
   --prefix NAME            unique output prefix
   --checkpoint PATH        shared starting training checkpoint
   --resume-replay PATH     replay snapshot paired with --checkpoint
@@ -49,7 +50,7 @@ python_path() {
 checkpoint="${SWEEP_CHECKPOINT:-}"
 resume_replay="${SWEEP_RESUME_REPLAY:-}"
 final_iteration="${SWEEP_FINAL_ITERATION:-1}"
-profiles="${SWEEP_PROFILES:-256:4 256:8 256:16 384:8 512:8}"
+profiles="${SWEEP_PROFILES:-256:4 256:8 256:16 384:8 512:8:1 512:8:2}"
 prefix="${SWEEP_PREFIX:-native-cuda-sweep-$(date -u '+%Y%m%dT%H%M%SZ')-$$}"
 python_bin="${SWEEP_PYTHON:-${repository_root}/.venv/bin/python}"
 compile_model="${SWEEP_COMPILE:-1}"
@@ -90,14 +91,26 @@ profiles="${profiles//,/ }"
 read -r -a profile_values <<< "${profiles}"
 (( ${#profile_values[@]} > 0 )) || die "profile list cannot be empty"
 declare -a active_values=() worker_values=()
+declare -a cohort_values=() explicit_cohort_values=()
 declare -A seen_profiles=()
 for profile in "${profile_values[@]}"; do
-    [[ ${profile} =~ ^([1-9][0-9]*):([1-9][0-9]*)$ ]] || die "invalid profile: ${profile}"
+    [[ ${profile} =~ ^([1-9][0-9]*):([1-9][0-9]*)(:([1-9][0-9]*))?$ ]] || die "invalid profile: ${profile}"
     active="${BASH_REMATCH[1]}"; workers="${BASH_REMATCH[2]}"
-    [[ -z ${seen_profiles[${profile}]+present} ]] || die "duplicate profile: ${profile}"
-    seen_profiles[${profile}]=1
+    explicit_cohort=0; cohorts=1
+    if [[ -n ${BASH_REMATCH[3]} ]]; then
+        explicit_cohort=1; cohorts="${BASH_REMATCH[4]}"
+    fi
+    (( cohorts == 1 || cohorts == 2 )) || die "cohorts must be 1 or 2: ${profile}"
+    profile_key="${active}:${workers}:${cohorts}"
+    [[ -z ${seen_profiles[${profile_key}]+present} ]] || die "duplicate profile: ${profile}"
+    seen_profiles[${profile_key}]=1
     (( active <= 512 )) || die "active-games must not exceed 512: ${active}"
+    if (( cohorts == 2 )); then
+        (( active >= 2 )) || die "cohorts=2 requires active-games >= 2: ${profile}"
+        (( workers >= 2 )) || die "cohorts=2 requires native-workers >= 2: ${profile}"
+    fi
     active_values+=("${active}"); worker_values+=("${workers}")
+    cohort_values+=("${cohorts}"); explicit_cohort_values+=("${explicit_cohort}")
 done
 
 metrics_root="${repository_root}/metrics"; replays_root="${repository_root}/replays"; logs_root="${repository_root}/logs"
@@ -106,12 +119,20 @@ for output_root in "${metrics_root}" "${replays_root}" "${logs_root}"; do
     [[ ! -e ${output_root} || -d ${output_root} ]] || die "output root is not a directory: ${output_root}"
 done
 assert_new() { [[ ! -e $1 && ! -L $1 ]] || die "output already exists: $1"; }
+profile_name() {
+    local index=$1 suffix=""
+    if (( explicit_cohort_values[index] )); then
+        suffix="-cohorts${cohort_values[index]}"
+    fi
+    printf '%s-active%s-workers%s%s' \
+        "${prefix}" "${active_values[index]}" "${worker_values[index]}" "${suffix}"
+}
 for index in "${!active_values[@]}"; do
-    active=${active_values[index]}; workers=${worker_values[index]}
-    assert_new "${repository_root}/pente-model-${prefix}-active${active}-workers${workers}"
-    assert_new "${metrics_root}/${prefix}-active${active}-workers${workers}.jsonl"
-    assert_new "${replays_root}/${prefix}-active${active}-workers${workers}.jsonl"
-    assert_new "${logs_root}/${prefix}-active${active}-workers${workers}.log"
+    name="$(profile_name "${index}")"
+    assert_new "${repository_root}/pente-model-${name}"
+    assert_new "${metrics_root}/${name}.jsonl"
+    assert_new "${replays_root}/${name}.jsonl"
+    assert_new "${logs_root}/${name}.log"
 done
 
 if (( ! dry_run )); then
@@ -135,25 +156,27 @@ common_args=(
 if (( checkpoint_supplied )); then common_args+=(--model "${checkpoint}" --resume-replay "${resume_replay}"); fi
 if (( ! dry_run )); then mkdir -p "${metrics_root}" "${replays_root}" "${logs_root}"; fi
 for index in "${!active_values[@]}"; do
-    active=${active_values[index]}; workers=${worker_values[index]}
-    model_dir="${repository_root}/pente-model-${prefix}-active${active}-workers${workers}"
-    metric_file="${metrics_root}/${prefix}-active${active}-workers${workers}.jsonl"
-    replay_file="${replays_root}/${prefix}-active${active}-workers${workers}.jsonl"
-    log_file="${logs_root}/${prefix}-active${active}-workers${workers}.log"
+    active=${active_values[index]}; workers=${worker_values[index]}; cohorts=${cohort_values[index]}
+    name="$(profile_name "${index}")"
+    model_dir="${repository_root}/pente-model-${name}"
+    metric_file="${metrics_root}/${name}.jsonl"
+    replay_file="${replays_root}/${name}.jsonl"
+    log_file="${logs_root}/${name}.log"
     args=("${common_args[@]}" --active-games "${active}" --native-search-threads "${workers}"
+        --native-search-cohorts "${cohorts}"
         --model-dir "${model_dir}" --telemetry-file "${metric_file}" --replay-sample-file "${replay_file}")
-    printf '[%d/%d] active-games=%s native-workers=%s\n' "$((index + 1))" "${#active_values[@]}" "${active}" "${workers}"
+    printf '[%d/%d] active-games=%s native-workers=%s native-cohorts=%s\n' "$((index + 1))" "${#active_values[@]}" "${active}" "${workers}" "${cohorts}"
     if (( dry_run )); then printf '  command:'; printf ' %q' "${python_bin}" "${main_file}" "${args[@]}"; printf '\n'; continue; fi
     mkdir "${model_dir}"
     (set -o noclobber; : > "${metric_file}"; : > "${replay_file}"; : > "${log_file}") \
-        || die "could not reserve outputs for active=${active}, workers=${workers}"
-    printf 'active-games=%s native-workers=%s\ncommand:' "${active}" "${workers}" >> "${log_file}"
+        || die "could not reserve outputs for active=${active}, workers=${workers}, cohorts=${cohorts}"
+    printf 'active-games=%s native-workers=%s native-cohorts=%s\ncommand:' "${active}" "${workers}" "${cohorts}" >> "${log_file}"
     printf ' %q' "${python_bin}" "${main_file}" "${args[@]}" >> "${log_file}"; printf '\n' >> "${log_file}"
     if (cd -- "${model_dir}" && "${python_bin}" "${main_file}" "${args[@]}") 2>&1 | tee -a "${log_file}"; then
         printf '  model: %s\n  telemetry: %s\n  replay: %s\n  log: %s\n' "${model_dir}" "${metric_file}" "${replay_file}" "${log_file}"
     else
         status=${PIPESTATUS[0]}; (( status > 0 )) || status=1
-        printf 'error: run active=%s workers=%s failed (status %s); log: %s\n' "${active}" "${workers}" "${status}" "${log_file}" >&2
+        printf 'error: run active=%s workers=%s cohorts=%s failed (status %s); log: %s\n' "${active}" "${workers}" "${cohorts}" "${status}" "${log_file}" >&2
         exit "${status}"
     fi
 done
