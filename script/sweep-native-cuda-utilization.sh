@@ -118,7 +118,7 @@ if (( ! dry_run )); then
     cuda_status="$("${python_bin}" -c 'import torch; print("available" if torch.cuda.is_available() else "unavailable")')" \
         || die "could not query CUDA availability"
     [[ ${cuda_status} == available ]] || die "CUDA is unavailable; this runner requires CUDA"
-    "${python_bin}" -c 'import kb_pente_native' >/dev/null 2>&1 || die "kb_pente_native could not be imported"
+    "${python_bin}" -c 'import torch; import kb_pente_native' >/dev/null 2>&1 || die "kb_pente_native could not be imported"
 fi
 
 common_args=(

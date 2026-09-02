@@ -117,6 +117,7 @@ class NativeCudaSweepTest(unittest.TestCase):
                 "from pathlib import Path\n"
                 "import sys\n"
                 "marker = Path(os.environ['SWEEP_TEST_MARKER'])\n"
+                "code = None\n"
                 "if len(sys.argv) > 1 and sys.argv[1] == '-c':\n"
                 "    code = sys.argv[2]\n"
                 "    kind = 'cuda-check' if 'torch.cuda.is_available' in code else 'native-check'\n"
@@ -125,7 +126,7 @@ class NativeCudaSweepTest(unittest.TestCase):
                 "else:\n"
                 "    kind = 'main'\n"
                 "with marker.open('a', encoding='utf-8') as stream:\n"
-                "    stream.write(json.dumps({'kind': kind, 'argv': sys.argv[1:]}) + '\\n')\n",
+                "    stream.write(json.dumps({'kind': kind, 'argv': sys.argv[1:], 'code': code}) + '\\n')\n",
                 encoding="utf-8",
             )
             fake_python.chmod(0o755)
@@ -149,6 +150,13 @@ class NativeCudaSweepTest(unittest.TestCase):
                 self.assertEqual(
                     ["cuda-check", "native-check", "main", "main"],
                     [record["kind"] for record in records],
+                )
+                native_code = records[1]["code"]
+                self.assertIsInstance(native_code, str)
+                assert isinstance(native_code, str)
+                self.assertLess(
+                    native_code.index("import torch"),
+                    native_code.index("import kb_pente_native"),
                 )
                 actual_profiles = [
                     (
