@@ -16,7 +16,11 @@ from src.mcts.batched import (
     evaluate_search_wave,
 )
 from src.mcts.mcts_v2 import MCTS, MCTSArgs, PolicyValueEvaluator, SearchTelemetry
-from src.mcts.native_backend import NativeSearchBackend, TensorEvaluator
+from src.mcts.native_backend import (
+    NativeSearchBackend,
+    NativeWaveSubmission,
+    TensorEvaluator,
+)
 from src.train.self_play_args import SearchBackend
 from src.train.training_example import TrainingExample
 
@@ -39,6 +43,14 @@ class ActiveSelfPlayGame:
     actions: list[int]
     root_telemetry: list[SearchTelemetry]
     native_slot: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingNativeWave:
+    active_slots: tuple[int, ...]
+    before_completed_simulations: tuple[tuple[int, int], ...]
+    accumulator: BatchedSearchAccumulator
+    submission: NativeWaveSubmission
 
 
 _NativeBackendFactory = Callable[..., NativeSearchBackend]
@@ -175,6 +187,7 @@ class _NativeSearchCoordinator:
         self._cumulative_telemetry: dict[int, SearchTelemetry | None] = {}
         self._telemetry_pending: dict[int, bool] = {}
         self._completed_simulations: dict[int, int] = {}
+        self._pending_wave: _PendingNativeWave | None = None
 
     def start(self, active: ActiveSelfPlayGame) -> None:
         if active.native_slot is not None:
@@ -242,30 +255,69 @@ class _NativeSearchCoordinator:
         active: list[ActiveSelfPlayGame],
         accumulator: BatchedSearchAccumulator,
     ) -> None:
-        before = {
-            self._slot(game): self._completed_simulations[self._slot(game)]
-            for game in active
-        }
-        wave = self._backend.evaluate_wave()
-        timing = self._backend.native_timing_telemetry()
-        worker_threads = _integral_count(
-            self._backend.thread_count,
-            "Native worker threads",
+        if self._pending_wave is None:
+            self.submit_wave(active, accumulator)
+        else:
+            active_slots = tuple(self._slot(game) for game in active)
+            if (
+                active_slots != self._pending_wave.active_slots
+                or accumulator is not self._pending_wave.accumulator
+            ):
+                raise RuntimeError(
+                    "Native evaluate_wave does not match the pending wave"
+                )
+        self.wait_wave()
+
+    def submit_wave(
+        self,
+        active: list[ActiveSelfPlayGame],
+        accumulator: BatchedSearchAccumulator,
+    ) -> None:
+        if self._pending_wave is not None:
+            raise RuntimeError("Native search coordinator already has a pending wave")
+        active_slots = tuple(self._slot(game) for game in active)
+        before = tuple(
+            (slot, self._completed_simulations[slot]) for slot in active_slots
         )
-        selected_leaves = 0
-        after: dict[int, int] = {}
-        for game in active:
-            slot = self._slot(game)
-            current = self._backend.slot_simulations(slot)
-            selected_leaves += max(0, current - before[slot])
-            after[slot] = current
-        accumulator.record_native_wave(
-            wave,
-            timing,
-            worker_threads,
-            selected_leaves=selected_leaves,
+        submission = self._backend.submit_wave()
+        self._pending_wave = _PendingNativeWave(
+            active_slots,
+            before,
+            accumulator,
+            submission,
         )
-        self._completed_simulations.update(after)
+
+    def wait_wave(self) -> None:
+        pending = self._pending_wave
+        if pending is None:
+            raise RuntimeError("Native search coordinator has no pending wave")
+
+        backend_succeeded = False
+        try:
+            wave = self._backend.wait_wave(pending.submission)
+            backend_succeeded = True
+            timing = self._backend.native_timing_telemetry()
+            worker_threads = _integral_count(
+                self._backend.thread_count,
+                "Native worker threads",
+            )
+            before = dict(pending.before_completed_simulations)
+            selected_leaves = 0
+            after: dict[int, int] = {}
+            for slot in pending.active_slots:
+                current = self._backend.slot_simulations(slot)
+                selected_leaves += max(0, current - before[slot])
+                after[slot] = current
+            pending.accumulator.record_native_wave(
+                wave,
+                timing,
+                worker_threads,
+                selected_leaves=selected_leaves,
+            )
+            self._completed_simulations.update(after)
+        finally:
+            if backend_succeeded:
+                self._pending_wave = None
 
     @staticmethod
     def _slot(active: ActiveSelfPlayGame) -> int:

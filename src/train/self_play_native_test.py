@@ -17,6 +17,7 @@ from src.mcts.mcts_v2 import MCTSArgs, SearchTelemetry
 from src.mcts.native_backend import (
     NativeBackendUnavailableError,
     NativeWave,
+    NativeWaveSubmission,
 )
 from src.train.self_play_args import SelfPlayTrainerArgs
 from src.train.self_play_generation import SelfPlayGenerator
@@ -64,6 +65,7 @@ class _FakeNativeBackend:
         worker_threads: int,
         *,
         fail_first_wave: bool = False,
+        fail_first_wait: bool = False,
         failed_wave_terminal_leaves: int = 0,
         mismatch_terminal: bool = False,
     ) -> None:
@@ -72,6 +74,7 @@ class _FakeNativeBackend:
         self.capacity = max_active_games
         self.thread_count = worker_threads
         self.fail_first_wave = fail_first_wave
+        self.fail_first_wait = fail_first_wait
         self.failed_wave_terminal_leaves = failed_wave_terminal_leaves
         self.mismatch_terminal = mismatch_terminal
         self.slots: dict[int, _FakeSlot] = {}
@@ -140,7 +143,7 @@ class _FakeNativeBackend:
             mean_inference_batch_size=1.0 if state.simulations else 0.0,
         )
 
-    def evaluate_wave(self) -> NativeWave:
+    def submit_wave(self) -> NativeWaveSubmission:
         if self._pending is None:
             self._token += 1
             self._pending = tuple(
@@ -153,9 +156,22 @@ class _FakeNativeBackend:
                 for slot in self._pending:
                     self.slots[slot].simulations += self.failed_wave_terminal_leaves
                 raise RuntimeError("transient fake native wave failure")
-
         pending = self._pending
         assert pending is not None
+        return NativeWaveSubmission(self._token, len(pending), len(pending))
+
+    def wait_wave(self, submission: NativeWaveSubmission) -> NativeWave:
+        pending = self._pending
+        assert pending is not None
+        if (
+            submission.token != self._token
+            or submission.size != len(pending)
+            or submission.raw_size != len(pending)
+        ):
+            raise RuntimeError("invalid fake native wave submission")
+        if self.fail_first_wait:
+            self.fail_first_wait = False
+            raise RuntimeError("transient fake native wait failure")
         self._pending = None
         for slot in pending:
             self.slots[slot].simulations += 1
@@ -169,6 +185,9 @@ class _FakeNativeBackend:
             device_to_host_seconds=0.25,
             inference_wait_seconds=0.125,
         )
+
+    def evaluate_wave(self) -> NativeWave:
+        return self.wait_wave(self.submit_wave())
 
     def native_timing_telemetry(self) -> dict[str, object]:
         def stage(workers: int, busy: float) -> dict[str, object]:
@@ -223,6 +242,7 @@ def _fake_factory(
     created: list[_FakeNativeBackend],
     *,
     fail_first_wave: bool = False,
+    fail_first_wait: bool = False,
     failed_wave_terminal_leaves: int = 0,
     mismatch_terminal: bool = False,
 ) -> Callable[..., Any]:
@@ -238,6 +258,7 @@ def _fake_factory(
             int(cast(int, kwargs["max_active_games"])),
             int(cast(int, kwargs["worker_threads"])),
             fail_first_wave=fail_first_wave,
+            fail_first_wait=fail_first_wait,
             failed_wave_terminal_leaves=failed_wave_terminal_leaves,
             mismatch_terminal=mismatch_terminal,
         )
@@ -372,6 +393,132 @@ class SelfPlayNativeTests(unittest.TestCase):
         self.assertGreater(metrics["inference_wait_seconds"], 0.0)
         self.assertGreater(metrics["native_worker_busy_seconds"], 0.0)
         self.assertGreater(metrics["native_worker_capacity_seconds"], 0.0)
+
+    def test_native_submit_defers_telemetry_until_wait(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created),
+        )
+        coordinator = cast(Any, generator._coordinator(1))
+        active = generator._new_active_game()
+        coordinator.start(active)
+        accumulator = BatchedSearchAccumulator(1)
+
+        coordinator.submit_wave([active], accumulator)
+
+        self.assertIsNotNone(coordinator._pending_wave)
+        self.assertEqual(0, accumulator.simulation_waves)
+        self.assertEqual(0, accumulator.evaluator_calls)
+        self.assertEqual(0, created[0].slot_simulations(0))
+
+        coordinator.wait_wave()
+
+        self.assertIsNone(coordinator._pending_wave)
+        self.assertEqual(1, accumulator.simulation_waves)
+        self.assertEqual(1, accumulator.evaluator_calls)
+
+    def test_native_coordinator_rejects_duplicate_submit_without_replacing_owner(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created),
+        )
+        coordinator = cast(Any, generator._coordinator(1))
+        active = generator._new_active_game()
+        coordinator.start(active)
+        accumulator = BatchedSearchAccumulator(1)
+        coordinator.submit_wave([active], accumulator)
+        pending = coordinator._pending_wave
+
+        with self.assertRaisesRegex(RuntimeError, "pending wave"):
+            coordinator.submit_wave([active], BatchedSearchAccumulator(1))
+
+        self.assertIs(pending, coordinator._pending_wave)
+        coordinator.wait_wave()
+
+    def test_native_pending_wave_owns_immutable_slots_counts_accumulator_and_handle(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created),
+        )
+        coordinator = cast(Any, generator._coordinator(1))
+        active = generator._new_active_game()
+        coordinator.start(active)
+        active_games = [active]
+        accumulator = BatchedSearchAccumulator(1)
+
+        coordinator.submit_wave(active_games, accumulator)
+        pending = coordinator._pending_wave
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual((0,), pending.active_slots)
+        self.assertEqual(((0, 0),), pending.before_completed_simulations)
+        self.assertIs(accumulator, pending.accumulator)
+        self.assertEqual(
+            (1, 1, 1),
+            (
+                pending.submission.token,
+                pending.submission.size,
+                pending.submission.raw_size,
+            ),
+        )
+
+        active_games.clear()
+        active.native_slot = None
+        coordinator.wait_wave()
+        self.assertEqual(1, accumulator.simulation_waves)
+
+    def test_native_coordinator_clears_owner_and_reuses_after_success(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created),
+        )
+        coordinator = cast(Any, generator._coordinator(1))
+        active = generator._new_active_game()
+        coordinator.start(active)
+        first_accumulator = BatchedSearchAccumulator(1)
+        coordinator.submit_wave([active], first_accumulator)
+        coordinator.wait_wave()
+        self.assertIsNone(coordinator._pending_wave)
+
+        coordinator.remove(active)
+        replacement = generator._new_active_game()
+        coordinator.start(replacement)
+        second_accumulator = BatchedSearchAccumulator(1)
+        coordinator.submit_wave([replacement], second_accumulator)
+        coordinator.wait_wave()
+
+        self.assertIsNone(coordinator._pending_wave)
+        self.assertEqual(1, first_accumulator.simulation_waves)
+        self.assertEqual(1, second_accumulator.simulation_waves)
+        self.assertEqual(2, len(created[0].added_slots))
+
+    def test_native_coordinator_wait_failure_keeps_owner_for_retry(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created, fail_first_wait=True),
+        )
+        coordinator = cast(Any, generator._coordinator(1))
+        active = generator._new_active_game()
+        coordinator.start(active)
+        accumulator = BatchedSearchAccumulator(1)
+        coordinator.submit_wave([active], accumulator)
+        pending = coordinator._pending_wave
+
+        with self.assertRaisesRegex(RuntimeError, "wait failure"):
+            coordinator.wait_wave()
+        self.assertIs(pending, coordinator._pending_wave)
+        self.assertEqual(0, accumulator.simulation_waves)
+        self.assertEqual(0, created[0].slot_simulations(0))
+
+        coordinator.evaluate_wave([active], accumulator)
+        self.assertIsNone(coordinator._pending_wave)
+        self.assertEqual(1, accumulator.simulation_waves)
+        self.assertEqual(1, created[0].slot_simulations(0))
 
     def test_native_terminal_mismatch_releases_slot_before_failing(self) -> None:
         created: list[_FakeNativeBackend] = []
