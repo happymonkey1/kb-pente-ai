@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import operator
 from typing import Callable, Protocol, SupportsIndex, cast
 
 import numpy as np
+import torch
 
 from src.game.game import TerminalResult
 from src.game.pente.pente_board import PenteBoard
@@ -64,6 +65,7 @@ class _PendingNativeWave:
     accumulator: BatchedSearchAccumulator
     submission: NativeWaveSubmission
     in_flight: int = 1
+    needs_resubmit: bool = False
 
 
 _NativeBackendFactory = Callable[..., NativeSearchBackend]
@@ -117,6 +119,11 @@ def _fill_active_games(
         coordinator.start(active_game)
         active.append(active_game)
         launched_games.value += 1
+
+
+def _split_cohort_budget(total: int) -> tuple[int, int]:
+    quotient, remainder = divmod(total, 2)
+    return quotient + remainder, quotient
 
 
 class _PythonSearchCoordinator:
@@ -334,6 +341,14 @@ class _NativeSearchCoordinator:
 
         backend_succeeded = False
         try:
+            if pending.needs_resubmit:
+                submission = self._backend.submit_wave()
+                pending = replace(
+                    pending,
+                    submission=submission,
+                    needs_resubmit=False,
+                )
+                self._pending_wave = pending
             wave = self._backend.wait_wave(pending.submission)
             backend_succeeded = True
             timing = self._backend.native_timing_telemetry()
@@ -356,6 +371,10 @@ class _NativeSearchCoordinator:
                 pipeline_in_flight=pending.in_flight,
             )
             self._completed_simulations.update(after)
+        except Exception:
+            if not backend_succeeded:
+                self._pending_wave = replace(pending, needs_resubmit=True)
+            raise
         finally:
             if backend_succeeded:
                 self._pending_wave = None
@@ -365,6 +384,14 @@ class _NativeSearchCoordinator:
         if active.native_slot is None:
             raise RuntimeError("Native active game has no slot")
         return active.native_slot
+
+
+@dataclass(slots=True)
+class _NativeSearchCohort:
+    coordinator: _NativeSearchCoordinator
+    capacity: int
+    active: list[ActiveSelfPlayGame]
+    accumulators: dict[int, BatchedSearchAccumulator]
 
 
 class SelfPlayGenerator:
@@ -378,6 +405,7 @@ class SelfPlayGenerator:
         deduplicate_evaluations: bool = True,
         search_backend: SearchBackend = "python",
         native_worker_threads: int = 1,
+        native_search_cohorts: int = 1,
         *,
         _native_backend_factory: _NativeBackendFactory | None = None,
     ) -> None:
@@ -388,6 +416,21 @@ class SelfPlayGenerator:
             "Native worker threads",
             minimum=1,
         )
+        native_search_cohorts = _integral_count(
+            native_search_cohorts,
+            "Native search cohorts",
+            minimum=1,
+        )
+        if native_search_cohorts not in (1, 2):
+            raise ValueError("Native search cohorts must be 1 or 2")
+        if native_search_cohorts == 2 and search_backend != "cpp":
+            raise ValueError(
+                "Native search cohorts=2 requires search_backend='cpp'"
+            )
+        if native_search_cohorts == 2 and native_worker_threads < 2:
+            raise ValueError(
+                "Native search cohorts=2 requires at least two worker threads"
+            )
         self.game = game
         self.evaluator = evaluator
         self.mcts_args = mcts_args
@@ -396,6 +439,7 @@ class SelfPlayGenerator:
         self.deduplicate_evaluations = deduplicate_evaluations
         self.search_backend = search_backend
         self.native_worker_threads = native_worker_threads
+        self.native_search_cohorts = native_search_cohorts
         self._native_backend_factory = _native_backend_factory
 
     def play_game(self) -> PlayedGame:
@@ -412,6 +456,8 @@ class SelfPlayGenerator:
         active_limit = game_count if max_active_games is None else max_active_games
         if active_limit < 1:
             raise ValueError("At least one active self-play game is required")
+        if self.native_search_cohorts == 2:
+            return self._play_games_two_cohorts(game_count, active_limit)
 
         coordinator = self._coordinator(active_limit)
         launched_games = _LaunchCounter()
@@ -455,6 +501,176 @@ class SelfPlayGenerator:
             accumulator.telemetry()
             for accumulator in batch_accumulators.values()
         ]
+
+    def _play_games_two_cohorts(
+        self,
+        game_count: int,
+        active_limit: int,
+    ) -> tuple[list[PlayedGame], list[BatchedSearchTelemetry]]:
+        total_target = min(game_count, active_limit)
+        if total_target < 2:
+            raise ValueError(
+                "Native search cohorts=2 requires at least two active games"
+            )
+        if self._native_backend_factory is None:
+            device = getattr(self.evaluator, "device", None)
+            if device is None or torch.device(device).type != "cuda":
+                raise ValueError(
+                    "Native search cohorts=2 requires a CUDA evaluator"
+                )
+
+        capacities = _split_cohort_budget(total_target)
+        worker_counts = _split_cohort_budget(self.native_worker_threads)
+        cohorts = [
+            _NativeSearchCohort(
+                coordinator=_NativeSearchCoordinator(
+                    self,
+                    capacities[index],
+                    worker_counts[index],
+                    self._native_backend_factory,
+                ),
+                capacity=capacities[index],
+                active=[],
+                accumulators={},
+            )
+            for index in range(2)
+        ]
+        try:
+            launched_games = _LaunchCounter()
+            for cohort in cohorts:
+                _fill_active_games(
+                    self,
+                    cohort.coordinator,
+                    cohort.active,
+                    cohort.capacity,
+                    game_count,
+                    launched_games,
+                )
+
+            shared_stream = self._two_cohort_stream()
+            for cohort in cohorts:
+                self._submit_cohort_wave(
+                    cohort,
+                    cohorts,
+                    total_target,
+                    self.native_worker_threads,
+                    shared_stream,
+                )
+
+            completed: list[_CompletedSelfPlayGame] = []
+            cohort_index = 0
+            while any(cohort.coordinator.has_pending_wave for cohort in cohorts):
+                cohort = cohorts[cohort_index]
+                if not cohort.coordinator.has_pending_wave:
+                    cohort_index = 1 - cohort_index
+                    continue
+
+                cohort.coordinator.wait_wave()
+                remaining, completed_roots = self._advance_completed_roots(
+                    cohort.coordinator,
+                    cohort.active,
+                )
+                cohort.active = remaining
+                completed.extend(completed_roots)
+                _fill_active_games(
+                    self,
+                    cohort.coordinator,
+                    cohort.active,
+                    cohort.capacity,
+                    game_count,
+                    launched_games,
+                )
+                if cohort.active:
+                    self._submit_cohort_wave(
+                        cohort,
+                        cohorts,
+                        total_target,
+                        self.native_worker_threads,
+                        shared_stream,
+                    )
+                cohort_index = 1 - cohort_index
+
+            return (
+                [
+                    completed_root.played_game
+                    for completed_root in sorted(
+                        completed,
+                        key=lambda completed_root: completed_root.launch_index,
+                    )
+                ],
+                [
+                    accumulator.telemetry()
+                    for cohort in cohorts
+                    for accumulator in cohort.accumulators.values()
+                ],
+            )
+        except BaseException as error:
+            self._drain_pending_cohorts(cohorts, error)
+            raise
+
+    def _two_cohort_stream(self) -> torch.cuda.Stream | None:
+        if self._native_backend_factory is not None:
+            return None
+        device = torch.device(cast(TensorEvaluator, self.evaluator).device)
+        return torch.cuda.Stream(device=device)
+
+    def _submit_cohort_wave(
+        self,
+        cohort: _NativeSearchCohort,
+        cohorts: list[_NativeSearchCohort],
+        total_target: int,
+        total_worker_threads: int,
+        shared_stream: torch.cuda.Stream | None,
+    ) -> None:
+        root_count = len(cohort.active)
+        accumulator = cohort.accumulators.get(root_count)
+        if accumulator is None:
+            accumulator = BatchedSearchAccumulator(
+                root_count,
+                native_search_cohorts=2,
+                native_total_active_game_target=total_target,
+                native_total_worker_threads=total_worker_threads,
+            )
+            cohort.accumulators[root_count] = accumulator
+        in_flight = sum(
+            other.coordinator.has_pending_wave for other in cohorts
+        ) + 1
+        if shared_stream is None:
+            cohort.coordinator.submit_wave(
+                cohort.active,
+                accumulator,
+                in_flight=in_flight,
+            )
+        else:
+            with torch.cuda.stream(shared_stream):
+                cohort.coordinator.submit_wave(
+                    cohort.active,
+                    accumulator,
+                    in_flight=in_flight,
+                )
+
+    @staticmethod
+    def _drain_pending_cohorts(
+        cohorts: list[_NativeSearchCohort],
+        primary_error: BaseException,
+    ) -> None:
+        failures: list[str] = []
+        for index, cohort in enumerate(cohorts):
+            if not cohort.coordinator.has_pending_wave:
+                continue
+            try:
+                cohort.coordinator.wait_wave()
+            except BaseException as error:
+                failures.append(
+                    f"cohort {index}: {type(error).__name__}: {error}"
+                )
+        if failures:
+            add_note = getattr(primary_error, "add_note", None)
+            if not callable(add_note):
+                return
+            cast(Callable[[str], None], add_note)(
+                "Native cohort drain failures: " + "; ".join(failures)
+            )
 
     def _advance_completed_roots(
         self,

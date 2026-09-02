@@ -68,6 +68,8 @@ class _FakeNativeBackend:
         fail_first_wait: bool = False,
         failed_wave_terminal_leaves: int = 0,
         mismatch_terminal: bool = False,
+        call_log: list[tuple[str, int]] | None = None,
+        backend_label: int = 0,
     ) -> None:
         self.game = game
         self.args = args
@@ -77,6 +79,8 @@ class _FakeNativeBackend:
         self.fail_first_wait = fail_first_wait
         self.failed_wave_terminal_leaves = failed_wave_terminal_leaves
         self.mismatch_terminal = mismatch_terminal
+        self.call_log = call_log
+        self.backend_label = backend_label
         self.slots: dict[int, _FakeSlot] = {}
         self.added_slots: list[int] = []
         self.removed_slots: list[int] = []
@@ -144,6 +148,8 @@ class _FakeNativeBackend:
         )
 
     def submit_wave(self) -> NativeWaveSubmission:
+        if self.call_log is not None:
+            self.call_log.append(("submit", self.backend_label))
         if self._pending is None:
             self._token += 1
             self._pending = tuple(
@@ -161,6 +167,8 @@ class _FakeNativeBackend:
         return NativeWaveSubmission(self._token, len(pending), len(pending))
 
     def wait_wave(self, submission: NativeWaveSubmission) -> NativeWave:
+        if self.call_log is not None:
+            self.call_log.append(("wait", self.backend_label))
         pending = self._pending
         assert pending is not None
         if (
@@ -243,8 +251,10 @@ def _fake_factory(
     *,
     fail_first_wave: bool = False,
     fail_first_wait: bool = False,
+    fail_first_wait_label: int | None = None,
     failed_wave_terminal_leaves: int = 0,
     mismatch_terminal: bool = False,
+    call_log: list[tuple[str, int]] | None = None,
 ) -> Callable[..., Any]:
     def factory(
         game: PenteGame,
@@ -252,15 +262,24 @@ def _fake_factory(
         args: MCTSArgs,
         **kwargs: object,
     ) -> _FakeNativeBackend:
+        backend_label = len(created)
         backend = _FakeNativeBackend(
             game,
             args,
             int(cast(int, kwargs["max_active_games"])),
             int(cast(int, kwargs["worker_threads"])),
             fail_first_wave=fail_first_wave,
-            fail_first_wait=fail_first_wait,
+            fail_first_wait=(
+                fail_first_wait
+                and (
+                    fail_first_wait_label is None
+                    or fail_first_wait_label == backend_label
+                )
+            ),
             failed_wave_terminal_leaves=failed_wave_terminal_leaves,
             mismatch_terminal=mismatch_terminal,
+            call_log=call_log,
+            backend_label=backend_label,
         )
         created.append(backend)
         return backend
@@ -281,9 +300,11 @@ class SelfPlayNativeTests(unittest.TestCase):
         backend: str | None = None,
         factory: Callable[..., Any] | None = None,
         native_worker_threads: int = 1,
+        native_search_cohorts: int = 1,
     ) -> SelfPlayGenerator:
         options: dict[str, Any] = {
             "native_worker_threads": native_worker_threads,
+            "native_search_cohorts": native_search_cohorts,
             "_native_backend_factory": factory,
         }
         if backend is not None:
@@ -393,6 +414,139 @@ class SelfPlayNativeTests(unittest.TestCase):
         self.assertGreater(metrics["inference_wait_seconds"], 0.0)
         self.assertGreater(metrics["native_worker_busy_seconds"], 0.0)
         self.assertGreater(metrics["native_worker_capacity_seconds"], 0.0)
+
+    def test_two_native_cohorts_split_capacity_workers_and_pipeline(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        call_log: list[tuple[str, int]] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created, call_log=call_log),
+            native_worker_threads=5,
+            native_search_cohorts=2,
+        )
+
+        games, batches = generator.play_games(5, 5)
+
+        self.assertEqual([(3, 3), (2, 2)], [
+            (backend.capacity, backend.thread_count) for backend in created
+        ])
+        self.assertEqual(
+            [
+                ("submit", 0),
+                ("submit", 1),
+                ("wait", 0),
+                ("submit", 0),
+                ("wait", 1),
+            ],
+            call_log[:5],
+        )
+        self.assertEqual(2, len(created))
+        self.assertTrue(all(backend.active_count == 0 for backend in created))
+        self.assertEqual(5, sum(len(backend.removed_slots) for backend in created))
+        self.assertEqual(5, len(games))
+
+        metrics = collect_self_play_metrics(games, batches, elapsed_seconds=1.0)
+        self.assertEqual(5, metrics["active_game_target"])
+        self.assertEqual(3, metrics["inference_batch_target"])
+        self.assertEqual(5, metrics["native_worker_threads"])
+        self.assertEqual(3, metrics["native_worker_threads_per_cohort"])
+        self.assertEqual(2, metrics["native_search_cohorts"])
+        self.assertEqual(2, metrics["native_pipeline_max_in_flight"])
+
+    def test_two_native_cohort_seeded_runs_have_stable_signatures(self) -> None:
+        created_one: list[_FakeNativeBackend] = []
+        created_two: list[_FakeNativeBackend] = []
+        generator_one = self.make_generator(
+            seed=73,
+            backend="cpp",
+            factory=_fake_factory(created_one),
+            native_worker_threads=4,
+            native_search_cohorts=2,
+        )
+        generator_two = self.make_generator(
+            seed=73,
+            backend="cpp",
+            factory=_fake_factory(created_two),
+            native_worker_threads=4,
+            native_search_cohorts=2,
+        )
+
+        games_one, _ = generator_one.play_games(4, 3)
+        games_two, _ = generator_two.play_games(4, 3)
+
+        self.assertEqual(
+            [self.game_signature(game) for game in games_one],
+            [self.game_signature(game) for game in games_two],
+        )
+
+    def test_two_native_cohort_failure_drains_all_pending_waves(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        call_log: list[tuple[str, int]] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(
+                created,
+                fail_first_wait=True,
+                fail_first_wait_label=0,
+                call_log=call_log,
+            ),
+            native_worker_threads=4,
+            native_search_cohorts=2,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "transient fake native wait failure",
+        ):
+            generator.play_games(4, 4)
+
+        self.assertEqual(
+            [
+                ("submit", 0),
+                ("submit", 1),
+                ("wait", 0),
+                ("submit", 0),
+                ("wait", 0),
+                ("wait", 1),
+            ],
+            call_log,
+        )
+        self.assertEqual(2, len(created))
+        self.assertTrue(all(backend._pending is None for backend in created))
+
+    def test_two_native_cohort_configuration_and_runtime_validation(self) -> None:
+        with self.assertRaises(TypeError):
+            self.make_generator(backend="cpp", native_search_cohorts=True)
+        with self.assertRaises(ValueError):
+            self.make_generator(backend="cpp", native_search_cohorts=0)
+        with self.assertRaises(ValueError):
+            self.make_generator(backend="cpp", native_search_cohorts=3)
+        with self.assertRaises(ValueError):
+            self.make_generator(native_search_cohorts=2)
+        with self.assertRaises(ValueError):
+            self.make_generator(
+                backend="cpp",
+                native_search_cohorts=2,
+                native_worker_threads=1,
+            )
+
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created),
+            native_search_cohorts=2,
+            native_worker_threads=2,
+        )
+        with self.assertRaises(ValueError):
+            generator.play_games(1, 1)
+
+        real_generator = self.make_generator(
+            backend="cpp",
+            native_search_cohorts=2,
+            native_worker_threads=2,
+        )
+        with self.assertRaisesRegex(ValueError, "CUDA evaluator"):
+            real_generator.play_games(2, 2)
 
     def test_pipeline_telemetry_defaults_preserve_one_cohort_metrics(self) -> None:
         accumulator = BatchedSearchAccumulator(8)
@@ -639,9 +793,14 @@ class SelfPlayNativeTests(unittest.TestCase):
 
     def test_native_coordinator_wait_failure_keeps_owner_for_retry(self) -> None:
         created: list[_FakeNativeBackend] = []
+        call_log: list[tuple[str, int]] = []
         generator = self.make_generator(
             backend="cpp",
-            factory=_fake_factory(created, fail_first_wait=True),
+            factory=_fake_factory(
+                created,
+                fail_first_wait=True,
+                call_log=call_log,
+            ),
         )
         coordinator = cast(Any, generator._coordinator(1))
         active = generator._new_active_game()
@@ -652,12 +811,26 @@ class SelfPlayNativeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "wait failure"):
             coordinator.wait_wave()
-        self.assertIs(pending, coordinator._pending_wave)
+        retry_pending = coordinator._pending_wave
+        self.assertIsNot(pending, retry_pending)
+        self.assertEqual(pending.active_slots, retry_pending.active_slots)
+        self.assertEqual(
+            pending.before_completed_simulations,
+            retry_pending.before_completed_simulations,
+        )
+        self.assertIs(pending.accumulator, retry_pending.accumulator)
+        self.assertEqual(pending.in_flight, retry_pending.in_flight)
+        self.assertEqual(pending.submission, retry_pending.submission)
+        self.assertTrue(retry_pending.needs_resubmit)
         self.assertEqual(0, accumulator.simulation_waves)
         self.assertEqual(0, created[0].slot_simulations(0))
 
         coordinator.evaluate_wave([active], accumulator)
         self.assertIsNone(coordinator._pending_wave)
+        self.assertEqual(
+            [("submit", 0), ("wait", 0), ("submit", 0), ("wait", 0)],
+            call_log,
+        )
         self.assertEqual(1, accumulator.simulation_waves)
         self.assertEqual(1, created[0].slot_simulations(0))
 
