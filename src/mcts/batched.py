@@ -38,6 +38,38 @@ class BatchedSearchTelemetry:
     native_worker_busy_seconds: float = 0.0
     native_worker_capacity_seconds: float = 0.0
     native_worker_busy_percent: float = 0.0
+    native_search_cohorts: int = 1
+    native_total_active_game_target: int = 0
+    native_total_worker_threads: int = 0
+    native_pipeline_submissions: int = 0
+    native_pipeline_waits: int = 0
+    native_pipeline_max_in_flight: int = 0
+
+    def __post_init__(self) -> None:
+        values = _validated_native_pipeline_values(
+            self.native_search_cohorts,
+            self.native_total_active_game_target,
+            self.native_total_worker_threads,
+            self.native_pipeline_submissions,
+            self.native_pipeline_waits,
+            self.native_pipeline_max_in_flight,
+        )
+        for name, value in zip(
+            (
+                "native_search_cohorts",
+                "native_total_active_game_target",
+                "native_total_worker_threads",
+                "native_pipeline_submissions",
+                "native_pipeline_waits",
+                "native_pipeline_max_in_flight",
+            ),
+            values,
+        ):
+            object.__setattr__(
+                self,
+                name,
+                value,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,10 +165,31 @@ class BatchedSearchAccumulator:
     native_worker_threads: int = 0
     native_worker_busy_seconds: float = 0.0
     native_worker_capacity_seconds: float = 0.0
+    native_search_cohorts: int = 1
+    native_total_active_game_target: int = 0
+    native_total_worker_threads: int = 0
+    native_pipeline_submissions: int = 0
+    native_pipeline_waits: int = 0
+    native_pipeline_max_in_flight: int = 0
 
     def __post_init__(self) -> None:
         if self.root_count < 1:
             raise ValueError("At least one root is required")
+        (
+            self.native_search_cohorts,
+            self.native_total_active_game_target,
+            self.native_total_worker_threads,
+            self.native_pipeline_submissions,
+            self.native_pipeline_waits,
+            self.native_pipeline_max_in_flight,
+        ) = _validated_native_pipeline_values(
+            self.native_search_cohorts,
+            self.native_total_active_game_target,
+            self.native_total_worker_threads,
+            self.native_pipeline_submissions,
+            self.native_pipeline_waits,
+            self.native_pipeline_max_in_flight,
+        )
 
     def telemetry(self) -> BatchedSearchTelemetry:
         batch_sizes = self.inference_batch_sizes
@@ -182,6 +235,32 @@ class BatchedSearchAccumulator:
                 if self.native_worker_capacity_seconds > 0.0
                 else 0.0
             ),
+            native_search_cohorts=self.native_search_cohorts,
+            native_total_active_game_target=self.native_total_active_game_target,
+            native_total_worker_threads=self.native_total_worker_threads,
+            native_pipeline_submissions=self.native_pipeline_submissions,
+            native_pipeline_waits=self.native_pipeline_waits,
+            native_pipeline_max_in_flight=self.native_pipeline_max_in_flight,
+        )
+
+    def record_pipeline_wave(self, in_flight: int = 1) -> None:
+        """Record one successfully completed native pipeline wave.
+
+        A caller invokes this after the corresponding backend wait succeeds.
+        The submission and wait counters therefore advance together, while
+        ``in_flight`` captures the pipeline depth observed for that wave.
+        """
+
+        parsed_in_flight = _nonnegative_int(in_flight)
+        if parsed_in_flight > self.native_search_cohorts:
+            raise ValueError(
+                "Native pipeline in-flight count cannot exceed search cohorts"
+            )
+        self.native_pipeline_submissions += 1
+        self.native_pipeline_waits += 1
+        self.native_pipeline_max_in_flight = max(
+            self.native_pipeline_max_in_flight,
+            parsed_in_flight,
         )
 
     def record_native_wave(
@@ -190,6 +269,7 @@ class BatchedSearchAccumulator:
         timing: Mapping[str, Any] | None,
         worker_threads: int,
         selected_leaves: int,
+        pipeline_in_flight: int = 1,
     ) -> None:
         """Record one native selection/inference/backup generation.
 
@@ -205,8 +285,13 @@ class BatchedSearchAccumulator:
         unique_size = _nonnegative_int(wave.size)
         selected_count = _nonnegative_int(selected_leaves)
         parsed_worker_threads = _nonnegative_int(worker_threads)
+        parsed_pipeline_in_flight = _nonnegative_int(pipeline_in_flight)
         if unique_size > raw_size:
             raise ValueError("Native unique requests cannot exceed raw requests")
+        if parsed_pipeline_in_flight > self.native_search_cohorts:
+            raise ValueError(
+                "Native pipeline in-flight count cannot exceed search cohorts"
+            )
 
         self.simulation_waves += 1
         self.selected_leaves += selected_count
@@ -257,6 +342,8 @@ class BatchedSearchAccumulator:
             self.native_worker_busy_seconds += busy_seconds
             self.native_worker_capacity_seconds += wall_seconds * workers
 
+        self.record_pipeline_wave(parsed_pipeline_in_flight)
+
 
 def _nonnegative_int(value: object) -> int:
     if isinstance(value, bool):
@@ -268,6 +355,41 @@ def _nonnegative_int(value: object) -> int:
     if result < 0:
         raise ValueError("Native telemetry counts cannot be negative")
     return result
+
+
+def _positive_int(value: object, name: str) -> int:
+    result = _nonnegative_int(value)
+    if result < 1:
+        raise ValueError(f"{name} must be positive")
+    return result
+
+
+def _validated_native_pipeline_values(
+    native_search_cohorts: object,
+    native_total_active_game_target: object,
+    native_total_worker_threads: object,
+    native_pipeline_submissions: object,
+    native_pipeline_waits: object,
+    native_pipeline_max_in_flight: object,
+) -> tuple[int, int, int, int, int, int]:
+    cohorts = _positive_int(native_search_cohorts, "Native search cohorts")
+    total_active_game_target = _nonnegative_int(native_total_active_game_target)
+    total_worker_threads = _nonnegative_int(native_total_worker_threads)
+    pipeline_submissions = _nonnegative_int(native_pipeline_submissions)
+    pipeline_waits = _nonnegative_int(native_pipeline_waits)
+    pipeline_max_in_flight = _nonnegative_int(native_pipeline_max_in_flight)
+    if pipeline_max_in_flight > cohorts:
+        raise ValueError(
+            "Native pipeline max in-flight cannot exceed search cohorts"
+        )
+    return (
+        cohorts,
+        total_active_game_target,
+        total_worker_threads,
+        pipeline_submissions,
+        pipeline_waits,
+        pipeline_max_in_flight,
+    )
 
 
 def _finite_seconds(value: object) -> float:

@@ -20,7 +20,7 @@ from src.mcts.native_backend import (
     NativeWaveSubmission,
 )
 from src.train.self_play_args import SelfPlayTrainerArgs
-from src.train.self_play_generation import SelfPlayGenerator
+from src.train.self_play_generation import PlayedGame, SelfPlayGenerator
 from src.train.self_play_metrics import collect_self_play_metrics
 
 
@@ -394,6 +394,109 @@ class SelfPlayNativeTests(unittest.TestCase):
         self.assertGreater(metrics["native_worker_busy_seconds"], 0.0)
         self.assertGreater(metrics["native_worker_capacity_seconds"], 0.0)
 
+    def test_pipeline_telemetry_defaults_preserve_one_cohort_metrics(self) -> None:
+        accumulator = BatchedSearchAccumulator(8)
+        accumulator.inference_batch_sizes.append(8)
+        metrics = collect_self_play_metrics(
+            [self._minimal_played_game()],
+            [accumulator.telemetry()],
+            elapsed_seconds=1.0,
+        )
+
+        self.assertEqual(1, metrics["native_search_cohorts"])
+        self.assertEqual(8, metrics["active_game_target"])
+        self.assertEqual(8, metrics["inference_batch_target"])
+        self.assertEqual(0, metrics["native_worker_threads"])
+        self.assertEqual(0, metrics["native_worker_threads_per_cohort"])
+        self.assertEqual(0, metrics["native_pipeline_submissions"])
+        self.assertEqual(0, metrics["native_pipeline_waits"])
+        self.assertEqual(0, metrics["native_pipeline_max_in_flight"])
+        self.assertEqual(1.0, metrics["steady_state_mean_batch_occupancy"])
+
+    def test_pipeline_telemetry_reports_total_and_per_cohort_targets(self) -> None:
+        batches = []
+        for _ in range(2):
+            accumulator = BatchedSearchAccumulator(
+                256,
+                native_worker_threads=4,
+                native_search_cohorts=2,
+                native_total_active_game_target=512,
+                native_total_worker_threads=8,
+            )
+            accumulator.inference_batch_sizes.append(256)
+            accumulator.record_pipeline_wave(in_flight=2)
+            batches.append(accumulator.telemetry())
+
+        metrics = collect_self_play_metrics(
+            [self._minimal_played_game()],
+            batches,
+            elapsed_seconds=1.0,
+        )
+
+        self.assertEqual(2, metrics["native_search_cohorts"])
+        self.assertEqual(512, metrics["active_game_target"])
+        self.assertEqual(256, metrics["inference_batch_target"])
+        self.assertEqual(8, metrics["native_worker_threads"])
+        self.assertEqual(4, metrics["native_worker_threads_per_cohort"])
+        self.assertEqual(2, metrics["native_pipeline_submissions"])
+        self.assertEqual(2, metrics["native_pipeline_waits"])
+        self.assertEqual(2, metrics["native_pipeline_max_in_flight"])
+        self.assertEqual(1.0, metrics["steady_state_mean_batch_occupancy"])
+
+    def test_pipeline_telemetry_rejects_invalid_dynamic_fields(self) -> None:
+        with self.assertRaises(TypeError):
+            BatchedSearchAccumulator(1, native_search_cohorts=True)
+        with self.assertRaises(ValueError):
+            BatchedSearchAccumulator(1, native_total_worker_threads=-1)
+        with self.assertRaises(ValueError):
+            BatchedSearchAccumulator(1, native_pipeline_max_in_flight=2)
+        accumulator = BatchedSearchAccumulator(1)
+        with self.assertRaises(TypeError):
+            accumulator.record_pipeline_wave(in_flight=True)
+        with self.assertRaises(ValueError):
+            accumulator.record_pipeline_wave(in_flight=-1)
+        before = accumulator.telemetry()
+        with self.assertRaises(ValueError):
+            accumulator.record_pipeline_wave(in_flight=2)
+        self.assertEqual(before, accumulator.telemetry())
+
+        with self.assertRaises(ValueError):
+            accumulator.record_native_wave(
+                NativeWave(0, 0, 0, 0.0, 0.0, 0.0, 0.0),
+                None,
+                worker_threads=0,
+                selected_leaves=0,
+                pipeline_in_flight=2,
+            )
+        self.assertEqual(before, accumulator.telemetry())
+
+    @staticmethod
+    def _minimal_played_game() -> PlayedGame:
+        return PlayedGame(
+            examples=[],
+            actions=(),
+            winner=None,
+            win_reason=None,
+            root_telemetry=(
+                SearchTelemetry(
+                    simulations=0,
+                    evaluator_calls=0,
+                    evaluated_positions=0,
+                    invalid_policy_fallbacks=0,
+                    zero_visit_fallbacks=0,
+                    max_depth=0,
+                    root_legal_actions=0,
+                    root_edge_visits=0,
+                    root_children_visited=0,
+                    root_visit_entropy=0.0,
+                    root_max_visit_share=0.0,
+                    root_collapse_eligible=False,
+                    root_search_collapsed=False,
+                    mean_inference_batch_size=0.0,
+                ),
+            ),
+        )
+
     def test_native_submit_defers_telemetry_until_wait(self) -> None:
         created: list[_FakeNativeBackend] = []
         generator = self.make_generator(
@@ -417,6 +520,9 @@ class SelfPlayNativeTests(unittest.TestCase):
         self.assertIsNone(coordinator._pending_wave)
         self.assertEqual(1, accumulator.simulation_waves)
         self.assertEqual(1, accumulator.evaluator_calls)
+        self.assertEqual(1, accumulator.native_pipeline_submissions)
+        self.assertEqual(1, accumulator.native_pipeline_waits)
+        self.assertEqual(1, accumulator.native_pipeline_max_in_flight)
 
     def test_native_coordinator_rejects_duplicate_submit_without_replacing_owner(self) -> None:
         created: list[_FakeNativeBackend] = []

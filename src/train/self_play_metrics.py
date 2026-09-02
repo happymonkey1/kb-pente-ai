@@ -34,11 +34,20 @@ def collect_self_play_metrics(
         for batch in batches
         for batch_size in batch.inference_batch_sizes
     ]
-    active_game_target = max((batch.root_count for batch in batches), default=0)
+    inference_batch_target = max((batch.root_count for batch in batches), default=0)
+    native_total_active_game_target = max(
+        (
+            batch.native_total_active_game_target
+            for batch in batches
+            if batch.native_total_active_game_target > 0
+        ),
+        default=0,
+    )
+    active_game_target = native_total_active_game_target or inference_batch_target
     steady_state_batch_sizes = [
         batch_size
         for batch in batches
-        if batch.root_count == active_game_target
+        if batch.root_count == inference_batch_target
         for batch_size in batch.inference_batch_sizes
     ]
     native_select_seconds = sum(
@@ -78,8 +87,31 @@ def collect_self_play_metrics(
         if native_worker_capacity_seconds > 0.0
         else 0.0
     )
-    native_worker_threads = max(
+    native_worker_threads_per_cohort = max(
         (batch.native_worker_threads for batch in batches),
+        default=0,
+    )
+    native_total_worker_threads = max(
+        (
+            batch.native_total_worker_threads
+            for batch in batches
+            if batch.native_total_worker_threads > 0
+        ),
+        default=0,
+    )
+    native_worker_threads = (
+        native_total_worker_threads or native_worker_threads_per_cohort
+    )
+    native_search_cohorts = max(
+        (batch.native_search_cohorts for batch in batches),
+        default=1,
+    )
+    native_pipeline_submissions = sum(
+        batch.native_pipeline_submissions for batch in batches
+    )
+    native_pipeline_waits = sum(batch.native_pipeline_waits for batch in batches)
+    native_pipeline_max_in_flight = max(
+        (batch.native_pipeline_max_in_flight for batch in batches),
         default=0,
     )
     collapse_eligible_roots = sum(root.root_collapse_eligible for root in roots)
@@ -136,6 +168,7 @@ def collect_self_play_metrics(
         ),
         "max_inference_batch_size": max(inference_batch_sizes, default=0),
         "active_game_target": active_game_target,
+        "inference_batch_target": inference_batch_target,
         "steady_state_inference_batches": len(steady_state_batch_sizes),
         "steady_state_mean_inference_batch_size": (
             float(np.mean(steady_state_batch_sizes))
@@ -143,8 +176,8 @@ def collect_self_play_metrics(
             else 0.0
         ),
         "steady_state_mean_batch_occupancy": (
-            float(np.mean(steady_state_batch_sizes)) / active_game_target
-            if steady_state_batch_sizes and active_game_target
+            float(np.mean(steady_state_batch_sizes)) / inference_batch_target
+            if steady_state_batch_sizes and inference_batch_target
             else 0.0
         ),
         "duplicate_leaf_rate": (
@@ -160,7 +193,12 @@ def collect_self_play_metrics(
         "host_to_device_seconds": host_to_device_seconds,
         "device_to_host_seconds": device_to_host_seconds,
         "inference_wait_seconds": inference_wait_seconds,
+        "native_search_cohorts": native_search_cohorts,
         "native_worker_threads": native_worker_threads,
+        "native_worker_threads_per_cohort": native_worker_threads_per_cohort,
+        "native_pipeline_submissions": native_pipeline_submissions,
+        "native_pipeline_waits": native_pipeline_waits,
+        "native_pipeline_max_in_flight": native_pipeline_max_in_flight,
         "native_worker_busy_percent": native_worker_busy_percent,
         "native_worker_busy_seconds": native_worker_busy_seconds,
         "native_worker_capacity_seconds": native_worker_capacity_seconds,
