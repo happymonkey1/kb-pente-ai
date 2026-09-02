@@ -902,6 +902,44 @@ class SelfPlayNativeTests(unittest.TestCase):
                 search_backend=cast(Any, "native"),
             )
 
+    def test_trainer_args_validate_two_native_cohort_requirements(self) -> None:
+        def make_args(**overrides: Any) -> SelfPlayTrainerArgs:
+            options: dict[str, Any] = {
+                "start_iteration": 0,
+                "professional_games_training_iterations": 0,
+                "self_play_training_iterations": 0,
+                "temp_threshold": 0,
+                "mcts_args": self.args,
+                "watch_training_raw_dataset_filepath": "unused",
+                "watch_training_processed_dataset_filepath": "unused",
+                "force_watch_training_raw_dataset_processing": False,
+                "batch_games": 2,
+                "active_games": 2,
+                "search_backend": "cpp",
+                "native_worker_threads": 2,
+                "native_search_cohorts": 2,
+            }
+            options.update(overrides)
+            return SelfPlayTrainerArgs(**options)
+
+        normalized = make_args(native_search_cohorts=cast(Any, np.int64(2)))
+        self.assertIs(int, type(normalized.native_search_cohorts))
+        self.assertEqual(2, normalized.native_search_cohorts)
+        with self.assertRaises(TypeError):
+            make_args(native_search_cohorts=True)
+        with self.assertRaises(ValueError):
+            make_args(native_search_cohorts=0)
+        with self.assertRaises(ValueError):
+            make_args(native_search_cohorts=3)
+        with self.assertRaises(ValueError):
+            make_args(search_backend="python")
+        with self.assertRaises(ValueError):
+            make_args(native_worker_threads=1)
+        with self.assertRaises(ValueError):
+            make_args(active_games=1)
+        with self.assertRaises(ValueError):
+            make_args(batch_games=1)
+
 
 if __name__ == "__main__":
     unittest.main()

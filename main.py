@@ -52,6 +52,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Native MCTS worker threads",
     )
+    parser.add_argument(
+        "--native-search-cohorts",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help=(
+            "Native search cohorts; two cohorts overlap CPU search with CUDA "
+            "inference while dividing active games and total native threads"
+        ),
+    )
     parser.add_argument("--temp-threshold", type=int, default=15)
     parser.add_argument("--batch-games", type=int, default=512)
     parser.add_argument("--active-games", type=int, default=128)
@@ -191,6 +201,7 @@ def main() -> int:
         expected_replay_generation=expected_replay_generation,
         search_backend=program_args.search_backend,
         native_worker_threads=program_args.native_search_threads,
+        native_search_cohorts=program_args.native_search_cohorts,
         search_health=SelfPlayHealthThresholds(
             minimum_steady_state_batch_occupancy=(
                 program_args.minimum_batch_occupancy

@@ -44,7 +44,12 @@ def _run_main(
         trainer_args = args[8]
         assert isinstance(trainer_args, SelfPlayTrainerArgs)
         events.append(
-            ("manifest", trainer_args.search_backend, trainer_args.native_worker_threads)
+            (
+                "manifest",
+                trainer_args.search_backend,
+                trainer_args.native_worker_threads,
+                trainer_args.native_search_cohorts,
+            )
         )
         return {}
 
@@ -53,7 +58,12 @@ def _run_main(
         trainer_args = args[4]
         assert isinstance(trainer_args, SelfPlayTrainerArgs)
         events.append(
-            ("trainer", trainer_args.search_backend, trainer_args.native_worker_threads)
+            (
+                "trainer",
+                trainer_args.search_backend,
+                trainer_args.native_worker_threads,
+                trainer_args.native_search_cohorts,
+            )
         )
         return SimpleNamespace(
             training_run_id="test-run",
@@ -81,13 +91,22 @@ class MainTest(unittest.TestCase):
 
         defaults = parser.parse_args([])
         native = parser.parse_args(
-            ["--search-backend", "cpp", "--native-search-threads", "4"]
+            [
+                "--search-backend",
+                "cpp",
+                "--native-search-threads",
+                "4",
+                "--native-search-cohorts",
+                "2",
+            ]
         )
 
         self.assertEqual("python", defaults.search_backend)
         self.assertEqual(1, defaults.native_search_threads)
+        self.assertEqual(1, defaults.native_search_cohorts)
         self.assertEqual("cpp", native.search_backend)
         self.assertEqual(4, native.native_search_threads)
+        self.assertEqual(2, native.native_search_cohorts)
 
     def test_cpp_training_preflights_before_manifest_and_training(self) -> None:
         events: list[tuple[object, ...]] = []
@@ -98,6 +117,8 @@ class MainTest(unittest.TestCase):
             "cpp",
             "--native-search-threads",
             "3",
+            "--native-search-cohorts",
+            "2",
             "--self-play-iterations",
             "0",
             "--no-checkpoint",
@@ -114,8 +135,8 @@ class MainTest(unittest.TestCase):
         self.assertEqual(
             [
                 ("load",),
-                ("trainer", "cpp", 3),
-                ("manifest", "cpp", 3),
+                ("trainer", "cpp", 3, 2),
+                ("manifest", "cpp", 3, 2),
                 ("train",),
             ],
             events,
@@ -144,8 +165,8 @@ class MainTest(unittest.TestCase):
         )
         self.assertEqual(
             [
-                ("trainer", "python", 1),
-                ("manifest", "python", 1),
+                ("trainer", "python", 1, 1),
+                ("manifest", "python", 1, 1),
                 ("train",),
             ],
             events,

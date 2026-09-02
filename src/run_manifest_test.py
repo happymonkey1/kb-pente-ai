@@ -96,5 +96,6 @@ class RunManifestTest(unittest.TestCase):
         self.assertEqual(manifest, loaded)
         self.assertEqual("run-id", loaded["training_run_id"])
         self.assertEqual(2, loaded["trainer"]["mcts_args"]["num_simulations"])
+        self.assertEqual(1, loaded["trainer"]["native_search_cohorts"])
         self.assertEqual("cpu", loaded["runtime"]["device"])
         self.assertIn("source_fingerprint_sha256", loaded["repository"])

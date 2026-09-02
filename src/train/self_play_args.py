@@ -46,6 +46,7 @@ class SelfPlayTrainerArgs:
     search_health: SelfPlayHealthThresholds = SelfPlayHealthThresholds()
     search_backend: SearchBackend = "python"
     native_worker_threads: int = 1
+    native_search_cohorts: int = 1
 
     def __post_init__(self) -> None:
         if self.start_iteration < 0:
@@ -112,3 +113,29 @@ class SelfPlayTrainerArgs:
         if native_worker_threads < 1:
             raise ValueError("Native worker threads must be positive")
         object.__setattr__(self, "native_worker_threads", native_worker_threads)
+        if isinstance(self.native_search_cohorts, bool):
+            raise TypeError("Native search cohorts must be an integer")
+        try:
+            native_search_cohorts = operator.index(self.native_search_cohorts)
+        except TypeError as error:
+            raise TypeError("Native search cohorts must be an integer") from error
+        if native_search_cohorts not in (1, 2):
+            raise ValueError("Native search cohorts must be 1 or 2")
+        if native_search_cohorts == 2:
+            if self.search_backend != "cpp":
+                raise ValueError(
+                    "Native search cohorts=2 requires search_backend='cpp'"
+                )
+            if native_worker_threads < 2:
+                raise ValueError(
+                    "Native search cohorts=2 requires at least two worker threads"
+                )
+            if self.active_games < 2:
+                raise ValueError(
+                    "Native search cohorts=2 requires at least two active games"
+                )
+            if self.batch_games < 2:
+                raise ValueError(
+                    "Native search cohorts=2 requires at least two batch games"
+                )
+        object.__setattr__(self, "native_search_cohorts", native_search_cohorts)

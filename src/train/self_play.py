@@ -124,6 +124,7 @@ class SelfPlayTrainer:
             deduplicate_evaluations=self.device.type != "cuda",
             search_backend=self.args.search_backend,
             native_worker_threads=self.args.native_worker_threads,
+            native_search_cohorts=self.args.native_search_cohorts,
         )
 
     def _default_resume_replay_path(self, expected_generation: int | None) -> str:

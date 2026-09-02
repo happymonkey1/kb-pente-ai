@@ -509,6 +509,36 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(1.0, metrics["steady_state_mean_batch_occupancy"])
         self.assertEqual(1.0, metrics["unique_trajectory_rate"])
 
+    def test_trainer_propagates_native_search_cohorts_to_self_play_generator(self) -> None:
+        game = PenteGame(5, ruleset=PenteRuleset.FREESTYLE)
+        net = PenteNet(
+            torch.device("cpu"),
+            board_size=5,
+            action_size=25,
+            num_res_blocks=1,
+            num_channels=8,
+            hidden_fc_size=16,
+        )
+        optimizer = torch.optim.AdamW(net.parameters(), lr=1e-3)
+        args = SelfPlayTrainerArgs(
+            start_iteration=0,
+            professional_games_training_iterations=0,
+            self_play_training_iterations=0,
+            temp_threshold=0,
+            mcts_args=MCTSArgs(num_simulations=1),
+            watch_training_raw_dataset_filepath="unused",
+            watch_training_processed_dataset_filepath="unused",
+            force_watch_training_raw_dataset_processing=False,
+            batch_games=2,
+            active_games=2,
+            search_backend="cpp",
+            native_worker_threads=2,
+            native_search_cohorts=2,
+        )
+        trainer = SelfPlayTrainer(game, net, optimizer, torch.device("cpu"), args)
+
+        self.assertEqual(2, trainer._self_play_generator().native_search_cohorts)
+
 
 if __name__ == "__main__":
     unittest.main()
