@@ -524,6 +524,41 @@ class SelfPlayNativeTests(unittest.TestCase):
         self.assertEqual(1, accumulator.native_pipeline_waits)
         self.assertEqual(1, accumulator.native_pipeline_max_in_flight)
 
+    def test_native_coordinator_passes_generator_worker_count_to_backend(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created),
+            native_worker_threads=3,
+        )
+        coordinator = cast(Any, generator._coordinator(1))
+        active = generator._new_active_game()
+        coordinator.start(active)
+
+        self.assertEqual(3, created[0].thread_count)
+        coordinator.remove(active)
+
+    def test_native_coordinator_records_configured_pipeline_in_flight(self) -> None:
+        created: list[_FakeNativeBackend] = []
+        generator = self.make_generator(
+            backend="cpp",
+            factory=_fake_factory(created),
+        )
+        coordinator = cast(Any, generator._coordinator(1))
+        active = generator._new_active_game()
+        coordinator.start(active)
+        accumulator = BatchedSearchAccumulator(1, native_search_cohorts=2)
+
+        coordinator.submit_wave([active], accumulator, in_flight=2)
+        self.assertEqual(2, coordinator._pending_wave.in_flight)
+        coordinator.wait_wave()
+
+        telemetry = accumulator.telemetry()
+        self.assertEqual(2, telemetry.native_pipeline_max_in_flight)
+        self.assertEqual(1, telemetry.native_pipeline_submissions)
+        self.assertEqual(1, telemetry.native_pipeline_waits)
+        coordinator.remove(active)
+
     def test_native_coordinator_rejects_duplicate_submit_without_replacing_owner(self) -> None:
         created: list[_FakeNativeBackend] = []
         generator = self.make_generator(

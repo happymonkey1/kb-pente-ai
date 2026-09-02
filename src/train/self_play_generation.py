@@ -51,6 +51,7 @@ class _PendingNativeWave:
     before_completed_simulations: tuple[tuple[int, int], ...]
     accumulator: BatchedSearchAccumulator
     submission: NativeWaveSubmission
+    in_flight: int = 1
 
 
 _NativeBackendFactory = Callable[..., NativeSearchBackend]
@@ -172,6 +173,7 @@ class _NativeSearchCoordinator:
         self,
         generator: SelfPlayGenerator,
         max_active_games: int,
+        worker_threads: int,
         backend_factory: _NativeBackendFactory | None,
     ) -> None:
         factory = NativeSearchBackend if backend_factory is None else backend_factory
@@ -181,13 +183,17 @@ class _NativeSearchCoordinator:
             cast(TensorEvaluator, generator.evaluator),
             generator.mcts_args,
             max_active_games=max_active_games,
-            worker_threads=generator.native_worker_threads,
+            worker_threads=worker_threads,
             seed=int(generator.rng.integers(0, 2**63)),
         )
         self._cumulative_telemetry: dict[int, SearchTelemetry | None] = {}
         self._telemetry_pending: dict[int, bool] = {}
         self._completed_simulations: dict[int, int] = {}
         self._pending_wave: _PendingNativeWave | None = None
+
+    @property
+    def has_pending_wave(self) -> bool:
+        return self._pending_wave is not None
 
     def start(self, active: ActiveSelfPlayGame) -> None:
         if active.native_slot is not None:
@@ -254,9 +260,10 @@ class _NativeSearchCoordinator:
         self,
         active: list[ActiveSelfPlayGame],
         accumulator: BatchedSearchAccumulator,
+        in_flight: int = 1,
     ) -> None:
         if self._pending_wave is None:
-            self.submit_wave(active, accumulator)
+            self.submit_wave(active, accumulator, in_flight=in_flight)
         else:
             active_slots = tuple(self._slot(game) for game in active)
             if (
@@ -272,9 +279,14 @@ class _NativeSearchCoordinator:
         self,
         active: list[ActiveSelfPlayGame],
         accumulator: BatchedSearchAccumulator,
+        in_flight: int = 1,
     ) -> None:
         if self._pending_wave is not None:
             raise RuntimeError("Native search coordinator already has a pending wave")
+        parsed_in_flight = _integral_count(
+            in_flight,
+            "Native pipeline in-flight count",
+        )
         active_slots = tuple(self._slot(game) for game in active)
         before = tuple(
             (slot, self._completed_simulations[slot]) for slot in active_slots
@@ -285,6 +297,7 @@ class _NativeSearchCoordinator:
             before,
             accumulator,
             submission,
+            parsed_in_flight,
         )
 
     def wait_wave(self) -> None:
@@ -313,6 +326,7 @@ class _NativeSearchCoordinator:
                 timing,
                 worker_threads,
                 selected_leaves=selected_leaves,
+                pipeline_in_flight=pending.in_flight,
             )
             self._completed_simulations.update(after)
         finally:
@@ -457,6 +471,7 @@ class SelfPlayGenerator:
         return _NativeSearchCoordinator(
             self,
             active_limit,
+            self.native_worker_threads,
             self._native_backend_factory,
         )
 
