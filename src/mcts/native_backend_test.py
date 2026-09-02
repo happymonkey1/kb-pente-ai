@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 from unittest import TestCase, skipUnless
 from unittest.mock import patch
 
@@ -16,6 +16,8 @@ from src.mcts.mcts_v2 import MCTSArgs
 from src.mcts.native_backend import (
     NativeBackendUnavailableError,
     NativeSearchBackend,
+    NativeWave,
+    NativeWaveSubmission,
     load_native_extension,
 )
 
@@ -64,6 +66,8 @@ class _FakeBatch:
         self._pending = False
         self._selection_sizes: list[int] = []
         self._slots: list[dict[str, Any] | None] = [None] * capacity
+        self.select_calls = 0
+        self.backup_calls = 0
         self.slot_snapshot_calls = 0
         self.slot_telemetry_calls = 0
         self.slot_complete_calls = 0
@@ -103,6 +107,7 @@ class _FakeBatch:
         return slot
 
     def select(self) -> _FakeSelection:
+        self.select_calls += 1
         self._token += 1
         self._pending = True
         active = [slot for slot in self._slots if slot is not None]
@@ -137,6 +142,7 @@ class _FakeBatch:
         return _FakeSelection(self.features[:size], self._token, size, raw_size)
 
     def backup(self, token: int, rows: int) -> None:
+        self.backup_calls += 1
         if not self._pending or token != self._token or rows < 1:
             raise RuntimeError("invalid fake backup")
         if torch.count_nonzero(self.policies[0, 25:]).item() != 0:
@@ -321,6 +327,75 @@ class _VariableCudaExtension:
     SearchBatch = _VariableCudaBatch
 
 
+class _ZeroRowBatch(_FakeBatch):
+    def __init__(self, **options: Any) -> None:
+        super().__init__(**options)
+        self._selection_sizes = [0]
+
+    def select(self) -> _FakeSelection:
+        selection = super().select()
+        if selection.size == 0:
+            self._pending = False
+        return selection
+
+
+class _ZeroRowExtension:
+    SearchBatch = _ZeroRowBatch
+
+
+class _FakeCudaStream:
+    def __init__(self) -> None:
+        self.synchronize_calls = 0
+        self.fail_synchronize = False
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
+        if self.fail_synchronize:
+            raise RuntimeError("CUDA drain failure")
+
+
+class _FakeCudaEvent:
+    def __init__(self, ready: bool = True) -> None:
+        self.ready = ready
+        self.recorded_streams: list[_FakeCudaStream] = []
+        self.synchronize_calls = 0
+
+    def record(self, stream: _FakeCudaStream) -> None:
+        self.recorded_streams.append(stream)
+
+    def query(self) -> bool:
+        return self.ready
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
+
+    def elapsed_time(self, _finished: _FakeCudaEvent) -> float:
+        return 1.0
+
+
+class _FailingQueryCudaEvent(_FakeCudaEvent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_query = True
+
+    def query(self) -> bool:
+        if self.fail_query:
+            self.fail_query = False
+            raise RuntimeError("transient CUDA query failure")
+        return super().query()
+
+
+class _FailingOnceEvaluator(_FakeEvaluator):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def evaluate_features(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("transient CUDA evaluator failure")
+        return super().evaluate_features(inputs)
+
+
 class NativeBackendTests(TestCase):
     def setUp(self) -> None:
         self.game = PenteGame(board_size=5, ruleset=PenteRuleset.FREESTYLE)
@@ -359,6 +434,23 @@ class NativeBackendTests(TestCase):
             seed=103,
             extension=extension,
         )
+
+    def make_mocked_cuda_backend(
+        self,
+        evaluator: _FakeEvaluator | None = None,
+    ) -> tuple[NativeSearchBackend, _FakeCudaStream, tuple[_FakeCudaEvent, ...]]:
+        backend = self.make_backend(capacity=1)
+        backend.device = torch.device("cuda")
+        backend._pin_memory = True
+        backend._cuda_feature_staging = torch.empty(
+            (1, 4, 5, 5),
+            dtype=torch.float32,
+        )
+        events = tuple(_FakeCudaEvent() for _ in range(6))
+        backend._cuda_timing_events = cast(Any, events)
+        if evaluator is not None:
+            backend.evaluator = evaluator
+        return backend, _FakeCudaStream(), events
 
     def test_extension_loading_is_explicit_and_actionable(self) -> None:
         with patch(
@@ -402,6 +494,241 @@ class NativeBackendTests(TestCase):
 
         self.assertIsNone(backend._cuda_feature_staging)
         self.assertIsNone(backend._cuda_timing_events)
+
+    def test_cpu_submit_poll_and_wait_preserve_wave_and_timing_contract(self) -> None:
+        backend = self.make_backend(capacity=1)
+        backend.add_root(self.game.init_board())
+
+        first_submission = backend.submit_wave()
+        self.assertIsInstance(first_submission, NativeWaveSubmission)
+        self.assertEqual(
+            (1, 1, 1),
+            (first_submission.token, first_submission.size, first_submission.raw_size),
+        )
+        self.assertFalse(backend.complete())
+        with self.assertRaises(AttributeError):
+            first_submission.token = 2  # type: ignore[misc]
+
+        first_wave = backend.poll_wave(first_submission)
+        self.assertIsInstance(first_wave, NativeWave)
+        assert first_wave is not None
+        self.assertEqual(
+            (1, 1, 1),
+            (first_wave.token, first_wave.size, first_wave.raw_size),
+        )
+        self.assertEqual(1, backend._batch.select_calls)
+        self.assertEqual(1, backend._batch.backup_calls)
+        self.assertEqual(1, backend.inference_timing()["calls"])
+
+        second_submission = backend.submit_wave()
+        second_wave = backend.wait_wave(second_submission)
+        self.assertEqual(2, second_wave.token)
+        self.assertTrue(backend.complete())
+        self.assertEqual(2, backend._batch.select_calls)
+        self.assertEqual(2, backend._batch.backup_calls)
+        self.assertEqual(2, backend.inference_timing()["calls"])
+
+    def test_submitted_wave_rejects_duplicate_submit_and_lifecycle_mutations(
+        self,
+    ) -> None:
+        backend = self.make_backend(capacity=1)
+        slot = backend.add_root(self.game.init_board())
+        submission = backend.submit_wave()
+
+        with self.assertRaisesRegex(RuntimeError, "already submitted"):
+            backend.submit_wave()
+        with self.assertRaisesRegex(RuntimeError, "pending"):
+            backend.add_root(self.game.init_board())
+        with self.assertRaisesRegex(RuntimeError, "pending"):
+            backend.root_policy(slot)
+        with self.assertRaisesRegex(RuntimeError, "pending"):
+            backend.remove(slot)
+
+        backend.wait_wave(submission)
+
+    def test_submission_handles_reject_mismatched_stale_and_foreign_waves(self) -> None:
+        backend = self.make_backend(capacity=1)
+        backend.add_root(self.game.init_board())
+        submission = backend.submit_wave()
+
+        mismatched = NativeWaveSubmission(
+            submission.token + 1,
+            submission.size,
+            submission.raw_size,
+        )
+        object.__setattr__(mismatched, "_owner", backend._wave_owner)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            backend.poll_wave(mismatched)
+
+        foreign_backend = self.make_backend(capacity=1)
+        foreign_backend.add_root(self.game.init_board())
+        foreign_submission = foreign_backend.submit_wave()
+        with self.assertRaisesRegex(ValueError, "another backend"):
+            backend.poll_wave(foreign_submission)
+
+        backend.wait_wave(submission)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            backend.wait_wave(submission)
+        foreign_backend.wait_wave(foreign_submission)
+
+    def test_submit_retry_reuses_selection_token_after_inference_failure(self) -> None:
+        evaluator = _FailingOnceEvaluator()
+        backend = NativeSearchBackend(
+            self.game,
+            evaluator,
+            MCTSArgs(num_simulations=1),
+            max_active_games=1,
+            worker_threads=1,
+            pin_memory=False,
+            extension=_FakeExtension,
+        )
+        backend.add_root(self.game.init_board())
+
+        with self.assertRaisesRegex(RuntimeError, "transient CUDA"):
+            backend.submit_wave()
+        self.assertEqual(1, backend._batch.select_calls)
+        self.assertEqual(0, backend.inference_timing()["calls"])
+
+        retry = backend.submit_wave()
+        self.assertEqual((1, 1, 1), (retry.token, retry.size, retry.raw_size))
+        backend.wait_wave(retry)
+        self.assertEqual(1, backend._batch.select_calls)
+        self.assertEqual(2, evaluator.calls)
+        self.assertEqual(1, backend.inference_timing()["calls"])
+
+    def test_zero_row_submission_holds_lifecycle_until_wait(self) -> None:
+        backend = NativeSearchBackend(
+            self.game,
+            _FakeEvaluator(),
+            self.args,
+            max_active_games=1,
+            worker_threads=1,
+            pin_memory=False,
+            extension=_ZeroRowExtension,
+        )
+
+        submission = backend.submit_wave()
+        self.assertEqual(
+            (1, 0, 0),
+            (submission.token, submission.size, submission.raw_size),
+        )
+        self.assertFalse(backend.complete())
+        with self.assertRaisesRegex(RuntimeError, "pending"):
+            backend.add_root(self.game.init_board())
+
+        wave = backend.wait_wave(submission)
+        self.assertEqual(NativeWave(1, 0, 0, 0.0, 0.0, 0.0, 0.0), wave)
+        self.assertTrue(backend.complete())
+        self.assertEqual(0, backend._batch.backup_calls)
+        backend.add_root(self.game.init_board())
+
+    def test_mocked_cuda_poll_uses_completion_event_without_stream_wait(self) -> None:
+        backend, stream, events = self.make_mocked_cuda_backend()
+        backend.add_root(self.game.init_board())
+        events[5].ready = False
+
+        with (
+            patch.object(torch.Tensor, "is_pinned", return_value=True),
+            patch.object(backend, "_validate_outputs"),
+            patch(
+                "src.mcts.native_backend.torch.cuda.current_stream",
+                return_value=stream,
+            ),
+        ):
+            submission = backend.submit_wave()
+            self.assertIsNone(backend.poll_wave(submission))
+            self.assertEqual(0, stream.synchronize_calls)
+            self.assertEqual(0, events[5].synchronize_calls)
+            self.assertEqual(0, backend.inference_timing()["calls"])
+
+            events[5].ready = True
+            wave = backend.poll_wave(submission)
+
+        self.assertIsInstance(wave, NativeWave)
+        self.assertEqual(1, events[5].synchronize_calls)
+        self.assertEqual(0, stream.synchronize_calls)
+        self.assertEqual(1, backend.inference_timing()["calls"])
+        self.assertEqual(1, backend._batch.backup_calls)
+
+    def test_mocked_cuda_query_failure_drains_before_retry(self) -> None:
+        backend, stream, events = self.make_mocked_cuda_backend()
+        backend.add_root(self.game.init_board())
+        events = (*events[:5], _FailingQueryCudaEvent())
+        backend._cuda_timing_events = cast(Any, events)
+
+        with (
+            patch.object(torch.Tensor, "is_pinned", return_value=True),
+            patch.object(backend, "_validate_outputs"),
+            patch(
+                "src.mcts.native_backend.torch.cuda.current_stream",
+                return_value=stream,
+            ),
+        ):
+            submission = backend.submit_wave()
+            with self.assertRaisesRegex(RuntimeError, "query failure"):
+                backend.poll_wave(submission)
+            self.assertEqual(1, stream.synchronize_calls)
+            retry = backend.submit_wave()
+            backend.wait_wave(retry)
+
+        self.assertEqual(1, backend._batch.select_calls)
+        self.assertEqual(1, backend.inference_timing()["calls"])
+        self.assertEqual(1, backend._batch.backup_calls)
+
+    def test_mocked_cuda_query_drain_failure_prevents_reuse(self) -> None:
+        backend, stream, events = self.make_mocked_cuda_backend()
+        backend.add_root(self.game.init_board())
+        events = (*events[:5], _FailingQueryCudaEvent())
+        backend._cuda_timing_events = cast(Any, events)
+        stream.fail_synchronize = True
+
+        with (
+            patch.object(torch.Tensor, "is_pinned", return_value=True),
+            patch.object(backend, "_validate_outputs"),
+            patch(
+                "src.mcts.native_backend.torch.cuda.current_stream",
+                return_value=stream,
+            ),
+        ):
+            submission = backend.submit_wave()
+            with self.assertRaisesRegex(RuntimeError, "could not be drained"):
+                backend.poll_wave(submission)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unavailable after a drain failure",
+            ):
+                backend.submit_wave()
+
+        self.assertEqual(1, stream.synchronize_calls)
+        self.assertEqual(1, backend._batch.select_calls)
+
+    def test_mocked_cuda_enqueue_failure_drains_before_retry_and_reuses_resources(
+        self,
+    ) -> None:
+        evaluator = _FailingOnceEvaluator()
+        backend, stream, events = self.make_mocked_cuda_backend(evaluator)
+        backend.add_root(self.game.init_board())
+        event_ids = tuple(id(event) for event in events)
+
+        with (
+            patch.object(torch.Tensor, "is_pinned", return_value=True),
+            patch.object(backend, "_validate_outputs"),
+            patch(
+                "src.mcts.native_backend.torch.cuda.current_stream",
+                return_value=stream,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "transient CUDA"):
+                backend.submit_wave()
+            self.assertEqual(1, stream.synchronize_calls)
+            retry = backend.submit_wave()
+            backend.wait_wave(retry)
+
+        self.assertEqual(1, backend._batch.select_calls)
+        self.assertEqual(2, evaluator.calls)
+        self.assertEqual(1, backend.inference_timing()["calls"])
+        self.assertEqual(event_ids, tuple(id(event) for event in events))
+        self.assertEqual(1, stream.synchronize_calls)
 
     @skipUnless(torch.cuda.is_available(), "CUDA device required")
     def test_cuda_reuses_feature_storage_events_and_variable_row_views(self) -> None:

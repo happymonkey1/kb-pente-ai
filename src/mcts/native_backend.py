@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import importlib
 import math
 import operator
 import time
-from typing import Any, Mapping, Protocol, SupportsIndex, cast
+from typing import Any, Mapping, NoReturn, Protocol, SupportsIndex, cast
 
 import numpy as np
 import torch
@@ -61,6 +62,27 @@ class NativeWave:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeWaveSubmission:
+    """Immutable identity for one submitted native search wave."""
+
+    token: int
+    size: int
+    raw_size: int
+    _owner: object | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "token", _nonnegative_int(self.token, "wave token"))
+        object.__setattr__(self, "size", _nonnegative_int(self.size, "wave size"))
+        object.__setattr__(
+            self,
+            "raw_size",
+            _nonnegative_int(self.raw_size, "wave raw size"),
+        )
+        if self.raw_size < self.size:
+            raise ValueError("wave raw size cannot be smaller than wave size")
+
+
+@dataclass(frozen=True, slots=True)
 class _Selection:
     features: torch.Tensor
     token: int
@@ -73,6 +95,20 @@ class _NativeSlotSnapshot:
     complete: bool
     simulations: int
     evaluator_completions: int
+
+
+class _WaveState(Enum):
+    IDLE = auto()
+    EXECUTING = auto()
+    RETRYABLE = auto()
+    SUBMITTED = auto()
+    READY = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class _CudaWaveSubmission:
+    stream: torch.cuda.Stream
+    completion: torch.cuda.Event
 
 
 def load_native_extension() -> Any:
@@ -169,6 +205,11 @@ class NativeSearchBackend:
         self._terminal_results: dict[int, TerminalResult] = {}
         self._pending: _Selection | None = None
         self._pending_completions: dict[int, int] = {}
+        self._wave_state = _WaveState.IDLE
+        self._pending_result: NativeWave | None = None
+        self._pending_cuda: _CudaWaveSubmission | None = None
+        self._wave_owner = object()
+        self._cuda_faulted = False
         self._inference_timing = NativeInferenceTiming()
 
     @property
@@ -189,6 +230,7 @@ class NativeSearchBackend:
         temperature: float = 1.0,
         add_root_noise: bool = False,
     ) -> int:
+        self._ensure_wave_idle()
         root = self._admit_position(position)
         slot = _nonnegative_int(
             self._batch.add(
@@ -208,36 +250,116 @@ class NativeSearchBackend:
         self._refresh_lifecycle_progress(slot)
         return slot
 
-    def evaluate_wave(self) -> NativeWave:
-        if self._pending is None:
-            self._validate_staging()
-            before = {
-                slot: snapshot.evaluator_completions
-                for slot, snapshot in self._slot_progress.items()
-            }
-            selected = self._batch.select()
-            self._pending = self._convert_selection(selected)
-            self._pending_completions = before
+    def submit_wave(self) -> NativeWaveSubmission:
+        """Select and submit one wave, returning its immutable identity.
+
+        CPU inference completes during this call. CUDA inference is enqueued on
+        the current stream and completes through :meth:`poll_wave` or
+        :meth:`wait_wave`. A failed inference or backup leaves the native token
+        pending so the next submission retries the same selection.
+        """
+
+        if self._cuda_faulted:
+            raise RuntimeError(
+                "Native CUDA wave resources are unavailable after a drain failure"
+            )
+        if self._wave_state in (
+            _WaveState.EXECUTING,
+            _WaveState.SUBMITTED,
+            _WaveState.READY,
+        ):
+            raise RuntimeError("A native wave is already submitted")
+        if self._wave_state is _WaveState.IDLE:
+            self._wave_state = _WaveState.EXECUTING
+            try:
+                self._select_wave()
+            except Exception:
+                self._wave_state = _WaveState.IDLE
+                raise
+        elif self._wave_state is not _WaveState.RETRYABLE:
+            raise RuntimeError("Native wave state is invalid")
+
         selection = self._pending
-        assert selection is not None
+        if selection is None:
+            raise RuntimeError("Native wave state has no pending selection")
+        submission = NativeWaveSubmission(
+            selection.token,
+            selection.size,
+            selection.raw_size,
+        )
+        object.__setattr__(submission, "_owner", self._wave_owner)
 
         if selection.size == 0:
-            self._update_slot_progress(self._read_slot_snapshots())
-            self._pending = None
-            self._pending_completions = {}
-            return NativeWave(selection.token, 0, selection.raw_size, 0.0, 0.0, 0.0, 0.0)
+            self._pending_result = NativeWave(
+                selection.token,
+                0,
+                selection.raw_size,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            self._wave_state = _WaveState.READY
+            return submission
 
-        timings = self._run_inference_and_stage(selection)
-        self._batch.backup(selection.token, selection.size)
-        previous = self._pending_completions
-        self._pending = None
-        self._pending_completions = {}
-        snapshots = self._read_slot_snapshots()
-        self._record_batch_sizes(selection, previous, snapshots)
-        self._update_slot_progress(snapshots)
-        return NativeWave(selection.token, selection.size, selection.raw_size, *timings)
+        try:
+            if self.device.type == "cuda":
+                self._pending_cuda = self._enqueue_cuda_inference_and_stage(selection)
+                self._wave_state = _WaveState.SUBMITTED
+            else:
+                timings = self._run_inference_and_stage(selection)
+                self._pending_result = NativeWave(
+                    selection.token,
+                    selection.size,
+                    selection.raw_size,
+                    *timings,
+                )
+                self._wave_state = _WaveState.READY
+        except Exception:
+            self._pending_cuda = None
+            self._pending_result = None
+            self._wave_state = _WaveState.RETRYABLE
+            raise
+        return submission
+
+    def poll_wave(self, submission: NativeWaveSubmission) -> NativeWave | None:
+        """Complete a submitted wave if its CUDA staging event is ready."""
+
+        self._validate_submission(submission)
+        self._ensure_submitted_for_completion()
+        if self._wave_state is _WaveState.SUBMITTED:
+            if self._pending_cuda is None:
+                raise RuntimeError("Native CUDA wave state has no pending submission")
+            pending = self._pending_cuda
+            try:
+                ready = pending.completion.query()
+            except Exception as error:
+                self._handle_cuda_submission_error(pending.stream, error)
+            if not ready:
+                return None
+            self._resolve_cuda_submission(pending)
+        return self._complete_wave()
+
+    def wait_wave(self, submission: NativeWaveSubmission) -> NativeWave:
+        """Wait for and complete a submitted wave."""
+
+        self._validate_submission(submission)
+        self._ensure_submitted_for_completion()
+        if self._wave_state is _WaveState.SUBMITTED:
+            if self._pending_cuda is None:
+                raise RuntimeError("Native CUDA wave state has no pending submission")
+            self._resolve_cuda_submission(self._pending_cuda)
+        result = self._complete_wave()
+        assert result is not None
+        return result
+
+    def evaluate_wave(self) -> NativeWave:
+        """Run one complete wave using the legacy synchronous API."""
+
+        return self.wait_wave(self.submit_wave())
 
     def root_policy(self, slot: int) -> np.ndarray:
+        self._ensure_wave_idle()
         parsed_slot = _nonnegative_int(slot, "slot")
         policy = self._batch.root_policy(parsed_slot)
         if not isinstance(policy, torch.Tensor):
@@ -262,6 +384,7 @@ class NativeSearchBackend:
         temperature: float = 1.0,
         add_root_noise: bool = False,
     ) -> dict[str, Any]:
+        self._ensure_wave_idle()
         parsed_slot = _nonnegative_int(slot, "slot")
         parsed_action = _nonnegative_int(action, "action")
         try:
@@ -287,6 +410,7 @@ class NativeSearchBackend:
         temperature: float = 1.0,
         add_root_noise: bool = False,
     ) -> dict[str, Any]:
+        self._ensure_wave_idle()
         parsed_slot = _nonnegative_int(slot, "slot")
         parsed_action = _nonnegative_int(action, "action")
         try:
@@ -310,6 +434,7 @@ class NativeSearchBackend:
         return dict(result)
 
     def remove(self, slot: int) -> None:
+        self._ensure_wave_idle()
         parsed_slot = _nonnegative_int(slot, "slot")
         self._batch.remove(parsed_slot)
         self._roots.pop(parsed_slot, None)
@@ -324,6 +449,7 @@ class NativeSearchBackend:
         temperature: float = 1.0,
         add_root_noise: bool = False,
     ) -> None:
+        self._ensure_wave_idle()
         parsed_slot = _nonnegative_int(slot, "slot")
         root = self._admit_position(position)
         self._batch.replace_root(
@@ -340,6 +466,7 @@ class NativeSearchBackend:
         self._refresh_lifecycle_progress(parsed_slot)
 
     def root_terminal(self, slot: int) -> TerminalResult:
+        self._ensure_wave_idle()
         parsed_slot = _nonnegative_int(slot, "slot")
         cached = self._terminal_results.get(parsed_slot)
         if cached is not None:
@@ -358,14 +485,17 @@ class NativeSearchBackend:
         )
 
     def complete(self) -> bool:
+        if self._wave_state is not _WaveState.IDLE:
+            return False
         return bool(self._batch.complete())
 
     def slot_complete(self, slot: int) -> bool:
         parsed_slot = _nonnegative_int(slot, "slot")
         try:
-            return self._slot_progress[parsed_slot].complete
+            complete = self._slot_progress[parsed_slot].complete
         except KeyError as error:
             raise IndexError(f"Native root slot is not active: {parsed_slot}") from error
+        return False if self._wave_state is not _WaveState.IDLE else complete
 
     def slot_simulations(self, slot: int) -> int:
         parsed_slot = _nonnegative_int(slot, "slot")
@@ -405,6 +535,89 @@ class NativeSearchBackend:
                 "worker_busy_percent": 100.0 * busy_fraction,
             },
         }
+
+    def _ensure_wave_idle(self) -> None:
+        if self._cuda_faulted:
+            raise RuntimeError(
+                "Native CUDA wave resources are unavailable after a drain failure"
+            )
+        if self._wave_state is not _WaveState.IDLE:
+            raise RuntimeError(
+                "A native wave is pending; complete it before changing search roots"
+            )
+
+    def _select_wave(self) -> None:
+        self._validate_staging()
+        before = {
+            slot: snapshot.evaluator_completions
+            for slot, snapshot in self._slot_progress.items()
+        }
+        selected = self._batch.select()
+        self._pending = self._convert_selection(selected)
+        self._pending_completions = before
+
+    def _validate_submission(self, submission: NativeWaveSubmission) -> None:
+        if not isinstance(submission, NativeWaveSubmission):
+            raise TypeError("Native wave submission must be a NativeWaveSubmission")
+        if submission._owner is not self._wave_owner:
+            raise ValueError("Native wave submission belongs to another backend")
+        selection = self._pending
+        if selection is None or self._wave_state is _WaveState.IDLE:
+            raise ValueError("Native wave submission is stale or no longer pending")
+        if (
+            submission.token != selection.token
+            or submission.size != selection.size
+            or submission.raw_size != selection.raw_size
+        ):
+            raise ValueError("Native wave submission does not match the pending wave")
+
+    def _ensure_submitted_for_completion(self) -> None:
+        if self._wave_state is _WaveState.RETRYABLE:
+            raise RuntimeError(
+                "Native wave submission failed; call submit_wave to retry "
+                "the pending wave"
+            )
+        if self._wave_state not in (_WaveState.SUBMITTED, _WaveState.READY):
+            raise RuntimeError("Native wave is not submitted")
+
+    def _complete_wave(self) -> NativeWave:
+        if self._wave_state is not _WaveState.READY:
+            raise RuntimeError("Native wave is not ready for backup")
+        selection = self._pending
+        result = self._pending_result
+        if selection is None or result is None:
+            raise RuntimeError("Native wave state has no completed result")
+
+        if selection.size == 0:
+            self._update_slot_progress(self._read_slot_snapshots())
+            self._clear_pending_wave()
+            return result
+
+        try:
+            self._batch.backup(selection.token, selection.size)
+        except Exception:
+            self._pending_result = None
+            self._pending_cuda = None
+            self._wave_state = _WaveState.RETRYABLE
+            raise
+
+        previous = self._pending_completions
+        self._pending = None
+        self._pending_completions = {}
+        self._pending_result = None
+        self._pending_cuda = None
+        self._wave_state = _WaveState.IDLE
+        snapshots = self._read_slot_snapshots()
+        self._record_batch_sizes(selection, previous, snapshots)
+        self._update_slot_progress(snapshots)
+        return result
+
+    def _clear_pending_wave(self) -> None:
+        self._pending = None
+        self._pending_completions = {}
+        self._pending_result = None
+        self._pending_cuda = None
+        self._wave_state = _WaveState.IDLE
 
     def _admit_position(self, position: PenteBoard) -> PenteBoard:
         if not isinstance(position, PenteBoard):
@@ -477,8 +690,7 @@ class NativeSearchBackend:
         selection: _Selection,
     ) -> tuple[float, float, float, float]:
         if self.device.type == "cuda":
-            return self._run_cuda_inference_and_stage(selection)
-
+            raise RuntimeError("CUDA inference must be submitted asynchronously")
         started = time.perf_counter()
         inputs = selection.features.to(device=self.device)
         host_to_device = _elapsed(started)
@@ -492,10 +704,10 @@ class NativeSearchBackend:
         self._add_timing(1, host_to_device, model, device_to_host)
         return host_to_device, model, device_to_host, 0.0
 
-    def _run_cuda_inference_and_stage(
+    def _enqueue_cuda_inference_and_stage(
         self,
         selection: _Selection,
-    ) -> tuple[float, float, float, float]:
+    ) -> _CudaWaveSubmission:
         self._validate_staging()
         if self._cuda_feature_staging is None or self._cuda_timing_events is None:
             raise RuntimeError("CUDA inference resources were not initialized")
@@ -508,27 +720,80 @@ class NativeSearchBackend:
             d2h_started,
             d2h_finished,
         ) = self._cuda_timing_events
+        try:
+            h2d_started.record(stream)
+            inputs = self._cuda_feature_staging[: selection.size]
+            inputs.copy_(selection.features, non_blocking=True)
+            h2d_finished.record(stream)
+            model_started.record(stream)
+            policies, values = self._call_evaluator(inputs)
+            model_finished.record(stream)
+            self._validate_outputs(policies, values, selection.size)
+            d2h_started.record(stream)
+            self._copy_to_staging(policies, values, selection.size)
+            d2h_finished.record(stream)
+        except Exception as error:
+            self._handle_cuda_submission_error(stream, error)
+        return _CudaWaveSubmission(stream, d2h_finished)
 
-        h2d_started.record(stream)
-        inputs = self._cuda_feature_staging[: selection.size]
-        inputs.copy_(selection.features, non_blocking=True)
-        h2d_finished.record(stream)
-        model_started.record(stream)
-        policies, values = self._call_evaluator(inputs)
-        model_finished.record(stream)
-        self._validate_outputs(policies, values, selection.size)
-        d2h_started.record(stream)
-        self._copy_to_staging(policies, values, selection.size)
-        d2h_finished.record(stream)
+    def _resolve_cuda_submission(self, pending: _CudaWaveSubmission) -> None:
+        selection = self._pending
+        if selection is None:
+            raise RuntimeError("Native CUDA wave has no pending selection")
+        try:
+            wait_started = time.perf_counter()
+            pending.completion.synchronize()
+            wait = _elapsed(wait_started)
+            if self._cuda_timing_events is None:
+                raise RuntimeError("CUDA inference resources were not initialized")
+            (
+                h2d_started,
+                h2d_finished,
+                model_started,
+                model_finished,
+                d2h_started,
+                d2h_finished,
+            ) = self._cuda_timing_events
+            host_to_device = _cuda_elapsed(h2d_started, h2d_finished)
+            model = _cuda_elapsed(model_started, model_finished)
+            device_to_host = _cuda_elapsed(d2h_started, d2h_finished)
+            self._add_timing(1, host_to_device, model, device_to_host, wait)
+            self._pending_result = NativeWave(
+                selection.token,
+                selection.size,
+                selection.raw_size,
+                host_to_device,
+                model,
+                device_to_host,
+                wait,
+            )
+            self._pending_cuda = None
+            self._wave_state = _WaveState.READY
+        except Exception as error:
+            self._handle_cuda_submission_error(pending.stream, error)
 
-        wait_started = time.perf_counter()
-        stream.synchronize()
-        wait = _elapsed(wait_started)
-        host_to_device = _cuda_elapsed(h2d_started, h2d_finished)
-        model = _cuda_elapsed(model_started, model_finished)
-        device_to_host = _cuda_elapsed(d2h_started, d2h_finished)
-        self._add_timing(1, host_to_device, model, device_to_host, wait)
-        return host_to_device, model, device_to_host, wait
+    def _handle_cuda_submission_error(
+        self,
+        stream: torch.cuda.Stream,
+        error: Exception,
+    ) -> NoReturn:
+        self._pending_result = None
+        self._pending_cuda = None
+        self._wave_state = _WaveState.RETRYABLE
+        try:
+            self._drain_cuda_stream(stream)
+        except Exception as drain_error:
+            raise drain_error from error
+        raise error
+
+    def _drain_cuda_stream(self, stream: torch.cuda.Stream) -> None:
+        try:
+            stream.synchronize()
+        except Exception as error:
+            self._cuda_faulted = True
+            raise RuntimeError(
+                "CUDA wave stream could not be drained safely for reuse"
+            ) from error
 
     def _call_evaluator(
         self,
@@ -813,6 +1078,7 @@ __all__ = [
     "NativeInferenceTiming",
     "NativeSearchBackend",
     "NativeWave",
+    "NativeWaveSubmission",
     "TensorEvaluator",
     "load_native_extension",
 ]

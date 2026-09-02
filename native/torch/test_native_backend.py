@@ -430,7 +430,12 @@ class NativeBackendExtensionTests(unittest.TestCase):
             extension=self.extension,
         )
         backend.add_root(self.game.init_board(), temperature=0.0)
-        wave = backend.evaluate_wave()
+        submission = backend.submit_wave()
+        wave = backend.wait_wave(submission)
+        self.assertEqual(
+            (submission.token, submission.size, submission.raw_size),
+            (wave.token, wave.size, wave.raw_size),
+        )
         self.assertEqual(1, wave.size)
         timing = backend.inference_timing()
         self.assertEqual(1, timing["calls"])
