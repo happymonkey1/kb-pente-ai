@@ -43,6 +43,18 @@ class ActiveSelfPlayGame:
     actions: list[int]
     root_telemetry: list[SearchTelemetry]
     native_slot: int | None = None
+    launch_index: int = -1
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedSelfPlayGame:
+    launch_index: int
+    played_game: PlayedGame
+
+
+@dataclass(slots=True)
+class _LaunchCounter:
+    value: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +102,21 @@ class _SearchCoordinator(Protocol):
         accumulator: BatchedSearchAccumulator,
     ) -> None:
         """Evaluate one wave across all active games."""
+
+
+def _fill_active_games(
+    generator: SelfPlayGenerator,
+    coordinator: _SearchCoordinator,
+    active: list[ActiveSelfPlayGame],
+    capacity: int,
+    game_count: int,
+    launched_games: _LaunchCounter,
+) -> None:
+    while launched_games.value < game_count and len(active) < capacity:
+        active_game = generator._new_active_game(launched_games.value)
+        coordinator.start(active_game)
+        active.append(active_game)
+        launched_games.value += 1
 
 
 class _PythonSearchCoordinator:
@@ -387,69 +414,33 @@ class SelfPlayGenerator:
             raise ValueError("At least one active self-play game is required")
 
         coordinator = self._coordinator(active_limit)
-        launched_games = 0
+        launched_games = _LaunchCounter()
         active: list[ActiveSelfPlayGame] = []
-        while launched_games < min(game_count, active_limit):
-            active_game = self._new_active_game()
-            coordinator.start(active_game)
-            active.append(active_game)
-            launched_games += 1
+        _fill_active_games(
+            self,
+            coordinator,
+            active,
+            active_limit,
+            game_count,
+            launched_games,
+        )
 
-        completed: list[PlayedGame] = []
+        completed: list[_CompletedSelfPlayGame] = []
         batch_accumulators: dict[int, BatchedSearchAccumulator] = {}
         while active:
-            remaining: list[ActiveSelfPlayGame] = []
-            for active_game in active:
-                if not coordinator.is_complete(active_game):
-                    remaining.append(active_game)
-                    continue
-
-                policy = coordinator.policy(active_game)
-                active_game.pending.append((active_game.position, policy))
-                active_game.root_telemetry.append(coordinator.telemetry(active_game))
-                action = int(self.rng.choice(len(policy), p=policy))
-                active_game.actions.append(action)
-                next_position, _ = self.game.apply_action(
-                    active_game.position,
-                    active_game.position.current_player,
-                    action,
-                )
-                active_game.position = next_position
-                result = self.game.check_game_end(next_position)
-                native_result = coordinator.advance(
-                    active_game,
-                    action,
-                    self._temperature(next_position),
-                    result,
-                )
-                if native_result is not None and native_result != result:
-                    coordinator.remove(active_game)
-                    raise RuntimeError(
-                        "Native/Python terminal mismatch: "
-                        f"native={native_result!r}, python={result!r}"
-                    )
-                if result.is_terminal:
-                    coordinator.remove(active_game)
-                    completed.append(
-                        PlayedGame(
-                            examples=finalize_training_examples(
-                                active_game.pending,
-                                result,
-                            ),
-                            actions=tuple(active_game.actions),
-                            winner=result.winner,
-                            win_reason=result.reason,
-                            root_telemetry=tuple(active_game.root_telemetry),
-                        )
-                    )
-                else:
-                    remaining.append(active_game)
-
-            while launched_games < game_count and len(remaining) < active_limit:
-                active_game = self._new_active_game()
-                coordinator.start(active_game)
-                remaining.append(active_game)
-                launched_games += 1
+            remaining, completed_roots = self._advance_completed_roots(
+                coordinator,
+                active,
+            )
+            completed.extend(completed_roots)
+            _fill_active_games(
+                self,
+                coordinator,
+                remaining,
+                active_limit,
+                game_count,
+                launched_games,
+            )
             active = remaining
 
             if active:
@@ -460,10 +451,67 @@ class SelfPlayGenerator:
                     batch_accumulators[root_count] = accumulator
                 coordinator.evaluate_wave(active, accumulator)
 
-        return completed, [
+        return [completed_root.played_game for completed_root in completed], [
             accumulator.telemetry()
             for accumulator in batch_accumulators.values()
         ]
+
+    def _advance_completed_roots(
+        self,
+        coordinator: _SearchCoordinator,
+        active: list[ActiveSelfPlayGame],
+    ) -> tuple[list[ActiveSelfPlayGame], list[_CompletedSelfPlayGame]]:
+        remaining: list[ActiveSelfPlayGame] = []
+        completed: list[_CompletedSelfPlayGame] = []
+        for active_game in active:
+            if not coordinator.is_complete(active_game):
+                remaining.append(active_game)
+                continue
+
+            policy = coordinator.policy(active_game)
+            active_game.pending.append((active_game.position, policy))
+            active_game.root_telemetry.append(coordinator.telemetry(active_game))
+            action = int(self.rng.choice(len(policy), p=policy))
+            active_game.actions.append(action)
+            next_position, _ = self.game.apply_action(
+                active_game.position,
+                active_game.position.current_player,
+                action,
+            )
+            active_game.position = next_position
+            result = self.game.check_game_end(next_position)
+            native_result = coordinator.advance(
+                active_game,
+                action,
+                self._temperature(next_position),
+                result,
+            )
+            if native_result is not None and native_result != result:
+                coordinator.remove(active_game)
+                raise RuntimeError(
+                    "Native/Python terminal mismatch: "
+                    f"native={native_result!r}, python={result!r}"
+                )
+            if result.is_terminal:
+                coordinator.remove(active_game)
+                completed.append(
+                    _CompletedSelfPlayGame(
+                        active_game.launch_index,
+                        PlayedGame(
+                            examples=finalize_training_examples(
+                                active_game.pending,
+                                result,
+                            ),
+                            actions=tuple(active_game.actions),
+                            winner=result.winner,
+                            win_reason=result.reason,
+                            root_telemetry=tuple(active_game.root_telemetry),
+                        ),
+                    )
+                )
+            else:
+                remaining.append(active_game)
+        return remaining, completed
 
     def _coordinator(self, active_limit: int) -> _SearchCoordinator:
         if self.search_backend == "python":
@@ -475,7 +523,7 @@ class SelfPlayGenerator:
             self._native_backend_factory,
         )
 
-    def _new_active_game(self) -> ActiveSelfPlayGame:
+    def _new_active_game(self, launch_index: int = -1) -> ActiveSelfPlayGame:
         return ActiveSelfPlayGame(
             position=self.game.init_board(),
             mcts=None,
@@ -483,6 +531,7 @@ class SelfPlayGenerator:
             pending=[],
             actions=[],
             root_telemetry=[],
+            launch_index=launch_index,
         )
 
     def _temperature(self, position: PenteBoard) -> float:
