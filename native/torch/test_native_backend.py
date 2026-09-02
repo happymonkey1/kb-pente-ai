@@ -15,6 +15,7 @@ from src.train.arena import Arena
 from src.train.native_player import NativeMCTSPlayer
 from src.train.player import Player
 from src.train.self_play_generation import SelfPlayGenerator
+from src.train.self_play_metrics import collect_self_play_metrics
 
 
 def _draw_root():
@@ -443,6 +444,65 @@ class NativeBackendExtensionTests(unittest.TestCase):
         self.assertGreaterEqual(timing["model_inference_seconds"], 0.0)
         self.assertGreaterEqual(timing["device_to_host_seconds"], 0.0)
         self.assertGreaterEqual(timing["inference_wait_seconds"], 0.0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_two_cohort_self_play_scheduler(self) -> None:
+        torch.manual_seed(103)
+        device = torch.device("cuda")
+        game = PenteGame(board_size=5, ruleset=PenteRuleset.FREESTYLE)
+        net = PenteNet(
+            device,
+            board_size=5,
+            action_size=25,
+            num_res_blocks=1,
+            num_channels=8,
+            hidden_fc_size=16,
+        )
+        net.eval()
+        generator = SelfPlayGenerator(
+            game,
+            net,
+            MCTSArgs(num_simulations=2, root_noise_epsilon=0.0),
+            temp_threshold=0,
+            rng=np.random.default_rng(103),
+            search_backend="cpp",
+            native_worker_threads=2,
+            native_search_cohorts=2,
+        )
+
+        games, batches = generator.play_games(2, 2)
+        torch.cuda.synchronize(device)
+
+        self.assertEqual(2, len(games))
+        self.assertTrue(batches)
+        self.assertTrue(all(game.root_telemetry for game in games))
+        metrics = collect_self_play_metrics(games, batches, elapsed_seconds=1.0)
+        self.assertEqual(2, metrics["native_search_cohorts"])
+        self.assertEqual(2, metrics["active_game_target"])
+        self.assertEqual(1, metrics["inference_batch_target"])
+        self.assertEqual(2, metrics["native_worker_threads"])
+        self.assertEqual(1, metrics["native_worker_threads_per_cohort"])
+        self.assertEqual(2, metrics["native_pipeline_max_in_flight"])
+        self.assertEqual(
+            metrics["native_pipeline_submissions"],
+            metrics["native_pipeline_waits"],
+        )
+        self.assertGreater(metrics["native_pipeline_submissions"], 0)
+        self.assertEqual(0, metrics["mcts_invalid_policy_fallbacks"])
+        self.assertEqual(0, metrics["mcts_zero_visit_fallbacks"])
+
+        for played in games:
+            for example in played.examples:
+                legal = game.get_valid_moves(
+                    example.position,
+                    example.position.current_player,
+                )
+                self.assertAlmostEqual(1.0, float(example.policy.sum()), places=5)
+                self.assertAlmostEqual(
+                    0.0,
+                    float(example.policy[legal == 0].sum()),
+                    places=5,
+                )
 
 
 if __name__ == "__main__":
