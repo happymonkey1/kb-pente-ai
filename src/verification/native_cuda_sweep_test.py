@@ -37,6 +37,7 @@ class NativeCudaSweepTest(unittest.TestCase):
     def test_help_and_dry_run_do_not_require_cuda(self) -> None:
         help_result = _run("--help")
         self.assertEqual(0, help_result.returncode)
+        self.assertIn("--games", help_result.stdout)
         self.assertIn("--profiles", help_result.stdout)
         self.assertIn("--checkpoint", help_result.stdout)
 
@@ -76,6 +77,62 @@ class NativeCudaSweepTest(unittest.TestCase):
             (_ROOT / "replays" / f"{prefix}-active2-workers2.jsonl").exists()
         )
 
+    def test_games_override_controls_batch_games_and_active_limit(self) -> None:
+        prefix = f"test-native-cuda-games-{os.getpid()}"
+        result = _run(
+            "--dry-run",
+            "--no-compile",
+            "--games",
+            "768",
+            "--prefix",
+            prefix,
+            "--profiles",
+            "768:8",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("--batch-games 768", result.stdout)
+        self.assertIn("--active-games 768", result.stdout)
+        self.assertIn("batch-games=768", result.stdout)
+        self.assertFalse(
+            (_ROOT / f"pente-model-{prefix}-active768-workers8").exists()
+        )
+        self.assertFalse(
+            (_ROOT / "metrics" / f"{prefix}-active768-workers8.jsonl").exists()
+        )
+        self.assertFalse(
+            (_ROOT / "replays" / f"{prefix}-active768-workers8.jsonl").exists()
+        )
+        self.assertFalse(
+            (_ROOT / "logs" / f"{prefix}-active768-workers8.log").exists()
+        )
+
+        over_limit = _run(
+            "--dry-run",
+            "--no-compile",
+            "--games",
+            "768",
+            "--prefix",
+            f"{prefix}-over",
+            "--profiles",
+            "769:8",
+        )
+        self.assertEqual(64, over_limit.returncode)
+        self.assertIn("active-games must not exceed games=768", over_limit.stderr)
+
+    def test_games_validation_rejects_nonpositive_and_noninteger_values(self) -> None:
+        for games in ("0", "-1", "not-an-integer"):
+            result = _run(
+                "--dry-run",
+                "--games",
+                games,
+                "--prefix",
+                f"test-native-cuda-invalid-games-{os.getpid()}-{games}",
+                "--profiles",
+                "1:1",
+            )
+            self.assertEqual(64, result.returncode, games)
+            self.assertIn("games must be a positive integer", result.stderr, games)
+
     def test_profile_validation_rejects_normalized_duplicates_and_invalid_budgets(self) -> None:
         duplicate = _run(
             "--dry-run",
@@ -91,7 +148,7 @@ class NativeCudaSweepTest(unittest.TestCase):
             ("2:2:3", "cohorts must be 1 or 2"),
             ("1:2:2", "active-games >= 2"),
             ("2:1:2", "native-workers >= 2"),
-            ("513:2", "must not exceed 512"),
+            ("513:2", "must not exceed games=512"),
         ):
             result = _run(
                 "--dry-run",

@@ -8,11 +8,12 @@ cd -- "${repository_root}"
 usage() {
     cat <<'EOF'
 Sweep native CUDA self-play across active-game/native-worker profiles.
-Defaults: Standard19, model 6/128/256, 512 games, 64 simulations, one learner
+Defaults: Standard19, model 6/128/256, 512 games (--games/SWEEP_GAMES), 64 simulations, one learner
 step, and profiles 256:4 256:8 256:16 384:8 512:8:1 512:8:2
 (active:workers[:cohorts], where omitted cohorts means one).
 
 Options (also available as SWEEP_* environment variables):
+  --games N                number of self-play games and main.py --batch-games value (default: 512)
   --profiles LIST          space- or comma-separated active:workers[:cohorts] profiles
   --prefix NAME            unique output prefix
   --checkpoint PATH        shared starting training checkpoint
@@ -50,6 +51,7 @@ python_path() {
 checkpoint="${SWEEP_CHECKPOINT:-}"
 resume_replay="${SWEEP_RESUME_REPLAY:-}"
 final_iteration="${SWEEP_FINAL_ITERATION:-1}"
+games="${SWEEP_GAMES:-512}"
 profiles="${SWEEP_PROFILES:-256:4 256:8 256:16 384:8 512:8:1 512:8:2}"
 prefix="${SWEEP_PREFIX:-native-cuda-sweep-$(date -u '+%Y%m%dT%H%M%SZ')-$$}"
 python_bin="${SWEEP_PYTHON:-${repository_root}/.venv/bin/python}"
@@ -65,6 +67,7 @@ while (($# > 0)); do
         --checkpoint|--starting-checkpoint) checkpoint="$(value "$@")"; checkpoint_supplied=1; shift 2;;
         --resume-replay) resume_replay="$(value "$@")"; shift 2;;
         --final-iteration) final_iteration="$(value "$@")"; final_iteration_supplied=1; shift 2;;
+        --games) games="$(value "$@")"; shift 2;;
         --python) python_bin="$(value "$@")"; shift 2;;
         --compile) compile_model=1; shift;;
         --no-compile) compile_model=0; shift;;
@@ -77,6 +80,7 @@ done
 [[ ${compile_model} == 0 || ${compile_model} == 1 ]] || die "SWEEP_COMPILE must be 0 or 1"
 [[ ${prefix} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid prefix: ${prefix}"
 [[ ${final_iteration} =~ ^[1-9][0-9]*$ ]] || die "final-iteration must be positive: ${final_iteration}"
+[[ ${games} =~ ^[1-9][0-9]*$ ]] || die "games must be a positive integer: ${games}"
 if (( checkpoint_supplied )); then
     (( final_iteration_supplied )) || die "--checkpoint requires --final-iteration"
     [[ -n ${resume_replay} ]] || die "--checkpoint requires --resume-replay"
@@ -104,7 +108,7 @@ for profile in "${profile_values[@]}"; do
     profile_key="${active}:${workers}:${cohorts}"
     [[ -z ${seen_profiles[${profile_key}]+present} ]] || die "duplicate profile: ${profile}"
     seen_profiles[${profile_key}]=1
-    (( active <= 512 )) || die "active-games must not exceed 512: ${active}"
+    (( active <= games )) || die "active-games must not exceed games=${games}: ${active}"
     if (( cohorts == 2 )); then
         (( active >= 2 )) || die "cohorts=2 requires active-games >= 2: ${profile}"
         (( workers >= 2 )) || die "cohorts=2 requires native-workers >= 2: ${profile}"
@@ -145,7 +149,7 @@ fi
 common_args=(
     --gpu --search-backend cpp --ruleset standard --board-size 19
     --model-blocks 6 --model-channels 128 --model-hidden-size 256
-    --professional-iterations 0 --self-play-iterations "${final_iteration}" --batch-games 512
+    --professional-iterations 0 --self-play-iterations "${final_iteration}" --batch-games "${games}"
     --mcts-sim 64 --temp-threshold 16 --batch-size 512 --learner-steps 1
     --max-training-examples 1000000 --replay-checkpoint-interval 1 --seed 103
     --minimum-batch-occupancy 0.80 --minimum-mean-root-children 4
@@ -165,18 +169,18 @@ for index in "${!active_values[@]}"; do
     args=("${common_args[@]}" --active-games "${active}" --native-search-threads "${workers}"
         --native-search-cohorts "${cohorts}"
         --model-dir "${model_dir}" --telemetry-file "${metric_file}" --replay-sample-file "${replay_file}")
-    printf '[%d/%d] active-games=%s native-workers=%s native-cohorts=%s\n' "$((index + 1))" "${#active_values[@]}" "${active}" "${workers}" "${cohorts}"
+    printf '[%d/%d] active-games=%s native-workers=%s native-cohorts=%s batch-games=%s\n' "$((index + 1))" "${#active_values[@]}" "${active}" "${workers}" "${cohorts}" "${games}"
     if (( dry_run )); then printf '  command:'; printf ' %q' "${python_bin}" "${main_file}" "${args[@]}"; printf '\n'; continue; fi
     mkdir "${model_dir}"
     (set -o noclobber; : > "${metric_file}"; : > "${replay_file}"; : > "${log_file}") \
         || die "could not reserve outputs for active=${active}, workers=${workers}, cohorts=${cohorts}"
-    printf 'active-games=%s native-workers=%s native-cohorts=%s\ncommand:' "${active}" "${workers}" "${cohorts}" >> "${log_file}"
+    printf 'active-games=%s native-workers=%s native-cohorts=%s batch-games=%s\ncommand:' "${active}" "${workers}" "${cohorts}" "${games}" >> "${log_file}"
     printf ' %q' "${python_bin}" "${main_file}" "${args[@]}" >> "${log_file}"; printf '\n' >> "${log_file}"
     if (cd -- "${model_dir}" && "${python_bin}" "${main_file}" "${args[@]}") 2>&1 | tee -a "${log_file}"; then
         printf '  model: %s\n  telemetry: %s\n  replay: %s\n  log: %s\n' "${model_dir}" "${metric_file}" "${replay_file}" "${log_file}"
     else
         status=${PIPESTATUS[0]}; (( status > 0 )) || status=1
-        printf 'error: run active=%s workers=%s cohorts=%s failed (status %s); log: %s\n' "${active}" "${workers}" "${cohorts}" "${status}" "${log_file}" >&2
+        printf 'error: run active=%s workers=%s cohorts=%s batch-games=%s failed (status %s); log: %s\n' "${active}" "${workers}" "${cohorts}" "${games}" "${status}" "${log_file}" >&2
         exit "${status}"
     fi
 done
