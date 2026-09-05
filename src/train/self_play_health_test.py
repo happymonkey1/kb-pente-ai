@@ -1,7 +1,12 @@
 import unittest
+from unittest.mock import patch
 
+from src.telemetry import InMemoryMetricSink
 from src.train.self_play_health import (
+    SelfPlayHealthFailurePolicy,
     SelfPlayHealthThresholds,
+    evaluate_self_play_health,
+    validate_and_emit_self_play_health,
     validate_self_play_health,
 )
 
@@ -47,6 +52,81 @@ class SelfPlayHealthTest(unittest.TestCase):
             self.metrics,
             SelfPlayHealthThresholds(),
         )
+
+    def test_evaluation_returns_failures_without_enforcement(self) -> None:
+        report = evaluate_self_play_health(
+            {**self.metrics, "mean_root_children_visited": 1.0},
+            self.thresholds,
+        )
+
+        self.assertFalse(report.healthy)
+        self.assertEqual(
+            ("mean_root_children_visited=1 is below 4",),
+            report.failures,
+        )
+
+    def test_warning_policy_emits_and_continues(self) -> None:
+        sink = InMemoryMetricSink()
+
+        report = validate_and_emit_self_play_health(
+            sink,
+            7,
+            "cuda",
+            8,
+            1.5,
+            {**self.metrics, "mean_root_children_visited": 1.0},
+            self.thresholds,
+            SelfPlayHealthFailurePolicy.WARN,
+        )
+
+        self.assertFalse(report.healthy)
+        self.assertEqual(1, len(sink.records))
+        metrics = sink.records[0]["metrics"]
+        assert isinstance(metrics, dict)
+        self.assertEqual("warn", metrics["health_failure_policy"])
+        self.assertTrue(metrics["training_continues"])
+
+    def test_error_policy_emits_then_raises(self) -> None:
+        sink = InMemoryMetricSink()
+
+        with self.assertRaisesRegex(RuntimeError, "mean_root_children_visited"):
+            validate_and_emit_self_play_health(
+                sink,
+                7,
+                "cuda",
+                8,
+                1.5,
+                {**self.metrics, "mean_root_children_visited": 1.0},
+                self.thresholds,
+                SelfPlayHealthFailurePolicy.ERROR,
+            )
+
+        self.assertEqual(1, len(sink.records))
+        metrics = sink.records[0]["metrics"]
+        assert isinstance(metrics, dict)
+        self.assertEqual("error", metrics["health_failure_policy"])
+        self.assertFalse(metrics["training_continues"])
+
+    def test_unexpected_health_evaluation_errors_propagate(self) -> None:
+        sink = InMemoryMetricSink()
+
+        with patch(
+            "src.train.self_play_health.evaluate_self_play_health",
+            side_effect=RuntimeError("search evaluator failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "search evaluator failed"):
+                validate_and_emit_self_play_health(
+                    sink,
+                    7,
+                    "cuda",
+                    8,
+                    1.5,
+                    self.metrics,
+                    self.thresholds,
+                    SelfPlayHealthFailurePolicy.WARN,
+                )
+
+        self.assertEqual([], sink.records)
 
 
 if __name__ == "__main__":

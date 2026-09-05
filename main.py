@@ -23,7 +23,10 @@ from src.train.arena import Arena
 from src.train.random_player import RandomPlayer
 from src.train.player_builder import build_player
 from src.train.self_play import SelfPlayTrainer, SelfPlayTrainerArgs
-from src.train.self_play_health import SelfPlayHealthThresholds
+from src.train.self_play_health import (
+    SelfPlayHealthFailurePolicy,
+    SelfPlayHealthThresholds,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--maximum-search-collapse-rate", type=float, default=1.0)
     parser.add_argument("--maximum-invalid-policy-fallbacks", type=int, default=0)
     parser.add_argument("--maximum-zero-visit-fallbacks", type=int, default=-1)
+    parser.add_argument(
+        "--self-play-health-failure-policy",
+        dest="health_failure_policy",
+        choices=tuple(policy.value for policy in SelfPlayHealthFailurePolicy),
+        default=SelfPlayHealthFailurePolicy.WARN.value,
+        help="How self-play health threshold breaches are handled",
+    )
     parser.add_argument("--model-blocks", type=int, default=4)
     parser.add_argument("--model-channels", type=int, default=64)
     parser.add_argument("--model-hidden-size", type=int, default=256)
@@ -218,6 +228,9 @@ def main() -> int:
             maximum_zero_visit_fallbacks=(
                 program_args.maximum_zero_visit_fallbacks
             ),
+        ),
+        health_failure_policy=SelfPlayHealthFailurePolicy.parse(
+            program_args.health_failure_policy
         ),
     )
 

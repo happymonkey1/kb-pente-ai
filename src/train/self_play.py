@@ -273,6 +273,7 @@ class SelfPlayTrainer:
                     generation_seconds,
                     self_play_metrics,
                     self.args.search_health,
+                    self.args.health_failure_policy,
                 )
 
             self.replay.extend(

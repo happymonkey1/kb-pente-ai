@@ -49,6 +49,7 @@ def _run_main(
                 trainer_args.search_backend,
                 trainer_args.native_worker_threads,
                 trainer_args.native_search_cohorts,
+                trainer_args.health_failure_policy.value,
             )
         )
         return {}
@@ -63,6 +64,7 @@ def _run_main(
                 trainer_args.search_backend,
                 trainer_args.native_worker_threads,
                 trainer_args.native_search_cohorts,
+                trainer_args.health_failure_policy.value,
             )
         )
         return SimpleNamespace(
@@ -104,9 +106,15 @@ class MainTest(unittest.TestCase):
         self.assertEqual("python", defaults.search_backend)
         self.assertEqual(1, defaults.native_search_threads)
         self.assertEqual(1, defaults.native_search_cohorts)
+        self.assertEqual("warn", defaults.health_failure_policy)
         self.assertEqual("cpp", native.search_backend)
         self.assertEqual(4, native.native_search_threads)
         self.assertEqual(2, native.native_search_cohorts)
+
+        strict = parser.parse_args(
+            ["--self-play-health-failure-policy", "error"]
+        )
+        self.assertEqual("error", strict.health_failure_policy)
 
     def test_cpp_training_preflights_before_manifest_and_training(self) -> None:
         events: list[tuple[object, ...]] = []
@@ -119,6 +127,8 @@ class MainTest(unittest.TestCase):
             "3",
             "--native-search-cohorts",
             "2",
+            "--self-play-health-failure-policy",
+            "error",
             "--self-play-iterations",
             "0",
             "--no-checkpoint",
@@ -135,8 +145,8 @@ class MainTest(unittest.TestCase):
         self.assertEqual(
             [
                 ("load",),
-                ("trainer", "cpp", 3, 2),
-                ("manifest", "cpp", 3, 2),
+                ("trainer", "cpp", 3, 2, "error"),
+                ("manifest", "cpp", 3, 2, "error"),
                 ("train",),
             ],
             events,
@@ -165,8 +175,8 @@ class MainTest(unittest.TestCase):
         )
         self.assertEqual(
             [
-                ("trainer", "python", 1, 1),
-                ("manifest", "python", 1, 1),
+                ("trainer", "python", 1, 1, "warn"),
+                ("manifest", "python", 1, 1, "warn"),
                 ("train",),
             ],
             events,

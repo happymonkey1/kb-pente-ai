@@ -26,6 +26,8 @@ Options (also available as SWEEP_* environment variables):
 
 With --checkpoint, all three checkpoint, replay, and final-iteration options
 are required. The final target must exceed the checkpoint's stored iteration.
+Every profile uses the strict self-play health failure policy so a threshold
+breach fails the verification sweep.
 EOF
 }
 
@@ -154,7 +156,7 @@ common_args=(
     --max-training-examples 1000000 --replay-checkpoint-interval 1 --seed 103
     --minimum-batch-occupancy 0.80 --minimum-mean-root-children 4
     --maximum-search-collapse-rate 0.25 --maximum-invalid-policy-fallbacks 0
-    --maximum-zero-visit-fallbacks 0
+    --maximum-zero-visit-fallbacks 0 --self-play-health-failure-policy error
 )
 (( compile_model )) && common_args+=(--compile)
 if (( checkpoint_supplied )); then common_args+=(--model "${checkpoint}" --resume-replay "${resume_replay}"); fi

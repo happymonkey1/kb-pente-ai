@@ -60,6 +60,10 @@ class NativeCudaSweepTest(unittest.TestCase):
         self.assertIn("--batch-games 512", result.stdout)
         self.assertIn("--learner-steps 1", result.stdout)
         self.assertIn("--minimum-batch-occupancy 0.80", result.stdout)
+        self.assertEqual(
+            2,
+            result.stdout.count("--self-play-health-failure-policy error"),
+        )
         self.assertIn("--active-games 2", result.stdout)
         self.assertIn("--native-search-threads 2", result.stdout)
         self.assertEqual(2, result.stdout.count("--native-search-cohorts 1"))
@@ -257,6 +261,14 @@ class NativeCudaSweepTest(unittest.TestCase):
                     native_code.index("import torch"),
                     native_code.index("import kb_pente_native"),
                 )
+                for record in records[2:]:
+                    command = record["argv"]
+                    self.assertEqual(
+                        "error",
+                        command[
+                            command.index("--self-play-health-failure-policy") + 1
+                        ],
+                    )
                 actual_profiles = [
                     (
                         record["argv"][record["argv"].index("--active-games") + 1],

@@ -5,7 +5,10 @@ import operator
 from typing import Literal
 
 from src.mcts.mcts_v2 import MCTSArgs
-from src.train.self_play_health import SelfPlayHealthThresholds
+from src.train.self_play_health import (
+    SelfPlayHealthFailurePolicy,
+    SelfPlayHealthThresholds,
+)
 
 
 SearchBackend = Literal["python", "cpp"]
@@ -44,6 +47,9 @@ class SelfPlayTrainerArgs:
     professional_value_loss_weight: float = 1.0
     self_play_value_loss_weight: float = 1.0
     search_health: SelfPlayHealthThresholds = SelfPlayHealthThresholds()
+    health_failure_policy: SelfPlayHealthFailurePolicy = (
+        SelfPlayHealthFailurePolicy.WARN
+    )
     search_backend: SearchBackend = "python"
     native_worker_threads: int = 1
     native_search_cohorts: int = 1
@@ -102,6 +108,11 @@ class SelfPlayTrainerArgs:
             raise ValueError("Value loss weights cannot be negative")
         if self.seed < 0:
             raise ValueError("Training seed cannot be negative")
+        object.__setattr__(
+            self,
+            "health_failure_policy",
+            SelfPlayHealthFailurePolicy.parse(self.health_failure_policy),
+        )
         if self.search_backend not in ("python", "cpp"):
             raise ValueError("Search backend must be 'python' or 'cpp'")
         if isinstance(self.native_worker_threads, bool):
